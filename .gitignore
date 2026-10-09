@@ -1,0 +1,41 @@
+# 依赖（体积大，不入库）
+node_modules/
+
+# 编辑器 / 会话工具产物
+.zcode/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+
+# 运行期产物：每题一个 CASE 证据目录（含题目答案，禁止入库）
+cases/
+
+# scripts/ 是运行期输出目录（生成的脚本/写题报告）；本目录下的一次性调试脚本不入库
+scripts/
+
+# 逆向解包/提取产物
+androguard.db
+*_so/
+*_extracted/
+*_decoded/
+*_decoded*/
+classes.dex
+so/
+apk_x/
+
+# 临时 / 凭据
+*.tmp
+*.bak
+.env
+env.json
+
+# 会话交接文档（含真实 flag/内网地址/本机路径，不入库）
+HANDOFF.md
+
+# 打包产物（electron-builder 输出，体积大，不入库）
+dist/
+dist-*/

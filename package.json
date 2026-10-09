@@ -1,0 +1,68 @@
+{
+  "name": "ctf-reverse-tool",
+  "version": "1.3.4",
+  "description": "CTF 逆向工程辅助工具：Electron 桌面应用，集成 AI 分析、Frida Hook、IDA/JEB/Burp MCP、11 个逆向方法论技能与可检索知识库",
+  "main": "electron/main.js",
+  "author": "ip2867",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ip2867/ctf-re-tool.git"
+  },
+  "homepage": "https://github.com/ip2867/ctf-re-tool",
+  "keywords": [
+    "ctf",
+    "reverse-engineering",
+    "frida",
+    "ida",
+    "android",
+    "apk",
+    "electron",
+    "security"
+  ],
+  "scripts": {
+    "start": "electron .",
+    "build:exe": "electron-builder --win portable"
+  },
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^26.15.3"
+  },
+  "dependencies": {
+    "ssh2": "^1.16.0"
+  },
+  "build": {
+    "appId": "com.ctf.re.tool",
+    "productName": "CTF-RE-TOOL",
+    "directories": {
+      "output": "dist",
+      "buildResources": "assets"
+    },
+    "files": [
+      "electron/**/*",
+      "src/**/*",
+      "skills/**/*",
+      "wiki/**/*",
+      "assets/icons/**/*",
+      "package.json",
+      "!**/node_modules/*/{CHANGELOG.md,README.md,readme.md,*.ts,*.map}",
+      "!cases/**",
+      "!scripts/**",
+      "!dist/**"
+    ],
+    "asar": true,
+    "win": {
+      "icon": "assets/icons/icon.ico",
+      "target": [
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "CTF-RE-TOOL.exe"
+    },
+    "compression": "maximum"
+  }
+}

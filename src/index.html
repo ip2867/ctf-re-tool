@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; font-src https://cdnjs.cloudflare.com; img-src 'self' data:; connect-src 'self'">
+  <title>CTF Reverse Engineering Tool</title>
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"
+        integrity="sha512-iecdLmaskl7CVkqkXNQ/ZH/XLlvWZOJyj7Yy7tcenmpD1ypASozpmT/E0iPtmFIB46ZmdtAc9eNBvH0H/ZpiBw=="
+        crossorigin="anonymous" referrerpolicy="no-referrer">
+</head>
+<body>
+  <!-- 自定义标题栏 -->
+  <div class="titlebar">
+    <div class="titlebar-drag">
+      <span class="brand-mark" aria-hidden="true"><i class="fas fa-terminal"></i></span>
+      <span class="brand-title">CTF Reverse Engineering Tool</span>
+      <span class="version-badge">v1.3.4</span>
+    </div>
+    <div class="titlebar-actions">
+      <button id="btn-settings" class="titlebar-btn" title="设置">
+        <i class="fas fa-cog"></i>
+      </button>
+    </div>
+    <div class="titlebar-controls">
+      <button id="btn-minimize" class="titlebar-btn" title="最小化">
+        <i class="fas fa-minus"></i>
+      </button>
+      <button id="btn-maximize" class="titlebar-btn" title="最大化">
+        <i class="fas fa-square"></i>
+      </button>
+      <button id="btn-close" class="titlebar-btn btn-close" title="关闭">
+        <i class="fas fa-times"></i>
+      </button>
+    </div>
+  </div>
+
+  <!-- 主内容区域 -->
+  <div class="main-container" id="main-container">
+    <!-- 左侧面板 -->
+    <div class="panel panel-left">
+      <!-- 文件拖入区域 -->
+      <div class="section file-drop-section">
+        <div class="section-header">
+          <i class="fas fa-file-import"></i>
+          <span>文件分析</span>
+        </div>
+        <div id="file-drop-zone" class="file-drop-zone">
+          <div class="drop-icon">
+            <i class="fas fa-cloud-upload-alt"></i>
+          </div>
+          <div class="drop-text">拖入文件到此处</div>
+          <div class="drop-hint">支持 APK / EXE / ELF / SO / DEX / PYC / JAR / WASM</div>
+          <button id="btn-select-file" class="btn btn-secondary">
+            <i class="fas fa-folder-open"></i> 选择文件
+          </button>
+        </div>
+      </div>
+
+      <!-- 文件信息显示 -->
+      <div id="file-info-panel" class="section file-info-section" style="display: none;">
+        <div class="section-header">
+          <i class="fas fa-info-circle"></i>
+          <span>文件信息</span>
+          <button id="btn-clear-file" class="btn-icon" title="清除">
+            <i class="fas fa-times"></i>
+          </button>
+        </div>
+        <div class="file-info-content">
+          <div class="info-row">
+            <span class="info-label">文件名</span>
+            <span id="info-filename" class="info-value">-</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">类型</span>
+            <span id="info-filetype" class="info-value type-badge">-</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">大小</span>
+            <span id="info-filesize" class="info-value">-</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">MD5</span>
+            <span id="info-md5" class="info-value hash-value">-</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">SHA256</span>
+            <span id="info-sha256" class="info-value hash-value">-</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 工具快捷按钮 -->
+      <div class="section tools-section">
+        <div class="section-header">
+          <i class="fas fa-tools"></i>
+          <span>逆向工具</span>
+          <button class="btn-collapse" id="btn-collapse-tools" title="收缩/展开">
+            <i class="fas fa-chevron-up"></i>
+          </button>
+        </div>
+        <div class="tools-content" id="tools-content">
+          <div class="tools-category">
+            <div class="category-header" data-category="static">
+              <span>静态分析</span>
+              <i class="fas fa-chevron-down"></i>
+            </div>
+            <div class="tools-grid category-content" id="category-static">
+              <button class="tool-btn" data-tool="ida" title="IDA Pro - 静态分析">
+                <i class="fas fa-search"></i>
+                <span>IDA</span>
+              </button>
+              <button class="tool-btn" data-tool="die" title="DIE - 查壳">
+                <i class="fas fa-shield-alt"></i>
+                <span>DIE</span>
+              </button>
+              <button class="tool-btn" data-tool="jeb" title="JEB - Android分析">
+                <i class="fas fa-android"></i>
+                <span>JEB</span>
+              </button>
+              <button class="tool-btn" data-tool="jadx" title="jadx - DEX→Java">
+                <i class="fab fa-java"></i>
+                <span>jadx</span>
+              </button>
+              <button class="tool-btn" data-tool="burp" title="BurpSuite - Web/JS 流量抓包">
+                <i class="fas fa-spider"></i>
+                <span>Burp</span>
+              </button>
+            </div>
+          </div>
+          <div class="tools-category">
+            <div class="category-header" data-category="unpack">
+              <span>脱壳工具</span>
+              <i class="fas fa-chevron-down"></i>
+            </div>
+            <div class="tools-grid category-content" id="category-unpack">
+              <button class="tool-btn" data-tool="upx" title="UPX - 脱壳">
+                <i class="fas fa-unlock"></i>
+                <span>UPX</span>
+              </button>
+              <button class="tool-btn" data-tool="apktool" title="apktool - APK解包">
+                <i class="fas fa-archive"></i>
+                <span>apktool</span>
+              </button>
+            </div>
+          </div>
+          <div class="tools-category">
+            <div class="category-header" data-category="python">
+              <span>Python工具</span>
+              <i class="fas fa-chevron-down"></i>
+            </div>
+            <div class="tools-grid category-content" id="category-python">
+              <button class="tool-btn" data-tool="pycdc" title="pycdc - Python字节码反编译">
+                <i class="fab fa-python"></i>
+                <span>pycdc</span>
+              </button>
+              <button class="tool-btn" data-tool="pycdas" title="pycdas - Python字节码反汇编">
+                <i class="fab fa-python"></i>
+                <span>pycdas</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 模拟器状态 -->
+      <div class="section emulator-section">
+        <div class="section-header">
+          <i class="fas fa-mobile-alt"></i>
+          <span>安卓9模拟器</span>
+          <span id="emulator-status" class="status-dot status-offline"></span>
+        </div>
+        <div class="emulator-actions">
+          <button id="btn-check-emulator" class="btn btn-small">
+            <i class="fas fa-sync"></i> 检查状态
+          </button>
+          <button id="btn-frida-ps" class="btn btn-small">
+            <i class="fas fa-list"></i> 进程列表
+          </button>
+          <button id="btn-install-apk" class="btn btn-small" disabled>
+            <i class="fas fa-download"></i> 安装APK
+          </button>
+        </div>
+      </div>
+
+      <!-- MCP工具 -->
+      <div class="section mcp-section">
+        <div class="section-header">
+          <i class="fas fa-plug"></i>
+          <span>MCP 工具</span>
+          <button class="btn-collapse" id="btn-collapse-mcp" title="收缩/展开">
+            <i class="fas fa-chevron-up"></i>
+          </button>
+        </div>
+        <div class="mcp-content" id="mcp-content">
+          <div class="mcp-grid">
+            <button id="btn-ida-mcp" class="mcp-btn" title="IDA MCP - 静态分析集成">
+              <i class="fas fa-search"></i>
+              <span>IDA MCP</span>
+              <span id="ida-mcp-status" class="status-dot status-offline"></span>
+            </button>
+            <button id="btn-jeb-mcp" class="mcp-btn" title="JEB MCP - Android分析集成">
+              <i class="fas fa-android"></i>
+              <span>JEB MCP</span>
+              <span id="jeb-mcp-status" class="status-dot status-offline"></span>
+            </button>
+            <button id="btn-burp-mcp" class="mcp-btn" title="Burp MCP - Web/JS 逆向流量分析">
+              <i class="fas fa-spider"></i>
+              <span>Burp MCP</span>
+              <span id="burp-mcp-status" class="status-dot status-offline"></span>
+            </button>
+            <button id="btn-browser-mcp" class="mcp-btn" title="浏览器 MCP - 网页搜索">
+              <i class="fas fa-globe"></i>
+              <span>浏览器</span>
+              <span id="browser-mcp-status" class="status-dot status-offline"></span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Kali虚拟机 -->
+      <div class="section kali-section">
+        <div class="section-header">
+          <i class="fas fa-linux"></i>
+          <span>Kali 虚拟机</span>
+          <span id="kali-status" class="status-dot status-offline"></span>
+        </div>
+        <div class="kali-actions">
+          <button id="btn-kali-start" class="btn btn-small">
+            <i class="fas fa-play"></i> 启动
+          </button>
+          <button id="btn-kali-stop" class="btn btn-small">
+            <i class="fas fa-stop"></i> 关闭
+          </button>
+          <button id="btn-kali-test" class="btn btn-small">
+            <i class="fas fa-plug"></i> 测试
+          </button>
+        </div>
+        <div class="kali-tools">
+          <span class="kali-hint">可用工具: binwalk, strings, file, gdb, strace, ltrace, radare2, pwntools...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 左侧分割线 -->
+    <div class="resize-handle resize-handle-left" id="resize-left"></div>
+
+    <!-- 中间面板 -->
+    <div class="panel panel-center">
+      <!-- 标签页切换 -->
+      <div class="tab-bar">
+        <button class="tab-btn active" data-tab="ai-chat">
+          <i class="fas fa-robot"></i> AI 分析
+        </button>
+      </div>
+
+      <!-- AI 对话区域 -->
+      <div id="tab-ai-chat" class="tab-content active">
+        <div id="chat-messages" class="chat-messages">
+          <div class="message message-system">
+            <div class="message-avatar">
+              <i class="fas fa-robot"></i>
+            </div>
+            <div class="message-content">
+              <div class="message-text welcome-text">
+                <h3 class="welcome-title">CTF 逆向工程助手</h3>
+                <p class="welcome-lead">拖入文件即可开始，或直接用自然语言提问。</p>
+                <ul class="welcome-list">
+                  <li>自动识别 APK / PE / ELF / DEX / PYC / JAR</li>
+                  <li>一键调用 IDA / DIE / JEB / jadx / Burp</li>
+                  <li>Frida Hook、解密脚本、反调试绕过</li>
+                  <li>MCP 实时集成 · Kali 工具链</li>
+                </ul>
+                <p class="welcome-foot">
+                  试试 <code>分析</code>、<code>生成Hook脚本</code>，或 <code>kali binwalk -e firmware.bin</code>
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="chat-input-area">
+          <div class="input-toolbar">
+            <button class="toolbar-btn" id="btn-attach-file" title="发送当前文件信息">
+              <i class="fas fa-paperclip"></i>
+            </button>
+            <button class="toolbar-btn" id="btn-clear-chat" title="清空对话">
+              <i class="fas fa-trash"></i>
+            </button>
+          </div>
+          <div class="input-row">
+            <textarea id="chat-input" class="chat-input" placeholder="输入问题或指令..." rows="1"></textarea>
+            <button id="btn-send" class="btn btn-primary" title="发送">
+              <i class="fas fa-paper-plane"></i>
+            </button>
+          </div>
+          <div class="quick-actions">
+            <button class="quick-btn" data-action="analyze">分析文件</button>
+            <button class="quick-btn" data-action="decrypt">生成解密脚本</button>
+            <button class="quick-btn" data-action="hook">生成Hook脚本</button>
+            <button class="quick-btn" data-action="bypass">反调试绕过</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 右侧分割线 -->
+    <div class="resize-handle resize-handle-right" id="resize-right"></div>
+
+    <!-- 右侧面板 -->
+    <div class="panel panel-right">
+      <!-- 工具输出日志 -->
+      <div class="section log-section">
+        <div class="category-header" data-category="log">
+          <span><i class="fas fa-terminal"></i> 输出日志</span>
+          <div>
+            <button id="btn-clear-log" class="btn-icon-small" title="清空日志">
+              <i class="fas fa-trash"></i>
+            </button>
+            <i class="fas fa-chevron-down"></i>
+          </div>
+        </div>
+        <div id="category-log" class="log-output">
+          <div class="log-line log-info">
+            <span class="log-time">[00:00:00]</span>
+            <span class="log-text">系统就绪，等待文件输入...</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Frida Hook 日志 -->
+      <div class="section frida-section">
+        <div class="category-header" data-category="frida">
+          <span><i class="fas fa-bug"></i> Frida Hook 日志</span>
+          <div>
+            <span id="frida-status" class="status-dot status-offline" style="margin-right: 8px;"></span>
+            <i class="fas fa-chevron-down"></i>
+          </div>
+        </div>
+        <div id="category-frida" class="frida-output">
+          <div class="placeholder-text-small">
+            <i class="fas fa-plug"></i>
+            <p>Frida 未连接</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- 快速操作 -->
+      <div class="section actions-section">
+        <div class="category-header" data-category="actions">
+          <span><i class="fas fa-bolt"></i> 快速操作</span>
+          <i class="fas fa-chevron-down"></i>
+        </div>
+        <div id="category-actions" class="actions-list">
+          <button id="btn-auto-analyze" class="action-btn" disabled>
+            <i class="fas fa-magic"></i>
+            <span>自动分析</span>
+          </button>
+          <button id="btn-deploy-frida" class="action-btn" disabled>
+            <i class="fas fa-upload"></i>
+            <span>部署Frida</span>
+          </button>
+          <button id="btn-run-hook" class="action-btn" disabled>
+            <i class="fas fa-play-circle"></i>
+            <span>运行Hook</span>
+          </button>
+          <button id="btn-generate-script" class="action-btn" disabled>
+            <i class="fas fa-file-code"></i>
+            <span>生成脚本</span>
+          </button>
+          <button id="btn-generate-wp" class="action-btn" disabled>
+            <i class="fas fa-pen-nib"></i>
+            <span>生成WP</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 设置弹窗 -->
+  <div id="settings-modal" class="modal" style="display: none;">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3><i class="fas fa-cog"></i> 设置</h3>
+        <button id="btn-close-modal" class="btn-icon">
+          <i class="fas fa-times"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="settings-group">
+          <h4><i class="fas fa-tools"></i> 工具路径</h4>
+          <div class="setting-row">
+            <label>IDA Pro</label>
+            <input type="text" id="setting-ida" class="input" placeholder="IDA路径">
+          </div>
+          <div class="setting-row">
+            <label>DIE</label>
+            <input type="text" id="setting-die" class="input" placeholder="DIE路径">
+          </div>
+          <div class="setting-row">
+            <label>JEB</label>
+            <input type="text" id="setting-jeb" class="input" placeholder="JEB路径">
+          </div>
+          <div class="setting-row">
+            <label>jadx</label>
+            <input type="text" id="setting-jadx" class="input" placeholder="jadx路径">
+          </div>
+          <div class="setting-row">
+            <label>pycdc</label>
+            <input type="text" id="setting-pycdc" class="input" placeholder="pycdc路径">
+          </div>
+          <div class="setting-row">
+            <label>UPX</label>
+            <input type="text" id="setting-upx" class="input" placeholder="UPX路径">
+          </div>
+          <div class="setting-row">
+            <label>apktool</label>
+            <input type="text" id="setting-apktool" class="input" placeholder="apktool路径">
+          </div>
+        </div>
+        <div class="settings-group">
+          <h4><i class="fas fa-mobile-alt"></i> 模拟器设置</h4>
+          <div class="setting-row">
+            <label>ADB路径</label>
+            <input type="text" id="setting-adb" class="input" placeholder="nox_adb路径">
+          </div>
+          <div class="setting-row">
+            <label>ADB端口</label>
+            <input type="number" id="setting-adb-port" class="input" placeholder="62025">
+          </div>
+          <div class="setting-row">
+            <label>Frida端口</label>
+            <input type="number" id="setting-frida-port" class="input" placeholder="27042">
+          </div>
+        </div>
+        <div class="settings-group">
+          <h4><i class="fas fa-robot"></i> AI 接口（留空则读取 CCSwitch 环境变量）</h4>
+          <div class="setting-row">
+            <label>Base URL</label>
+            <input type="text" id="setting-ai-baseurl" class="input" placeholder="https://llm.goaichat.top">
+          </div>
+          <div class="setting-row">
+            <label>API Key</label>
+            <input type="password" id="setting-ai-key" class="input" placeholder="留空沿用环境变量">
+          </div>
+          <div class="setting-row">
+            <label>模型</label>
+            <input type="text" id="setting-ai-model" class="input" placeholder="glm-5.3">
+          </div>
+          <div class="setting-row">
+            <label>快速模型（分级）</label>
+            <input type="text" id="setting-ai-fastmodel" class="input" placeholder="glm-5.2，留空禁用分级">
+          </div>
+          <div class="setting-row">
+            <label>max_tokens</label>
+            <input type="number" id="setting-ai-maxtokens" class="input" placeholder="8192">
+          </div>
+          <div class="setting-row">
+            <label>&nbsp;</label>
+            <button id="btn-test-ai" class="btn btn-small"><i class="fas fa-plug"></i> 测试AI连接</button>
+          </div>
+        </div>
+        <div class="settings-group">
+          <h4><i class="fas fa-plug"></i> MCP 服务</h4>
+          <div class="setting-row">
+            <label>IDA MCP</label>
+            <input type="text" id="setting-mcp-ida" class="input" placeholder="http://127.0.0.1:13337/mcp">
+          </div>
+          <div class="setting-row">
+            <label>JEB MCP</label>
+            <input type="text" id="setting-mcp-jeb" class="input" placeholder="http://127.0.0.1:16161/mcp">
+          </div>
+          <div class="setting-row">
+            <label>JEB MCP 目录</label>
+            <input type="text" id="setting-mcp-jeb-script" class="input" placeholder="server.py 所在目录（可选）">
+          </div>
+          <div class="setting-row">
+            <label>Burp MCP</label>
+            <input type="text" id="setting-mcp-burp" class="input" placeholder="http://127.0.0.1:9876">
+          </div>
+          <div class="setting-row">
+            <label>Burp 启动</label>
+            <input type="text" id="setting-burp" class="input" placeholder="Start.bat 路径">
+          </div>
+        </div>
+        <div class="settings-group">
+          <h4><i class="fas fa-globe"></i> Web/JS 逆向</h4>
+          <div class="setting-row">
+            <label>浏览器路径</label>
+            <input type="text" id="setting-web-browser" class="input" placeholder="留空自动探测 Chrome/Edge">
+          </div>
+          <div class="setting-row">
+            <label>Burp代理端口</label>
+            <input type="number" id="setting-web-proxy" class="input" placeholder="8080">
+          </div>
+        </div>
+        <div class="settings-group">
+          <h4><i class="fas fa-linux"></i> Kali 虚拟机</h4>
+          <div class="setting-row">
+            <label>vmx 目录</label>
+            <input type="text" id="setting-kali-vmx" class="input" placeholder="如 C:\VMs\kali">
+          </div>
+          <div class="setting-row">
+            <label>SSH 地址</label>
+            <input type="text" id="setting-kali-host" class="input" placeholder="如 127.0.0.1">
+          </div>
+          <div class="setting-row">
+            <label>SSH 端口</label>
+            <input type="number" id="setting-kali-port" class="input" placeholder="22">
+          </div>
+          <div class="setting-row">
+            <label>SSH 用户</label>
+            <input type="text" id="setting-kali-user" class="input" placeholder="kali">
+          </div>
+          <div class="setting-row">
+            <label>SSH 密码</label>
+            <input type="password" id="setting-kali-pass" class="input" placeholder="kali">
+          </div>
+        </div>
+        <div class="settings-group">
+          <h4><i class="fas fa-folder"></i> 输出目录</h4>
+          <div class="setting-row">
+            <label>脚本/WP目录</label>
+            <input type="text" id="setting-scripts-dir" class="input" placeholder="留空 = 应用目录/scripts">
+          </div>
+        </div>
+        <div class="settings-group">
+          <h4><i class="fas fa-robot"></i> 智能分析</h4>
+          <div class="setting-info">
+            <p>内置 ctf-agent 智能分析引擎</p>
+            <p>支持：APK/PE/ELF/DEX/PYC/JAR/.NET/Lua 逆向分析</p>
+            <p>功能：自动识别算法、生成脚本、反调试绕过</p>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-save-settings" class="btn btn-primary">保存</button>
+        <button id="btn-cancel-settings" class="btn btn-secondary">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 通用输入弹窗（替代 prompt()） -->
+  <div id="prompt-modal" class="modal" style="display: none;">
+    <div class="modal-content" style="max-width: 420px;">
+      <div class="modal-header">
+        <h3 id="prompt-title"><i class="fas fa-keyboard"></i> 输入</h3>
+        <button id="btn-prompt-cancel" class="btn-icon">
+          <i class="fas fa-times"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <p id="prompt-message" style="margin-bottom: 8px;"></p>
+        <input type="text" id="prompt-input" class="input" style="width: 100%;" />
+      </div>
+      <div class="modal-footer">
+        <button id="btn-prompt-ok" class="btn btn-primary">确定</button>
+        <button id="btn-prompt-cancel2" class="btn btn-secondary">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>

@@ -3832,16 +3832,25 @@ async function driveAppIteratively(packageName, totalMs = 30000) {
     const inter = nodes.filter(n => n.clickable || /EditText/i.test(n.cls)).slice(0, 14);
     const texts = nodes.filter(n => !n.clickable && n.text && n.text.length <= 30).slice(0, 6);
     const short = (s) => String(s || '').split('/').pop().slice(0, 22);
+    // 自绘大容器候选（图案锁/画布等）：通常不可点、不在交互清单里，单独列出，
+    // 否则九宫格图案锁对 AI 完全不可见，无法给出 pattern 几何参数。
+    const big = nodes
+      .filter(n => (n.x2 - n.x1) > 400 && (n.y2 - n.y1) > 400 && /View/i.test(n.cls)
+        && !/android\.widget\.(Button|TextView|EditText|ImageView)/i.test(n.cls))
+      .sort((a, b) => (b.x2 - b.x1) * (b.y2 - b.y1) - (a.x2 - a.x1) * (a.y2 - a.y1))[0];
     const list = inter.map((n, i) =>
       `${i}. ${n.cls.split('.').pop()} text="${(n.text || '').slice(0, 24)}" rid="${short(n.rid)}" @(${n.cx},${n.cy})`
-    ).join('\n');
-    return { inter, list, texts: texts.map(n => `"${(n.text || '').slice(0, 24)}"`).join(' | ') };
+    ).join('\n')
+      + (big ? `\nB. 自绘大容器 bounds=(${big.x1},${big.y1})-(${big.x2},${big.y2}) center=(${big.cx},${big.cy}) 边长${big.x2 - big.x1}x${big.y2 - big.y1}（若界面是九宫格图案锁：pattern 的 center 用容器中心、step=短边/4）` : '');
+    return { inter, big, list, texts: texts.map(n => `"${(n.text || '').slice(0, 24)}"`).join(' | ') };
   };
 
-  // 执行 AI 给出的单步操作
-  async function execStep(step, nodes) {
+  // 执行 AI 给出的单步操作（node 查找必须用摘要清单 s.inter，序号才与提示词一致）
+  async function execStep(step, inter) {
     const i = Number(step && step.i);
-    const node = nodes[i];
+    const node = inter[i];
+    // tap/input 必须有目标控件；pattern/swipe/back 不依赖 i
+    if ((step.action === 'tap' || step.action === 'input') && !node) return false;
     if (step.action === 'tap' && node) {
       const r = await window.electronAPI.driveAppUi([{ type: 'tap', x: node.cx, y: node.cy }, { type: 'sleep', ms: 700 }]);
       log.push(`tap#${i}(${String(node.text || node.rid || 'node').slice(0, 14)})` + (r && r.success ? ' ok' : ' err'));
@@ -3904,7 +3913,7 @@ async function driveAppIteratively(packageName, totalMs = 30000) {
     return false;
   }
 
-  let stall = 0, lastKey = '';
+  let stall = 0, lastKey = '', lastPlanKey = '';
   while (Date.now() < deadline) {
     const nodes = await dumpUiNodes();
     if (!nodes.length) { await sleepMs(800); continue; }
@@ -3913,51 +3922,59 @@ async function driveAppIteratively(packageName, totalMs = 30000) {
     const s = summarize(nodes);
     const key = s.list + '|' + s.texts;
     if (key === lastKey) { stall++; } else { stall = 0; lastKey = key; }
+    // 停滞收尾：同一界面连续多轮无变化就结束（放在 AI 调用之前，
+    // 否则"执行成功但界面没变"的循环会一直烧 AI 调用到超时）
+    if (stall >= 3) { log.push('stall'); break; }
 
     let plan = null;
-    try {
-      const prompt = `你在用 adb 自动操作安卓设备上的 CTF 题目 App（包名 ${packageName}），目标：触发 App 内部的校验/加密逻辑（正确答案未知时用占位值，正确值由并行运行的 Frida Hook 抓取）。
+    if (stall < 2) { // 界面已连着没变 → AI 大概率给出同样无效计划，直接走启发式
+      try {
+        const prompt = `你在用 adb 自动操作安卓设备上的 CTF 题目 App（包名 ${packageName}），目标：触发 App 内部的校验/加密逻辑（正确答案未知时用占位值，正确值由并行运行的 Frida Hook 抓取）。
 
 当前界面可交互控件（序号即 i）：
 ${s.list || '(无)'}
 
 界面可见文字：${s.texts || '(无)'}
 
-给出接下来最多 3 步操作，严格输出 JSON 数组，不要解释不要 markdown：
+已执行过的动作（不要原样重复）：
+${log.slice(-6).join('; ') || '(无)'}
+
+给出接下来**1 步**操作，严格输出 JSON 数组，不要解释不要 markdown：
 [{"action":"tap","i":0},
  {"action":"input","i":1,"text":"占位值"},
- {"action":"pattern","points":[0,4,8],"center":[cx,cy],"step":<九宫格格距像素>},
+ {"action":"pattern","points":[0,4,8],"center":[540,960],"step":120},
  {"action":"swipe","from":[x,y],"to":[x,y]},
  {"action":"back"}]
 规则：
-- 只能操作上面列出的控件；pattern 仅当界面明显是九宫格图案锁（多个同尺寸无文字小方块呈网格）才允许。
+- 只能操作上面列出的控件；pattern 仅当界面明显是九宫格图案锁（多个同尺寸无文字小方块呈网格，或存在 B 容器）才允许，center/step 按 B 的 center 与边长换算成数字。
 - 无法推进或不需要操作时输出 []。
 - 界面与上一轮相同、已试过的动作无效时，换未试过的控件或输出 []。`;
-      const res = await window.electronAPI.claudeChat(
-        [{ role: 'user', content: prompt }],
-        '你是安卓 UI 自动化决策器。只输出 JSON 数组，不要调用任何工具。',
-        { model: String((state.config.claude && state.config.claude.fastModel) || '').trim() || undefined, maxTokens: 800 });
-      if (res && res.success && res.text) {
-        const m = String(res.text).match(/\[[\s\S]*\]/);
-        if (m) plan = JSON.parse(m[0]);
-      }
-    } catch (e) { /* AI 决策失败 → 启发式兜底 */ }
+        const res = await window.electronAPI.claudeChat(
+          [{ role: 'user', content: prompt }],
+          '你是安卓 UI 自动化决策器。只输出 JSON 数组，不要调用任何工具。',
+          { model: String((state.config.claude && state.config.claude.fastModel) || '').trim() || undefined, maxTokens: 800 });
+        if (res && res.success && res.text) {
+          const m = String(res.text).match(/\[[\s\S]*\]/);
+          if (m) plan = JSON.parse(m[0]);
+        }
+      } catch (e) { /* AI 决策失败 → 启发式兜底 */ }
+    }
 
-    // 2) 执行 AI 计划
+    // 2) 执行 AI 计划的第一步（每轮一个动作、每轮重新 dump，
+    //    避免 3 步计划在界面变化后按旧坐标错点）；序号对齐摘要清单 s.inter
     if (Array.isArray(plan) && plan.length) {
-      let acted = false;
-      for (const step of plan.slice(0, 3)) {
-        if (Date.now() > deadline) break;
-        if (await execStep(step, nodes)) { acted = true; await sleepMs(800); }
+      const planKey = JSON.stringify(plan);
+      if (!(stall > 0 && planKey === lastPlanKey)) {
+        lastPlanKey = planKey;
+        if (await execStep(plan[0], s.inter)) { await sleepMs(800); continue; }
+      } else {
+        log.push('repeat-plan');
       }
-      if (acted) continue;
     }
 
     // 3) 通用启发式兜底
     if (await heuristicStep(nodes)) continue;
 
-    // 4) 停滞收尾：同一界面连续多轮无进展就结束，把时间留给 Hook 抓取
-    if (stall >= 3) { log.push('stall'); break; }
     await sleepMs(1000);
   }
   return log;
@@ -4342,7 +4359,7 @@ ${mcpCache.nativeIntel.decompiled && mcpCache.nativeIntel.decompiled.length ? '�
     try {
       await sleepMs(5000); // 等 App 完成启动 + hook 安装
       addLog('info', '开始自动驱动界面（AI 逐屏决策：读界面控件→决定操作→触发校验）...');
-      const log = await driveAppIteratively(packageName, 30000);
+      const log = await driveAppIteratively(packageName, 45000);
       addLog('success', `界面驱动完成：${log.length} 个动作 → ${log.join(' | ')}`);
     } catch (e) {
       addLog('warning', '界面驱动失败（不影响 Hook 抓取）: ' + e.message);

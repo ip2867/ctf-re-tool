@@ -3817,75 +3817,147 @@ async function dumpUiNodes() {
   } catch (e) { return []; }
 }
 
-// 迭代式驱动界面：每轮 dump → 执行一个动作 → 再 dump（真正"逐屏推进"）。
-// 单次 dump 只能看到首页（那时还没手势盘/输入框），必须边操作边重新识别。
+// 迭代式驱动界面（通解）：每轮 dump → 界面压缩摘要 → AI 决策下一步（fast 模型，JSON）
+// → 执行 → 再 dump。决策完全基于当前界面的实时数据，随题目变化，不含任何特定题目的
+// 操作序列；AI 不可用或解析失败时回退到通用启发式（多语言流程词 + 占位输入）。
 // 与 Hook 并行运行，让界面触发的校验代码真正执行。
-async function driveAppIteratively(packageName, totalMs = 18000) {
+async function driveAppIteratively(packageName, totalMs = 30000) {
   const deadline = Date.now() + totalMs;
   const seen = new Set();
   const log = [];
   const keyOf = (n) => `${n.cls}|${n.rid}|${n.text}|${n.cx},${n.cy}`;
-  let patternDone = false;
-  let patternViewWarned = false;
 
-  while (Date.now() < deadline) {
-    let nodes = await dumpUiNodes();
-    if (!nodes.length) { await sleepMs(800); continue; }
+  // 界面摘要：交互控件清单（序号供 AI 引用）+ 少量可见文本提供上下文
+  const summarize = (nodes) => {
+    const inter = nodes.filter(n => n.clickable || /EditText/i.test(n.cls)).slice(0, 14);
+    const texts = nodes.filter(n => !n.clickable && n.text && n.text.length <= 30).slice(0, 6);
+    const short = (s) => String(s || '').split('/').pop().slice(0, 22);
+    const list = inter.map((n, i) =>
+      `${i}. ${n.cls.split('.').pop()} text="${(n.text || '').slice(0, 24)}" rid="${short(n.rid)}" @(${n.cx},${n.cy})`
+    ).join('\n');
+    return { inter, list, texts: texts.map(n => `"${(n.text || '').slice(0, 24)}"`).join(' | ') };
+  };
 
-    // 手势盘：3x3，遍历候选手势（Hook 会指出哪个对）
-    const patternView = nodes.find(n => (n.x2 - n.x1) > 400 && (n.y2 - n.y1) > 400 && /View/i.test(n.cls)
-      && !/android\.widget/i.test(n.cls));
-    if (patternView && !patternDone) {
-      patternDone = true;
-      const w = patternView.x2 - patternView.x1, h = patternView.y2 - patternView.y1;
-      const step = Math.min(w, h) / 4;
-      const padX = patternView.x1 + (w - 2 * step) / 2;
-      const padY = patternView.y1 + (h - 2 * step) / 2;
-      const node = (i) => [Math.round(padX + (i % 3) * step), Math.round(padY + Math.floor(i / 3) * step)];
-      for (const c of [[0, 1, 2, 4, 8], [0, 3, 6, 7, 8], [0, 4, 8], [2, 4, 6], [0, 1, 3, 4, 6, 7]]) {
-        if (Date.now() > deadline) break;
-        const r = await window.electronAPI.driveAppUi([{ type: 'swipe', points: c.map(node), duration: 130 }]);
-        log.push('swipe[' + c.join(',') + ']' + (r && r.success ? ' ok' : ' err'));
-        await sleepMs(1100);
-      }
-      continue;
+  // 执行 AI 给出的单步操作
+  async function execStep(step, nodes) {
+    const i = Number(step && step.i);
+    const node = nodes[i];
+    if (step.action === 'tap' && node) {
+      const r = await window.electronAPI.driveAppUi([{ type: 'tap', x: node.cx, y: node.cy }, { type: 'sleep', ms: 700 }]);
+      log.push(`tap#${i}(${String(node.text || node.rid || 'node').slice(0, 14)})` + (r && r.success ? ' ok' : ' err'));
+      return true;
     }
-    if (!patternView && !patternDone && !patternViewWarned && Date.now() > deadline - totalMs + 6000) {
-      patternViewWarned = true; // 6 秒后仍无手势盘，不报错（可能本题无手势）
+    if (step.action === 'input' && node) {
+      const txt = String(step.text || 'A').slice(0, 32);
+      const r = await window.electronAPI.driveAppUi([
+        { type: 'tap', x: node.cx, y: node.cy }, { type: 'sleep', ms: 300 },
+        { type: 'text', value: txt }, { type: 'sleep', ms: 300 }]);
+      log.push(`input#${i}="${txt}"` + (r && r.success ? ' ok' : ' err'));
+      return true;
     }
+    if (step.action === 'pattern' && Array.isArray(step.points) && Array.isArray(step.center) && step.step) {
+      const pt = (k) => [Math.round(step.center[0] + (k % 3) * step.step), Math.round(step.center[1] + Math.floor(k / 3) * step.step)];
+      const r = await window.electronAPI.driveAppUi([{ type: 'swipe', points: step.points.map(pt), duration: 130 }]);
+      log.push('pattern[' + step.points.join(',') + ']' + (r && r.success ? ' ok' : ' err'));
+      return true;
+    }
+    if (step.action === 'swipe' && Array.isArray(step.from) && Array.isArray(step.to)) {
+      const r = await window.electronAPI.driveAppUi([{ type: 'swipe', points: [step.from, step.to], duration: 200 }]);
+      log.push('swipe' + (r && r.success ? ' ok' : ' err'));
+      return true;
+    }
+    if (step.action === 'back') {
+      const r = await window.electronAPI.adbCommand('shell input keyevent 4');
+      log.push('back' + (r && r.success ? ' ok' : ' err'));
+      return true;
+    }
+    return false;
+  }
 
-    // 输入框：填入占位值（真实正确值靠 Hook 抓；这里只为触发校验分支）
+  // 通用启发式兜底：多语言流程词推进 + 占位输入；无任何题目特定序列
+  async function heuristicStep(nodes) {
+    const NEXT = /start|begin|submit|confirm|check|verify|next|enter|continue|login|skip|同意|开始|提交|确认|确定|校验|下一步|登录|继续|跳过|进入/i;
     const edit = nodes.find(n => /EditText/i.test(n.cls) && !seen.has('edit:' + keyOf(n)));
     if (edit) {
       seen.add('edit:' + keyOf(edit));
       const r = await window.electronAPI.driveAppUi([
         { type: 'tap', x: edit.cx, y: edit.cy }, { type: 'sleep', ms: 300 },
-        { type: 'text', value: 'A' }, { type: 'sleep', ms: 300 }
-      ]);
-      log.push('input' + (r && r.success ? ' ok' : ' err'));
-      continue;
+        { type: 'text', value: 'A' }, { type: 'sleep', ms: 300 }]);
+      log.push('input(占位)' + (r && r.success ? ' ok' : ' err'));
+      return true;
     }
-
-    // 按钮：优先"开始/提交/确认"语义
-    const btn = nodes.find(n => /Button/i.test(n.cls) && n.clickable && !seen.has(keyOf(n))
-      && /start|开始|submit|提交|confirm|确认|check|verify|next|下一步|enter|登录|continue/i.test((n.text || '') + (n.rid || '')));
+    const btn = nodes.find(n => n.clickable && !seen.has(keyOf(n))
+      && NEXT.test((n.text || '') + ' ' + String(n.rid || '').split('/').pop()));
     if (btn) {
       seen.add(keyOf(btn));
       const r = await window.electronAPI.driveAppUi([{ type: 'tap', x: btn.cx, y: btn.cy }, { type: 'sleep', ms: 900 }]);
-      log.push('tap(' + (btn.text || btn.rid || 'btn') + ')' + (r && r.success ? ' ok' : ' err'));
-      continue;
+      log.push('tap(' + String(btn.text || btn.rid || 'btn').slice(0, 14) + ')' + (r && r.success ? ' ok' : ' err'));
+      return true;
     }
-
-    // 兜底：点第一个未点过的可点按钮
-    const anyBtn = nodes.find(n => /Button/i.test(n.cls) && n.clickable && !seen.has(keyOf(n)));
-    if (anyBtn) {
-      seen.add(keyOf(anyBtn));
-      const r = await window.electronAPI.driveAppUi([{ type: 'tap', x: anyBtn.cx, y: anyBtn.cy }, { type: 'sleep', ms: 900 }]);
+    const any = nodes.find(n => n.clickable && !seen.has(keyOf(n)) && (n.x2 - n.x1) < 500);
+    if (any) {
+      seen.add(keyOf(any));
+      const r = await window.electronAPI.driveAppUi([{ type: 'tap', x: any.cx, y: any.cy }, { type: 'sleep', ms: 900 }]);
       log.push('tap(any)' + (r && r.success ? ' ok' : ' err'));
-      continue;
+      return true;
+    }
+    return false;
+  }
+
+  let stall = 0, lastKey = '';
+  while (Date.now() < deadline) {
+    const nodes = await dumpUiNodes();
+    if (!nodes.length) { await sleepMs(800); continue; }
+
+    // 1) AI 决策：只看当前界面的实时数据，不同题目自然得出不同操作
+    const s = summarize(nodes);
+    const key = s.list + '|' + s.texts;
+    if (key === lastKey) { stall++; } else { stall = 0; lastKey = key; }
+
+    let plan = null;
+    try {
+      const prompt = `你在用 adb 自动操作安卓设备上的 CTF 题目 App（包名 ${packageName}），目标：触发 App 内部的校验/加密逻辑（正确答案未知时用占位值，正确值由并行运行的 Frida Hook 抓取）。
+
+当前界面可交互控件（序号即 i）：
+${s.list || '(无)'}
+
+界面可见文字：${s.texts || '(无)'}
+
+给出接下来最多 3 步操作，严格输出 JSON 数组，不要解释不要 markdown：
+[{"action":"tap","i":0},
+ {"action":"input","i":1,"text":"占位值"},
+ {"action":"pattern","points":[0,4,8],"center":[cx,cy],"step":<九宫格格距像素>},
+ {"action":"swipe","from":[x,y],"to":[x,y]},
+ {"action":"back"}]
+规则：
+- 只能操作上面列出的控件；pattern 仅当界面明显是九宫格图案锁（多个同尺寸无文字小方块呈网格）才允许。
+- 无法推进或不需要操作时输出 []。
+- 界面与上一轮相同、已试过的动作无效时，换未试过的控件或输出 []。`;
+      const res = await window.electronAPI.claudeChat(
+        [{ role: 'user', content: prompt }],
+        '你是安卓 UI 自动化决策器。只输出 JSON 数组，不要调用任何工具。',
+        { model: String((state.config.claude && state.config.claude.fastModel) || '').trim() || undefined, maxTokens: 800 });
+      if (res && res.success && res.text) {
+        const m = String(res.text).match(/\[[\s\S]*\]/);
+        if (m) plan = JSON.parse(m[0]);
+      }
+    } catch (e) { /* AI 决策失败 → 启发式兜底 */ }
+
+    // 2) 执行 AI 计划
+    if (Array.isArray(plan) && plan.length) {
+      let acted = false;
+      for (const step of plan.slice(0, 3)) {
+        if (Date.now() > deadline) break;
+        if (await execStep(step, nodes)) { acted = true; await sleepMs(800); }
+      }
+      if (acted) continue;
     }
 
-    // 本屏无可操作项：稍等再看（可能正在跳转）
+    // 3) 通用启发式兜底
+    if (await heuristicStep(nodes)) continue;
+
+    // 4) 停滞收尾：同一界面连续多轮无进展就结束，把时间留给 Hook 抓取
+    if (stall >= 3) { log.push('stall'); break; }
     await sleepMs(1000);
   }
   return log;
@@ -4226,7 +4298,24 @@ ${mcpCache.nativeIntel.decompiled && mcpCache.nativeIntel.decompiled.length ? '�
   // 脚本语法校验：AI 生成的正则常含未转义的 '/'（如 /data/dalvik），会让 frida 直接
   // 报 "invalid regular expression flags" 而整脚本不加载（表现为零输出、白等 25s）。
   // 这里做静态语法预检，并尝试自动修复"正则中裸露的 /"这类高频错误。
-  const vres = await validateAndRepairFridaScript(script);
+  let vres = await validateAndRepairFridaScript(script);
+  // 截断类错误（Unexpected end of input，max_tokens 不够）：先用更精简的要求 +
+  // 更大 max_tokens 重新生成一次，仍然失败才落到内置模板。
+  if (!vres.ok && /end of input|unexpected/i.test(String(vres.error || ''))) {
+    addLog('info', 'AI 脚本被截断，用更紧凑的要求重新生成一次...');
+    try {
+      const retry = await window.electronAPI.claudeChat(
+        [{ role: 'user', content: genPrompt + '\n\n注意：上一次输出因长度被截断。请重新输出一个**更精简但完整可运行**的脚本（总长度压到一屏内，去掉非必要的 hook 点，绝不省略花括号）。' }],
+        '你是 Frida 动态插桩专家。只输出一个 [FRIDA_SCRIPT] 块。不要调用任何工具。',
+        { model: String((state.config && state.config.claude && state.config.claude.fastModel) || '').trim() || undefined, maxTokens: 16384 });
+      const sm2 = retry && retry.success ? String(retry.text || '').match(/\[FRIDA_SCRIPT\]([\s\S]+?)\[\/FRIDA_SCRIPT\]/) : null;
+      if (sm2) {
+        const cand = sm2[1].replace(/^```(?:javascript|js)?\s*/i, '').replace(/```\s*$/, '').trim();
+        const v2 = await validateAndRepairFridaScript(cand);
+        if (v2.ok) { vres = v2; addLog('info', '截断脚本已重新生成并通过校验'); }
+      }
+    } catch (e) { /* 重试失败 → 走内置模板兜底 */ }
+  }
   const cryptoParams = pickCryptoParams();
   if (!vres.ok) {
     addLog('warning', 'AI Hook 脚本语法校验未通过（' + vres.error + '）；改用内置模板脚本');
@@ -4252,7 +4341,7 @@ ${mcpCache.nativeIntel.decompiled && mcpCache.nativeIntel.decompiled.length ? '�
   const drivePromise = (async () => {
     try {
       await sleepMs(5000); // 等 App 完成启动 + hook 安装
-      addLog('info', '开始自动驱动界面（逐屏推进：点开始→画手势→填输入→提交）...');
+      addLog('info', '开始自动驱动界面（AI 逐屏决策：读界面控件→决定操作→触发校验）...');
       const log = await driveAppIteratively(packageName, 30000);
       addLog('success', `界面驱动完成：${log.length} 个动作 → ${log.join(' | ')}`);
     } catch (e) {

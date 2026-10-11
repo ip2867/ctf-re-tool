@@ -3579,6 +3579,40 @@ ipcMain.handle('validate-frida-script', async (event, src) => {
 
     const err2 = tryParse(repaired);
     if (!err2) return { ok: true, script: repaired, repaired: true };
+
+    // 修复：输出被截断（"Unexpected end of input"，max_tokens 不足的 Hook 脚本常见）
+    // → 从尾部逐步回退到最近的完整语句边界，按括号栈补齐未闭合的 { ( [ ，
+    //   直到能通过语法解析。每一步都以真实 vm 解析为闸，修不好就如实返回失败。
+    if (/end of input/i.test(String(err || '') + String(err2 || ''))) {
+      const lines = code.split('\n');
+      const closers = { '{': '}', '(': ')', '[': ']' };
+      const scan = (txt) => {
+        const st = [];
+        let inStr = null, esc = false, ln = false, bk = false;
+        for (let i = 0; i < txt.length; i++) {
+          const ch = txt[i], nx = txt[i + 1];
+          if (ln) { if (ch === '\n') ln = false; continue; }
+          if (bk) { if (ch === '*' && nx === '/') { bk = false; i++; } continue; }
+          if (inStr) {
+            if (esc) { esc = false; continue; }
+            if (ch === '\\') { esc = true; continue; }
+            if (ch === inStr) inStr = null;
+            continue;
+          }
+          if (ch === '/' && nx === '/') { ln = true; continue; }
+          if (ch === '/' && nx === '*') { bk = true; i++; continue; }
+          if (ch === '"' || ch === "'" || ch === '`') { inStr = ch; continue; }
+          if (ch === '{' || ch === '(' || ch === '[') st.push(ch);
+          else if (ch === '}' || ch === ')' || ch === ']') st.pop();
+        }
+        return st;
+      };
+      for (let cut = lines.length; cut >= Math.max(1, lines.length - 14); cut--) {
+        const cand = lines.slice(0, cut).join('\n');
+        const fixed = cand + scan(cand).slice().reverse().map(c => closers[c] || '').join('');
+        if (!tryParse(fixed)) return { ok: true, script: fixed, repaired: true };
+      }
+    }
     return { ok: false, script: null, repaired: false, error: (err || err2) };
   } catch (e) {
     return { ok: false, script: null, repaired: false, error: e.message };

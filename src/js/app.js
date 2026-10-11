@@ -642,12 +642,41 @@ async function launchTool(toolName, filePath = null) {
       } catch (e) { /* 未运行则继续启动 */ }
 
       const idaPath = state.config.tools[toolName] || state.config.tools.ida;
+      // 残留数据库检测：上次 IDA 非正常退出会留下 <file>.id0/.id1 等未打包残件；
+      // -A 模式下 "Database already exists" 会被自动应答为 Load existing，
+      // 残留库一旦损坏（强杀/崩溃）IDA 会静默退出、MCP 端口永远起不来。
+      try {
+        const ex = await window.electronAPI.runToolArgs(['cmd', '/c', 'if', 'exist', fileToOpen + '.id0', 'echo', 'STALE_DB'], {});
+        if (/STALE_DB/.test(String((ex && ex.stdout) || ''))) {
+          let anyIda = false;
+          try {
+            const tl = await window.electronAPI.runToolArgs(['tasklist', '/FI', 'IMAGENAME eq ida.exe'], {});
+            anyIda = /ida\.exe/i.test(String((tl && tl.stdout) || ''));
+          } catch (e) { /* 无法判定时按没有实例占用处理 */ }
+          if (!anyIda) {
+            for (const ext of ['.id0', '.id1', '.id2', '.nam', '.til']) {
+              await window.electronAPI.runToolArgs(['cmd', '/c', 'move', '/y', fileToOpen + ext, fileToOpen + ext + '.bak'], {});
+            }
+            addLog('info', '检测到上次未正常关闭的 IDA 数据库残留，已重命名为 .bak 后重新建库');
+          } else {
+            addLog('warning', '检测到 IDA 数据库残留且 ida.exe 正在运行：若 MCP 始终连不上，请先关闭该 IDA 再重试');
+          }
+        }
+      } catch (e) { /* 检测失败不阻塞启动 */ }
+      // IDA 不能把 .apk 当数据库打开：会停在 "Load a new file" 对话框等人工确认，
+      // 插件 autostart 永不触发 → MCP 端口起不来。必须先提取 SO 再让 IDA 分析。
+      if (/\.apk$/i.test(String(fileToOpen || ''))) {
+        addLog('warning', 'IDA 不能直接分析 APK：请先点"分析文件"提取 SO，再让 IDA 打开 .so');
+        return;
+      }
       if (fileToOpen) {
-        // 参数数组分离启动 IDA 并打开文件（防注入）
-        result = await window.electronAPI.runToolArgs([idaPath, fileToOpen], { detached: true });
-        addLog('info', `IDA打开文件: ${fileToOpen}`);
+        // 参数数组分离启动 IDA 并打开文件（防注入）；-A 自主模式：
+        // 跳过 "Load a new file" 等人工对话框，按默认加载器自动建库分析。
+        // 冷启动时若模态框卡住，MCP 插件的 autostart 永远不会执行（13337 起不来）。
+        result = await window.electronAPI.runToolArgs([idaPath, '-A', fileToOpen], { detached: true });
+        addLog('info', `IDA打开文件: ${fileToOpen}（-A 自主模式，跳过加载对话框）`);
       } else {
-        result = await window.electronAPI.runToolArgs([idaPath], { detached: true });
+        result = await window.electronAPI.runToolArgs([idaPath, '-A'], { detached: true });
       }
     } else {
       result = await window.electronAPI.launchTool(toolName, fileToOpen);
@@ -1011,6 +1040,12 @@ async function processUserMessage(message) {
 
 判型：\`_0x\` 前缀大量出现 = obfuscator.io 混淆；控制流Flat = JSVMP；412/Cookie跳转 = 瑞数。`);
     }
+    return;
+  }
+
+  // 「保存」：把暂存的解题经验写入经验库（自动入库已改为手动触发）
+  if (/^(保存|保存经验|入库)$/.test(message.trim())) {
+    await flushPendingExperience();
     return;
   }
 
@@ -5855,27 +5890,55 @@ async function harvestExperience(aiText) {
       .map(l => l.trim().replace(/^[-*•]+\s*/, '').replace(/^\d+[.、)]?\s*/, '').replace(/^[-*•]+\s*/, ''))
       .filter(l => l && !/^(无|无新增经验|无新增|none)$/i.test(l) && l.length > 4);
     if (!lines.length) return;
+    // 解题成功不再自动入库：先暂存，用户发送「保存」才写入 experience.md
+    if (!Array.isArray(state.pendingExperience)) state.pendingExperience = [];
+    let n = 0;
+    for (const l of lines.slice(0, 5)) {
+      const line = `- [${new Date().toISOString().slice(0, 10)}] ${l.slice(0, 200)}`;
+      if (state.pendingExperience.includes(line) || (state.experience || '').includes(line)) continue;
+      state.pendingExperience.push(line);
+      addSolveNote('经验(待保存)', l.slice(0, 200));
+      n++;
+    }
+    if (n) {
+      addLog('info', `本题提炼出 ${n} 条经验（已暂存，未入库）。需要沉淀时发送「保存」写进经验库`);
+      addSystemMessage(`**💾 经验已暂存（未入库）**\n\n${state.pendingExperience.slice(-n).map(l => '> ' + l.replace(/^- \[[^\]]+\] /, '')).join('\n\n')}\n\n发送 **保存** 后才写入经验库（experience.md）。`);
+    }
+  } catch (e) {
+    addLog('warning', '经验暂存失败: ' + e.message);
+  }
+}
+
+// 「保存」指令：把暂存的解题经验写入 experience.md（入库由人工触发，保留原有机制）
+async function flushPendingExperience() {
+  try {
+    if (!Array.isArray(state.pendingExperience)) state.pendingExperience = [];
+    if (!state.pendingExperience.length) {
+      addSystemMessage('**当前没有待保存的经验**\n\n解题成功时提炼的经验只暂存不入库；发送「保存」才会写入。');
+      return;
+    }
+    if (!state.appPaths) return;
     const expPath = `${state.appPaths.userData}/experience.md`;
     const rf = await window.electronAPI.readFile(expPath);
     if (!rf || !rf.success) {
       await window.electronAPI.writeFile(expPath, '# 解题经验库（reverse-skill 进化层：AI 解题前自动速查）\n\n');
     }
     let n = 0;
-    for (const l of lines.slice(0, 5)) {
-      const line = `- [${new Date().toISOString().slice(0, 10)}] ${l.slice(0, 200)}\n`;
-      const r = await window.electronAPI.appendFile(expPath, line);
+    for (const line of state.pendingExperience) {
+      const r = await window.electronAPI.appendFile(expPath, line + '\n');
       if (r && r.success) {
-        state.experience += line;
-        addSolveNote('经验沉淀', l.slice(0, 200));
+        state.experience += line + '\n';
         n++;
       }
     }
+    state.pendingExperience = [];
     if (n) {
-      addLog('success', `✅ 本题经验已沉淀 ${n} 条进知识库，下次解题自动速查（避坑复用）`);
+      addLog('success', `✅ 已按指令保存 ${n} 条经验进知识库，下次解题自动速查（避坑复用）`);
+      addSystemMessage(`**✅ 经验已入库（${n} 条）**\n\n暂存经验已写入 experience.md，下次解题自动注入速查。`);
       await pruneExperience();
     }
   } catch (e) {
-    addLog('warning', '经验沉淀失败: ' + e.message);
+    addLog('error', '经验保存失败: ' + e.message);
   }
 }
 

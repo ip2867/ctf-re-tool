@@ -1980,9 +1980,10 @@ async function installApkToEmulator() {
       return false;
     }
 
-    // 安装APK（使用-r允许覆盖安装）
+    // 安装APK（-r 覆盖安装；-t 允许 testOnly 包——CTF 题 APK 常带此标记，
+    // 缺它会 INSTALL_FAILED_TEST_ONLY 秒失败）
     addLog('info', '正在安装APK...');
-    const result = await window.electronAPI.adbCommand(`install -r "${state.currentFile}"`);
+    const result = await window.electronAPI.adbCommand(`install -r -t "${state.currentFile}"`);
 
     // 必须校验 adb 的真实输出：install 成功 stdout 含 "Success"，
     // 失败含 "Failure"/"Missing APK file"/"no devices" 等（且 stderr 非空）。

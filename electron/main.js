@@ -1205,7 +1205,10 @@ async function idaMcpDiscoverTools(sessionId) {
   // 候选名映射：逻辑名 -> 真实名候选列表（按优先级）
   const candidates = {
     'list_functions': ['list_functions', 'list_funcs', 'get_all_functions', 'enumerate_functions'],
-    'find_strings': ['search_text', 'find_strings', 'get_strings', 'search_strings', 'search_string', 'find_regex', 'get_string_list', 'list_strings'],
+    // 找 flag/key 用 find_regex：字符串缓存 + Python 正则，快且不阻塞 IDA UI。
+    // search_text 是 IDA 原生 C++ 扫描，regex:true 时会对每个 EA 反复 find_text，
+    // 在稍大的二进制上会「卡住」甚至让 IDA 无响应——因此只作兜底，且调用时禁用其原生 regex。
+    'find_strings': ['find_regex', 'search_text', 'find_strings', 'get_strings', 'search_strings', 'search_string', 'get_string_list', 'list_strings'],
     'decompile': ['get_function_decompile', 'decompile_function', 'get_pseudocode', 'decompile'],
     'xrefs_to': ['get_xrefs_to', 'xrefs_to', 'get_cross_references'],
     'get_function_by_name': ['get_function_by_name'],
@@ -1231,20 +1234,39 @@ async function idaMcpResolveTool(logicalName) {
   return (idaMcpState.toolMap && idaMcpState.toolMap[logicalName]) || logicalName;
 }
 
-// 将逻辑参数名转换为各工具 schema 期望的参数名
-function normalizeIdaArgs(logicalName, args) {
+// 将逻辑参数名转换为各工具 schema 期望的参数名。
+// realName 为 tools/list 解析出的真实工具名——不同实现的参数 schema 不同，
+// 尤其是字符串搜索：find_regex 用 {pattern,limit,offset}，search_text 用
+// {pattern,limit,start,regex,...}，必须按真实工具名生成参数，否则会被 MCP 拒绝或走错分支。
+function normalizeIdaArgs(logicalName, args, realName) {
   args = args || {};
+  realName = realName || '';
   switch (logicalName) {
     case 'decompile':
       return { addr: args.address || args.addr || args.function_name || '' };
     case 'find_strings': {
-      // 真实工具可能是 search_text（本机插件）/ find_strings 等：优先给 pattern；
-      // search_text 另支持 regex/limit——含 '|' 或正则元字符时按正则搜更符合"找 flag/key"的用法
       const pat = args.pattern || args.regex || args.query || '';
-      const out = { pattern: pat };
-      if (/[|()\[\]{}^$*+?\\]/.test(String(pat))) out.regex = true;
-      if (args.limit) out.limit = args.limit;
-      return out;
+      const limit = args.limit || 30;
+      // find_regex：字符串缓存正则搜索（Python 端），快且绝不阻塞 IDA。
+      if (realName === 'find_regex') {
+        return { pattern: pat, limit };
+      }
+      // search_text：IDA 原生文本扫描。绝不能开 regex——其 SEARCH_REGEX 会对每个
+      // 候选 EA 反复调用 find_text，在大程序上会长时间卡住 IDA UI 线程（用户实测「卡住」）。
+      if (realName === 'search_text' || realName === 'find_strings' || !realName) {
+        // 无法用原生 regex 时，把 'a|b|c' 这类顶层字面量择一搜索（优先 flag），
+        // 否则会按字面去搜 'a|b|c' 整串，必然 0 命中。
+        let lit = pat;
+        if (/[|]/.test(lit) && !/[()\[\]{}^$*+?\\]/.test(lit)) {
+          const parts = lit.split('|').map(s => s.trim()).filter(Boolean);
+          lit = parts.find(s => /^flag$/i.test(s)) || parts[0] || lit;
+        }
+        const out = { pattern: lit, limit, regex: false };
+        if (realName === 'search_text') out.code_only = false;
+        return out;
+      }
+      // 其他实现（get_strings 等）：尽力透传 pattern
+      return { pattern: pat, limit };
     }
     case 'xrefs_to':
       return { address: args.address || args.addr || '' };
@@ -1278,14 +1300,13 @@ function unwrapMcpContent(envelope) {
 async function idaMcpCallTool(logicalName, args) {
   // 兼容旧调用名，统一到逻辑工具名
   const aliases = {
-    list_funcs: 'list_functions',
-    find_regex: 'find_strings'
+    list_funcs: 'list_functions'
   };
   logicalName = aliases[logicalName] || logicalName;
 
   const sessionId = await idaMcpEnsureSession();
   const realName = await idaMcpResolveTool(logicalName);
-  const realArgs = normalizeIdaArgs(logicalName, args);
+  const realArgs = normalizeIdaArgs(logicalName, args, realName);
   const baseUrl = await idaMcpGetBaseUrl();
 
   const headers = {};

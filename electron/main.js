@@ -677,6 +677,10 @@ ipcMain.handle('launch-tool', async (event, toolName, filePath) => {
     if (!toolPath) {
       return { success: false, error: `工具 ${toolName} 未配置` };
     }
+    // 启动 IDA/JEB 前固化"自动保存 + 不弹确认框"，让关闭时自动落库、无需人工点对话框
+    if (['ida', 'ida64', 'jeb'].includes(toolName)) {
+      try { hardenEditorConfigs(); } catch (e) { /* 配置固化失败不阻塞启动 */ }
+    }
 
     let cmd, args;
     if (/\.jar$/i.test(toolPath)) {
@@ -828,12 +832,45 @@ ipcMain.handle('save-file', async (event, defaultName, content, filters) => {
 });
 
 // ADB 命令（spawn 参数数组）
+// adb 解析：优先系统 PATH 里的 adb（版本新、与 Android SDK 一致）。
+// 关键修复：机器上常同时存在两个 adb（如 Android SDK 的新版 + 模拟器自带的旧版
+// nox_adb 1.0.36），两个版本的 daemon 会互相顶掉对方的 5037 端口——任何程序
+// 调一次另一版本的 adb，当前 daemon 就被杀、所有已连接设备全掉（表现为
+// install 秒失败、错误信息空白 = device not found）。全程统一用同一个 adb 即可根治。
+let _cachedAdbPath = null;
+function resolveAdbPath() {
+  if (_cachedAdbPath) return _cachedAdbPath;
+  try {
+    const which = require('child_process')
+      .execSync('where adb', { encoding: 'utf8', windowsHide: true, timeout: 5000 });
+    const first = String(which || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0];
+    if (first && fs.existsSync(first)) { _cachedAdbPath = first; return first; }
+  } catch (e) { /* 系统 PATH 无 adb → 回退配置里的 */ }
+  _cachedAdbPath = config.tools.nox_adb || 'adb';
+  return _cachedAdbPath;
+}
+
+// 连接设备（幂等）：每次 adb 命令前执行，应对 daemon 被顶替后掉线的瞬时窗口
+async function adbEnsureConnected(port) {
+  const adb = resolveAdbPath();
+  return await new Promise((resolve) => {
+    const child = spawn(adb, ['connect', `127.0.0.1:${port}`], { shell: false, windowsHide: true });
+    let out = '';
+    const t = setTimeout(() => { try { child.kill(); } catch (e) {} }, 8000);
+    child.stdout.on('data', d => { out += d.toString(); });
+    child.stderr.on('data', d => { out += d.toString(); });
+    child.on('error', () => { clearTimeout(t); resolve(false); });
+    child.on('close', () => { clearTimeout(t); resolve(/connected|already connected/i.test(out)); });
+  });
+}
+
 ipcMain.handle('adb-command', async (event, args) => {
-  const adbPath = config.tools.nox_adb;
+  const adbPath = resolveAdbPath();
   const port = config.emulator.adb_port;
+  await adbEnsureConnected(port);
   const argv = [adbPath, '-s', `127.0.0.1:${port}`].concat(tokenizeCommand(args || ''));
 
-  return new Promise((resolve) => {
+  const runOnce = () => new Promise((resolve) => {
     const child = spawn(argv[0], argv.slice(1), { shell: false, windowsHide: true });
     let stdout = '', stderr = '';
     const timer = setTimeout(() => { try { child.kill(); } catch (e) {} }, 30000);
@@ -848,6 +885,16 @@ ipcMain.handle('adb-command', async (event, args) => {
       resolve({ success: true, stdout: truncateOutput(stdout), stderr: truncateOutput(stderr), error: null });
     });
   });
+
+  let r = await runOnce();
+  // 断桥瞬时窗口重试：daemon 刚被另一版本 adb 顶掉时，第一条命令会 not found，
+  // 重连一次再试（对秒失败的 install 尤其关键）
+  if (r.success && /no devices|not found|device offline|device offline|offline/i.test(String(r.stdout) + String(r.stderr))) {
+    await adbEnsureConnected(port);
+    await new Promise(res => setTimeout(res, 400));
+    r = await runOnce();
+  }
+  return r;
 });
 
 // Frida 命令（spawn 参数数组）
@@ -1158,7 +1205,7 @@ async function idaMcpDiscoverTools(sessionId) {
   // 候选名映射：逻辑名 -> 真实名候选列表（按优先级）
   const candidates = {
     'list_functions': ['list_functions', 'list_funcs', 'get_all_functions', 'enumerate_functions'],
-    'find_strings': ['find_strings', 'get_strings', 'search_strings', 'search_string', 'find_regex', 'get_string_list', 'list_strings'],
+    'find_strings': ['search_text', 'find_strings', 'get_strings', 'search_strings', 'search_string', 'find_regex', 'get_string_list', 'list_strings'],
     'decompile': ['get_function_decompile', 'decompile_function', 'get_pseudocode', 'decompile'],
     'xrefs_to': ['get_xrefs_to', 'xrefs_to', 'get_cross_references'],
     'get_function_by_name': ['get_function_by_name'],
@@ -1190,8 +1237,15 @@ function normalizeIdaArgs(logicalName, args) {
   switch (logicalName) {
     case 'decompile':
       return { addr: args.address || args.addr || args.function_name || '' };
-    case 'find_strings':
-      return { pattern: args.pattern || args.regex || args.query || '' };
+    case 'find_strings': {
+      // 真实工具可能是 search_text（本机插件）/ find_strings 等：优先给 pattern；
+      // search_text 另支持 regex/limit——含 '|' 或正则元字符时按正则搜更符合"找 flag/key"的用法
+      const pat = args.pattern || args.regex || args.query || '';
+      const out = { pattern: pat };
+      if (/[|()\[\]{}^$*+?\\]/.test(String(pat))) out.regex = true;
+      if (args.limit) out.limit = args.limit;
+      return out;
+    }
     case 'xrefs_to':
       return { address: args.address || args.addr || '' };
     case 'list_functions':
@@ -1406,6 +1460,79 @@ function resolveJebJdkHome() {
 
 // JEB MCP 自动拉起：插件未监听 16161 时，用 JEB 启动器加载 scripts/MCP.py（可选打开目标文件）
 let jebLaunching = null;
+
+// 启动前固化"不弹确认框 + 自动保存"，避免每次都要人工点掉对话框：
+// - JEB：jeb-client.cfg 的 ui.DialogPersistenceData 里给相关对话框置 doNotShow=true
+//   （JEB 的"以后不再显示此对话框(仅本次操作)"复选框就是存这里）
+// - IDA ：idagui.cfg 的 AUTOSAVE 保持启用（>0），关闭/崩溃前会按操作数自动落库，
+//   避免"关闭后不保存"导致下次打开是空库
+function hardenEditorConfigs() {
+  // --- JEB ---
+  try {
+    const jebBat = config.tools && config.tools.jeb;
+    if (jebBat) {
+      const jebRoot = path.dirname(jebBat);
+      const cfgPath = path.join(jebRoot, 'bin', 'jeb-client.cfg');
+      if (fs.existsSync(cfgPath)) {
+        let txt = fs.readFileSync(cfgPath, 'utf8');
+        const need = ['dlgJebFileOpen', 'com.pnfsoftware.jeb.rcpclient.dialogs.AdaptivePopupDialog', 'dlgJavaVersionWarning4'];
+        const m = txt.match(/^\.ui\.DialogPersistenceData\s*=\s*(.*)$/m);
+        if (m) {
+          // 就地合并：对话框已有的参数（如 defaultPath）保留，仅追加/覆盖 doNotShow=true，
+          // 避免同一 key 出现两次（JEB 只认第一处，会白写）
+          const pairs = new Map();
+          const order = [];
+          for (const seg of m[1].trim().split('&')) {
+            if (!seg) continue;
+            const eq = seg.indexOf('=');
+            const k = eq >= 0 ? seg.slice(0, eq) : seg;
+            const v = eq >= 0 ? seg.slice(eq + 1) : '';
+            if (!pairs.has(k)) order.push(k);
+            pairs.set(k, v);
+          }
+          let changed = false;
+          for (const dlg of need) {
+            const cur = pairs.get(dlg);
+            if (cur === undefined) { pairs.set(dlg, 'doNotShow%3Dtrue'); order.push(dlg); changed = true; }
+            else if (!/doNotShow%3Dtrue/i.test(cur)) {
+              const params = cur.split('%26').filter(Boolean); // %26 = & 编码
+              const idx = params.findIndex(p => /^doNotShow%3D/i.test(p));
+              if (idx >= 0) params[idx] = 'doNotShow%3Dtrue'; else params.push('doNotShow%3Dtrue');
+              pairs.set(dlg, params.join('%26'));
+              changed = true;
+            }
+          }
+          if (changed) {
+            const val = order.map(k => k + '=' + pairs.get(k)).join('&');
+            txt = txt.replace(/^\.ui\.DialogPersistenceData\s*=.*$/m, '.ui.DialogPersistenceData = ' + val);
+            fs.writeFileSync(cfgPath, txt);
+            console.log('[JEB] 已固化对话框 doNotShow（抑制确认页）');
+          }
+        }
+      }
+    }
+  } catch (e) { console.error('[JEB] 固化配置失败:', e.message); }
+
+  // --- IDA ---
+  try {
+    const idaPath = (config.tools && (config.tools.ida || config.tools.ida64)) || '';
+    if (idaPath) {
+      const idaRoot = path.dirname(idaPath);
+      const cfgPath = path.join(idaRoot, 'cfg', 'idagui.cfg');
+      if (fs.existsSync(cfgPath)) {
+        let txt = fs.readFileSync(cfgPath, 'utf8');
+        // AUTOSAVE 为 0 时关闭自动保存 → 改成 100（每 100 次操作落库），保证关闭前有存档
+        const m = txt.match(/^AUTOSAVE\s*=\s*(\d+)/m);
+        if (m && parseInt(m[1], 10) === 0) {
+          txt = txt.replace(/^AUTOSAVE\s*=\s*\d+/m, 'AUTOSAVE                = 100');
+          fs.writeFileSync(cfgPath, txt);
+          console.log('[IDA] 已启用 AUTOSAVE=100（关闭前自动落库）');
+        }
+      }
+    }
+  } catch (e) { console.error('[IDA] 固化配置失败:', e.message); }
+}
+
 async function ensureJebPluginRunning(targetFile) {
   let existed = false;
   // jebProbe 是异步 Promise，必须 await 才能真实反映端口状态（否则 existed 恒 true，拉起永远跳过）
@@ -1424,6 +1551,7 @@ async function ensureJebPluginRunning(targetFile) {
       }
       // JEB 5.x 必须跑在 Java 17+ 上；找不到就明确报错，避免"启动了但闪退"的黑盒现象
       const jdkHome = resolveJebJdkHome();
+      try { hardenEditorConfigs(); } catch (e) { /* 配置固化失败不阻塞 */ }
       if (!jdkHome) {
         return { ok: false, error: '未找到 JDK 17+（JEB 5.x 必需）。请安装 JDK 21，或在设置 tools.jebJdkHome 中填写 JDK 主目录。' };
       }
@@ -3322,8 +3450,9 @@ async function runPythonScript(script) {
 
 // 执行ADB命令（spawn 参数数组）
 async function execAdbCommand(command) {
-  const adbPath = config.tools.nox_adb;
+  const adbPath = resolveAdbPath();
   const port = config.emulator.adb_port;
+  await adbEnsureConnected(port);
   const argv = [adbPath, '-s', `127.0.0.1:${port}`].concat(tokenizeCommand(command || ''));
 
   return new Promise((resolve) => {
@@ -4035,11 +4164,12 @@ ipcMain.handle('append-file', async (event, filePath, line) => {
 // 等待 ADB 设备就绪（轮询 get-state，替代固定 sleep）
 ipcMain.handle('adb-wait-device', async (event, timeoutMs) => {
   const deadline = Date.now() + (Number(timeoutMs) || 90000);
-  const adbPath = config.tools.nox_adb;
+  const adbPath = resolveAdbPath();
   const port = config.emulator.adb_port;
 
   while (Date.now() < deadline) {
     if (claudeAborted) return { success: false, error: '已取消' };
+    await adbEnsureConnected(port); // 每轮先重连：daemon 被另一版本 adb 顶掉后自动恢复
     const r = await new Promise((resolve) => {
       const child = spawn(adbPath, ['-s', `127.0.0.1:${port}`, 'get-state'], { shell: false, windowsHide: true });
       let out = '', err = '';

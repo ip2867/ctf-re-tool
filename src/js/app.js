@@ -621,15 +621,22 @@ async function launchTool(toolName, filePath = null) {
       } catch (e) { /* 未运行则继续启动 */ }
 
       const jebPath = state.config.tools.jeb;
-      const mcpScriptPath = (state.config.tools && state.config.tools.jebMcpPy) || '';
+      let mcpScriptPath = (state.config.tools && state.config.tools.jebMcpPy) || '';
+      // 兜底自动定位 MCP.py：配置为空时 jebMcpPy 会拼出 --script=（空值），
+      // 让 JEB 反复弹"资源确认/脚本确认"对话框。优先配置，其次 <JEB目录>/scripts/MCP.py。
+      if (!mcpScriptPath && jebPath) {
+        const guess = jebPath.replace(/[\\/][^\\/]+$/, '') + '\\scripts\\MCP.py';
+        mcpScriptPath = guess;
+      }
+      const scriptArg = mcpScriptPath ? [`--script=${mcpScriptPath}`] : [];
       if (fileToOpen) {
         // 以参数数组分离启动 JEB 并加载 MCP 脚本（若为 .bat 由主进程安全回退执行）
-        result = await window.electronAPI.runToolArgs([jebPath, `--script=${mcpScriptPath}`, fileToOpen], { detached: true });
+        result = await window.electronAPI.runToolArgs([jebPath, ...scriptArg, fileToOpen], { detached: true });
         addLog('info', `JEB打开文件: ${fileToOpen}`);
-        addLog('info', 'JEB MCP脚本自动加载中...');
+        addLog('info', mcpScriptPath ? `JEB MCP脚本: ${mcpScriptPath}` : 'JEB MCP脚本路径未配置（跳过 --script）');
       } else {
-        result = await window.electronAPI.runToolArgs([jebPath, `--script=${mcpScriptPath}`], { detached: true });
-        addLog('info', 'JEB MCP脚本自动加载中...');
+        result = await window.electronAPI.runToolArgs([jebPath, ...scriptArg], { detached: true });
+        addLog('info', mcpScriptPath ? `JEB MCP脚本: ${mcpScriptPath}` : 'JEB MCP脚本路径未配置（跳过 --script）');
       }
     } else if (toolName === 'ida' || toolName === 'ida64') {
       // 防重复实例：13337 在监听即说明已有 IDA+MCP 在跑，跳过再启动

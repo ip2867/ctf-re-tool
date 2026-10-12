@@ -888,10 +888,26 @@ ipcMain.handle('adb-command', async (event, args) => {
 
   let r = await runOnce();
   // 断桥瞬时窗口重试：daemon 刚被另一版本 adb 顶掉时，第一条命令会 not found，
-  // 重连一次再试（对秒失败的 install 尤其关键）
-  if (r.success && /no devices|not found|device offline|device offline|offline/i.test(String(r.stdout) + String(r.stderr))) {
+  // 重连一次再试（对秒失败的 install 尤其关键）。
+  // 尤其要处理 Nox 自带的 nox_adb(v36) 与本机 adb(v41) 互杀：
+  // 表现是 stderr 出现 "server version (36) doesn't match this client (41); killing"。
+  // 此时用我们的客户端 kill-server + start-server 重建 daemon，再重连重试。
+  const combined = () => String(r.stdout) + String(r.stderr);
+  const mismatch = /doesn't match this client|server version .* killing/i.test(combined());
+  if (mismatch) {
+    const adb = resolveAdbPath();
+    const runSync = (args) => new Promise((res) => {
+      const c = spawn(adb, args, { shell: false, windowsHide: true });
+      const t = setTimeout(() => { try { c.kill(); } catch (e) {} res(); }, 8000);
+      c.on('error', () => { clearTimeout(t); res(); });
+      c.on('close', () => { clearTimeout(t); res(); });
+    });
+    await runSync(['kill-server']);
+    await runSync(['start-server']);
+  }
+  if (r.success && (mismatch || /no devices|not found|device offline|offline/i.test(combined()))) {
     await adbEnsureConnected(port);
-    await new Promise(res => setTimeout(res, 400));
+    await new Promise(res => setTimeout(res, 600));
     r = await runOnce();
   }
   return r;

@@ -583,21 +583,26 @@ function spawnArgv(argv, opts = {}) {
     }
     const childOpts = Object.assign({ shell: false, windowsHide: true, timeout: opts.timeoutMs || 30000, maxBuffer: 10 * 1024 * 1024 }, extraOpts);
     if (opts.cwd && fs.existsSync(opts.cwd)) childOpts.cwd = opts.cwd;
-    // detached：GUI 工具（JEB/IDA）需要"启动后立即返回、不被超时杀掉"
-    if (opts.detached) { childOpts.detached = true; delete childOpts.timeout; }
-    // GUI 工具（IDA/JEB 等带窗口的程序）：绝不能 windowsHide=true——那会把程序自身窗口
-    // 一并隐藏（表现为"工具说已启动，但用户看不到 IDA/JEB 窗口"）。改为可见 + detached。
-    if (opts.gui) { childOpts.windowsHide = false; childOpts.detached = true; delete childOpts.timeout; }
+    // detached / gui：GUI 工具（JEB/IDA/Nox）"启动后立即返回、不阻塞、不被超时杀掉"。
+    // gui 额外要求窗口可见（windowsHide:false）。
+    // 关键：二者都必须走下面的"立即 resolve"分支——否则 detached 子进程不会触发 close，
+    // Promise 永不 resolve → 渲染层 await 卡死（实测：JEB .bat + {gui:true} 卡在"正在启动 jeb..."）。
+    const isBg = !!(opts.detached || opts.gui);
+    if (isBg) {
+      childOpts.detached = true;
+      delete childOpts.timeout;
+      if (opts.gui) childOpts.windowsHide = false;
+    }
     let child;
     try { child = spawn(file, args, childOpts); } catch (e) {
       return resolve({ success: false, stdout: '', stderr: '', error: e.message });
     }
     let stdout = '', stderr = '';
-    // detached 模式：不等输出，spawn 成功即视为已启动，让 GUI 独立运行
-    if (opts.detached) {
+    // 后台模式：不等输出，spawn 成功即视为已启动，让 GUI 独立运行
+    if (isBg) {
       child.unref();
       child.on('error', (err) => resolve({ success: false, stdout: '', stderr: '', error: err.message }));
-      setTimeout(() => resolve({ success: true, stdout: '已启动（分离运行）', stderr: '', error: null }), 800);
+      setTimeout(() => resolve({ success: true, stdout: '已启动（后台运行）', stderr: '', error: null }), 800);
       return;
     }
     const timer = setTimeout(() => { try { child.kill(); } catch (e) {} }, opts.timeoutMs || 30000);

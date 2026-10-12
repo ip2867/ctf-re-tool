@@ -65,6 +65,9 @@ metadata:
 
 | 症状 | 换路方向 |
 |---|---|
+| **动态阶段"整段落空"、Hook 0 命中** | 先查环境，别改脚本：`frida-ps -H 127.0.0.1:27042`。报 `queryIntentActivities` NPE = **frida 版本不兼容**（17.x 于 Nox Android9），降 16.7.19；spawn 失败改 attach。详见 `wiki/frida/environment-troubleshooting.md` |
+| **工具说 IDA/JEB "已启动"却看不到窗口** | 环境问题，非题目：GUI 程序需 `cmd /c start` 方式启动（本工具已修）。详见 wiki 环境排障页 |
+| **装 APK 反复失败**（`Broken pipe`/`Can't find service: package`） | 双 adb 互杀 或 package 服务未就绪：统一用 nox_adb；装前等 `service check package`=found。详见 wiki 环境排障页 |
 | 反编译看不懂/控制流爆炸 | 确认是否 OLLVM（平坦化→deflat）；或放弃静态直接动态，Hook 输入输出对 |
 | 输入对但说 wrong | 有隐含变换：Hook 比较函数看"期望值"到底是什么 |
 | 找不到比较点 | 搜"成功/失败字符串"的交叉引用；或动态对输入下内存写断点 |

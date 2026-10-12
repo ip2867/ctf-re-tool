@@ -2252,15 +2252,59 @@ async function collectIdaNativeIntel() {
       const r = await window.electronAPI.idaMcpCall('decompile', { address: name });
       if (r && r.success && r.result) {
         const code = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
-        intel.decompiled.push({ name, code: code.slice(0, 6000) });
+        // 保留 raw（含 refs，供 3b 步骤采集被引用的全局数据表）
+        intel.decompiled.push({ name, code: code.slice(0, 6000), raw: r.result });
         addLog('success', `IDA 已反编译: ${name}（${code.length} 字符）`);
       }
     } catch (e) { /* 单个失败继续 */ }
   }
 
-  // 4. 搜关键字符串（flag/key/密文常量）
+  // 3b. 采集被引用的全局数据表（关键！）
+  //     SO 里的密钥常量 / 密文表 / S 盒 / ChaCha 常量 通常放在 .data/.rodata 全局数组里，
+  //     只给反编译代码、不给常量表 → AI 永远还原不出算法（本类题"动态失败+静态缺数据"的典型）。
+  //     复用 PE 流程同款逻辑：从反编译结果的 refs 取被引用地址 → list_globals 匹配 → get_bytes 取值。
   try {
-    const rs = await window.electronAPI.idaMcpCall('find_strings', { pattern: 'flag|ctf|key|secret|[0-9a-fA-F]{32,}' });
+    const refAddrs = idaCollectRefAddrs(intel.decompiled.map(d => ({ refs: (d && d.raw && d.raw.refs) || [] })));
+    if (refAddrs.size) {
+      const gRes = await window.electronAPI.idaMcpCall('list_globals', { queries: {} });
+      const globals = (gRes && gRes.success && Array.isArray(gRes.result)) ? gRes.result : [];
+      const byAddr = globals
+        .map(g => ({ addr: String((g && g.addr) || ''), name: String((g && g.name) || ''), val: parseInt((g && g.addr) || '', 16) }))
+        .filter(g => Number.isFinite(g.val))
+        .sort((a, b) => a.val - b.val);
+      const wanted = [];
+      for (let i = 0; i < byAddr.length; i++) {
+        const g = byAddr[i];
+        if (!refAddrs.has(g.addr.toLowerCase())) continue;
+        const next = byAddr[i + 1];
+        let size = next ? next.val - g.val : 256;
+        if (!(size > 0) || size > 8192) size = 256;
+        wanted.push({ addr: g.addr, name: g.name, size });
+      }
+      if (wanted.length) {
+        const bRes = await window.electronAPI.idaMcpCall('get_bytes', {
+          regions: wanted.map(w => ({ addr: w.addr, size: w.size }))
+        });
+        if (bRes && bRes.success && Array.isArray(bRes.result)) {
+          intel.globals = bRes.result.map((r, i) => ({
+            name: (wanted[i] && wanted[i].name) || (r && r.addr) || 'global',
+            addr: (r && r.addr) || (wanted[i] && wanted[i].addr) || '',
+            data: (r && r.data) || ''
+          }));
+          addLog('success', `✅ 已读取 ${intel.globals.length} 个 SO 全局数据表: ${intel.globals.map(g => g.name).join(', ')}`);
+        }
+      }
+      // 兜底：若 refs 没带出任何地址，至少把全部全局符号名+地址列出（AI 可据此判断哪个像常量表）
+      if (!intel.globals && globals.length) {
+        intel.globalsList = globals.slice(0, 40).map(g => `${(g && g.addr) || '?'}  ${(g && g.name) || ''}`).join('\n');
+        addLog('info', `IDA 全局符号: ${globals.length} 个（已列前 40）`);
+      }
+    }
+  } catch (e) { /* 采集失败不阻塞 */ }
+
+  // 4. 搜关键字符串（flag/key/密文常量；含 crypto 特征：nonce/iv/salt/chacha/tea 等）
+  try {
+    const rs = await window.electronAPI.idaMcpCall('find_strings', { pattern: 'flag|ctf|key|secret|nonce|salt|cipher|chacha|salsa|aes|des|rc4|tea|sign|[0-9a-fA-F]{32,}' });
     if (rs && rs.success && rs.result) {
       // find_regex 返回 {n, matches:[{addr,string}]}；渲染成 `addr  string` 列表，
       // 比整段 JSON 更省 token、也便于 AI 直接引用。其他形态兜底字符串化。
@@ -4970,7 +5014,8 @@ ${classesList}
 ${mcpCache.nativeIntel && mcpCache.nativeIntel.decompiled.length ? `
 ## IDA 已反编译的 native 函数（直接用，勿重复反编译）
 ${mcpCache.nativeIntel.decompiled.map(d => `### ${d.name}\n\`\`\`c\n${d.code}\n\`\`\``).join('\n\n')}
-${mcpCache.nativeIntel.strings ? `\n## IDA 关键字符串\n${mcpCache.nativeIntel.strings}` : ''}` : ''}
+${mcpCache.nativeIntel.strings ? `\n## IDA 关键字符串\n${mcpCache.nativeIntel.strings}` : ''}
+${mcpCache.nativeIntel.globals && mcpCache.nativeIntel.globals.length ? `\n## SO 全局数据表（被反编译函数引用的常量表，逐字节 hex；密钥/密文/S盒常在此）\n${mcpCache.nativeIntel.globals.map(g => `### ${g.name} @ ${g.addr}\n${g.data}`).join('\n')}` : ''}${mcpCache.nativeIntel.globalsList ? `\n## SO 全局符号清单\n${mcpCache.nativeIntel.globalsList}` : ''}` : ''}
 
 ## 你必须做的（按需调用工具，不要只凭已有片段下结论）
 1. 用 jeb_get_all_classes 拿到完整类列表；对**混淆类**（短包名单字母类名，如 N0/d、C/h、K0/a）以及任何与校验/加密/状态相关的类，用 jeb_get_class_decompiled **逐个反编译**——真正的校验逻辑几乎总在这些类里，Activity 只是 UI。

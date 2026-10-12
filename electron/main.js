@@ -551,6 +551,24 @@ function spawnArgv(argv, opts = {}) {
     let args = argv.slice(1).map((a) => String(a));
     const isBatch = /\.(bat|cmd)$/i.test(file);
     let extraOpts = {};
+    // GUI 工具（IDA/JEB/Nox 等带窗口程序）：直接 spawn(detached) 实测拿不到可见窗口
+    // —— 进程在跑、窗口存在，但 IsWindowVisible=false（用户看不到 IDA/JEB 界面）。
+    // 可靠做法是交给 cmd 的 `start` 创建独立可视窗口环境：
+    //   cmd /c start "" "<exe>" <args...>
+    // 用 windowsVerbatimArguments 手工拼引号，参数边界清晰、路径空格安全。
+    if (opts.gui && !isBatch) {
+      const quote = (s) => '"' + String(s).replace(/"/g, '\\"') + '"';
+      const cmdLine = 'start "" ' + quote(file) + (args.length ? ' ' + args.map(quote).join(' ') : '');
+      file = process.env.ComSpec || 'cmd.exe';
+      args = ['/c', cmdLine];
+      extraOpts.windowsVerbatimArguments = true;
+      const child = spawn(file, args, Object.assign({ shell: false, windowsHide: false, detached: true }, extraOpts));
+      child.on('error', () => {});
+      child.unref();
+      // start 会立即返回；800ms 后回执"已启动"
+      setTimeout(() => resolve({ success: true, stdout: '已启动（可视窗口）', stderr: '', error: null }), 800);
+      return;
+    }
     if (isBatch) {
       // 批处理必须经 cmd.exe 执行。关键：不能简单用 ['/c', file].concat(args)——
       // cmd /s /c 会破坏含 '=' 的参数（如 JEB 的 --script=x 会被拆成两个），

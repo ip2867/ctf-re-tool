@@ -709,17 +709,25 @@ async function checkEmulatorStatus() {
     // 先尝试连接设备
     await window.electronAPI.adbCommand(`connect ${device}`);
 
-    // 检查是否连接成功
+    // 检查是否连接成功：必须匹配到 "device" 状态那一行（address 后跟空白+device）。
+    // 仅用 includes(device) 会把 offline/unauthorized 也判成在线 —— 这正是
+    // "刚报在线，下一秒 install 报 Can't find service: package" 的根因。
     const devicesResult = await window.electronAPI.adbCommand('devices');
-    const isOnline = devicesResult.success && devicesResult.stdout.includes(device);
+    const out = (devicesResult && devicesResult.stdout) || '';
+    const readyRe = new RegExp(device.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s+device\\b');
+    const isOnline = devicesResult.success && readyRe.test(out);
 
     if (isOnline) {
-      // 模拟器已在线
-      const result = await window.electronAPI.adbCommand('shell getprop ro.build.version.release');
-      setMcpStatus('emulator', true);
-      if (result.success) {
-        addLog('success', `✅ 模拟器在线 - Android ${result.stdout.trim()}`);
+      // 模拟器已在线（getprop 首次可能为空，重试几次取版本）
+      let version = '';
+      for (let i = 0; i < 5; i++) {
+        const result = await window.electronAPI.adbCommand('shell getprop ro.build.version.release');
+        version = result.success ? (result.stdout || '').trim() : '';
+        if (version) break;
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
+      setMcpStatus('emulator', true);
+      addLog('success', `✅ 模拟器在线 - Android ${version || '未知'}`);
       return true;
     }
 
@@ -744,6 +752,17 @@ async function startNoxEmulator() {
     const noxInstance = emulator.nox_instance || 'Nox_1';
     const port = emulator.adb_port || 62025;
     const device = `127.0.0.1:${port}`;
+
+    // nox_path 缺失/不存在时明确报错，避免"启动了但什么都没发生"的黑盒现象
+    if (!noxPath) {
+      addLog('error', '未配置模拟器启动器路径（设置 → 模拟器 → nox_path），无法自动启动');
+      setMcpStatus('emulator', false);
+      return false;
+    }
+    try {
+      await window.electronAPI.runToolArgs(['cmd', '/c', 'if', 'exist', noxPath, 'echo', 'NOX_OK'], {});
+    } catch (e) { /* 路径探测失败不阻塞，交给启动结果判定 */ }
+
     // 启动安卓9实例（参数数组分离启动；替代 `start "" "path" -clone:x` 拼接）
     const result = await window.electronAPI.runToolArgs([noxPath, `-clone:${noxInstance}`], { detached: true });
 
@@ -755,12 +774,22 @@ async function startNoxEmulator() {
       while (Date.now() < deadline) {
         await window.electronAPI.adbCommand(`connect ${device}`);
         const devicesResult = await window.electronAPI.adbCommand('devices');
-        if (devicesResult.success && devicesResult.stdout.includes(device)) {
+        const out = (devicesResult && devicesResult.stdout) || '';
+        // 必须匹配到 "device" 状态那一行（address 后跟 \tdevice），
+        // 仅含 address（offline/unauthorized）不算就绪——否则会假成功。
+        const readyRe = new RegExp(device.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s+device\\b');
+        if (devicesResult.success && readyRe.test(out)) {
           setMcpStatus('emulator', true);
 
-          // 验证Android版本
-          const versionResult = await window.electronAPI.adbCommand('shell getprop ro.build.version.release');
-          const version = versionResult.success ? versionResult.stdout.trim() : '未知';
+          // 验证Android版本（getprop 首次可能为空，重试几次）
+          let version = '未知';
+          for (let i = 0; i < 5; i++) {
+            const versionResult = await window.electronAPI.adbCommand('shell getprop ro.build.version.release');
+            version = versionResult.success ? (versionResult.stdout || '').trim() : '';
+            if (version) break;
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+          if (!version) version = '未知';
 
           addLog('success', `✅ 安卓9模拟器启动成功 - Android ${version}`);
           return true;
@@ -805,7 +834,8 @@ async function listFridaProcesses() {
   }
 }
 
-// 安装APK
+// 安装APK（手动按钮）——复用自动版 installApkToEmulator()，
+// 以获得 -r -t、package 服务就绪轮询、瞬时错误重试、真实输出校验等能力。
 async function installApk() {
   if (state.fileType !== 'APK') {
     addLog('warning', '请选择APK文件');
@@ -816,19 +846,11 @@ async function installApk() {
   addLog('info', '文件: ' + state.fileInfo.fileName);
 
   try {
-    // 先连接设备
-    const adbPort = (state.config.emulator && state.config.emulator.adb_port) || 62025;
-    await window.electronAPI.adbCommand(`connect 127.0.0.1:${adbPort}`);
-
-    addLog('info', '正在安装...');
-    const result = await window.electronAPI.adbCommand(`install "${state.currentFile}"`);
-    if (result.success) {
-      addLog('success', 'APK安装成功！');
-    } else {
-      addLog('error', 'APK安装失败: ' + (result.error || result.stderr));
+    const ok = await installApkToEmulator();
+    if (!ok) {
       addLog('info', '可能原因:');
-      addLog('info', '- 模拟器未启动');
-      addLog('info', '- APK与模拟器架构不兼容');
+      addLog('info', '- 模拟器未启动或 package 服务未就绪');
+      addLog('info', '- APK 与模拟器架构不兼容');
       addLog('info', '- 存储空间不足');
     }
   } catch (err) {
@@ -2129,10 +2151,7 @@ async function startFridaServer() {
     // 等待启动
     await new Promise(resolve => setTimeout(resolve, 2000));
 
-    // 设置端口转发
-    await window.electronAPI.adbCommand(`forward tcp:${fridaPort} tcp:${fridaPort}`);
-
-    // 设置端口转发
+    // 设置端口转发（一次即可；重复调用无意义）
     await window.electronAPI.adbCommand(`forward tcp:${fridaPort} tcp:${fridaPort}`);
 
     // 验证：进程在跑 + 端口真的可达。
@@ -3410,36 +3429,28 @@ Java.perform(function() {
 
 
 
-// 部署Frida
+// 部署Frida（手动按钮）——复用自动版 startFridaServer()，
+// 以获得设备就绪判定、进程复用/重启、端口转发重建、TCP 可达性验证等能力。
 async function deployFrida() {
   addLog('info', '=== 部署Frida到模拟器 ===');
 
   try {
-    // 先检查模拟器连接
-    addLog('info', '步骤1: 检查模拟器连接...');
+    // 先确认设备真正就绪（匹配 "device" 状态，避免 offline 误判）
+    const port = (state.config.emulator && state.config.emulator.adb_port) || 62025;
+    const device = `127.0.0.1:${port}`;
+    await window.electronAPI.adbCommand(`connect ${device}`);
     const deviceCheck = await window.electronAPI.adbCommand('devices');
-    if (!deviceCheck.success || !deviceCheck.stdout.includes('device')) {
-      addLog('error', '模拟器未连接，请先启动安卓9模拟器');
+    const out = (deviceCheck && deviceCheck.stdout) || '';
+    const readyRe = new RegExp(device.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s+device\\b');
+    if (!deviceCheck.success || !readyRe.test(out)) {
+      addLog('error', '模拟器未就绪，请先启动安卓9模拟器');
       return;
     }
 
-    // 检查frida-server
-    addLog('info', '步骤2: 检查frida-server...');
-    const checkResult = await window.electronAPI.adbCommand('shell "ls -la /data/local/tmp/frida-server"');
-    if (!checkResult.success) {
-      addLog('warning', 'frida-server未找到，请先将frida-server推送到模拟器');
-      addLog('info', '命令: adb push frida-server /data/local/tmp/');
-      return;
-    }
-
-    // 启动frida-server
-    addLog('info', '步骤3: 启动frida-server...');
-    const startResult = await window.electronAPI.adbCommand('shell "su -c \'nohup /data/local/tmp/frida-server -D &\'"');
-    if (startResult.success) {
-      addLog('success', 'Frida-server已启动！');
-      addLog('info', 'Frida端口: 27042');
-    } else {
-      addLog('error', 'Frida启动失败: ' + (startResult.error || startResult.stderr));
+    const ok = await startFridaServer();
+    if (ok) {
+      const fridaPort = (state.config.emulator && state.config.emulator.frida_port) || 27042;
+      addLog('success', `Frida-server 已就绪（端口: ${fridaPort}）`);
     }
   } catch (err) {
     addLog('error', '部署失败: ' + err.message);

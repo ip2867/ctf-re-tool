@@ -7,6 +7,21 @@ const http = require('http');
 const https = require('https');
 const { Client: SshClient } = require('ssh2');
 
+// ============ 全局异常兜底（防闪退） ============
+// 之前主进程没有任何 uncaughtException/unhandledRejection 处理：任意一个后台任务
+// （AI 流、Frida、脚本、adb 回调）抛出未捕获异常，Electron 会直接退出 → 表现为"工具闪退"。
+// 这里统一捕获、落盘日志、并保持进程存活，让功能继续可诊断、可恢复。
+function _crashLog(tag, err) {
+  try {
+    const line = `[${new Date().toISOString()}] [${tag}] ` + (err && (err.stack || err.message)) + '\n';
+    fs.appendFileSync(path.join(app.getPath('userData'), 'crash.log'), line);
+  } catch (e) { /* 落盘失败也不能再抛 */ }
+  try { console.error(`[${tag}]`, err); } catch (e) {}
+}
+process.on('uncaughtException', (err) => { _crashLog('uncaughtException', err); });
+process.on('unhandledRejection', (reason) => { _crashLog('unhandledRejection', reason instanceof Error ? reason : new Error(String(reason))); });
+
+
 // Claude API 基础配置（从 CC Switch 读取环境变量；config.claude 可覆盖 baseUrl/model/max_tokens）
 const CLAUDE_ENV = {
   // 兼容 CCSwitch / Claude Code 环境变量；CTF_* 仅作为显式覆盖项
@@ -206,6 +221,13 @@ function createWindow() {
   });
 
   mainWindow.loadFile(path.join(__dirname, '..', 'src', 'index.html'));
+
+  // 渲染进程崩溃/被 OOM 杀死时自动重载，避免窗口空白（"闪退"观感）
+  mainWindow.webContents.on('render-process-gone', (event, details) => {
+    _crashLog('render-process-gone', new Error(JSON.stringify(details)));
+    try { if (details && details.reason !== 'clean-exit') mainWindow.reload(); } catch (e) {}
+  });
+  mainWindow.webContents.on('unresponsive', () => { _crashLog('unresponsive', new Error('webContents unresponsive')); });
 
   // 窗口准备好后显示
   mainWindow.once('ready-to-show', () => {
@@ -1512,6 +1534,10 @@ function resolveJebJdkHome() {
   for (const root of ['C:\\Program Files\\Java', 'C:\\Program Files\\Eclipse Adoptium', 'C:\\Program Files\\Microsoft\\jdk', 'C:\\Program Files\\Amazon Corretto', 'D:\\Program Files\\Java']) {
     try { fs.readdirSync(root).forEach(n => push(path.join(root, n))); } catch (e) { /* 目录不存在 */ }
   }
+  // 先探测所有候选的 Java 版本，再择优：JDK 17 最佳（JEB 官方推荐，SecurityManager
+  // 默认可用，dexdec 沙箱完整）；其次 18/19/20/21（需 jvmopt 里 allow，已在
+  // hardenEditorConfigs 写入）。避免"目录扫描顺序"随机命中 JDK21 而丢掉 JDK17。
+  let best17 = '', bestOther = '';
   for (const home of cands) {
     const javaExe = path.join(home, 'bin', 'java.exe');
     if (!fs.existsSync(javaExe)) continue;
@@ -1519,11 +1545,14 @@ function resolveJebJdkHome() {
       const r = spawnSync(javaExe, ['-version'], { encoding: 'utf8', timeout: 5000 });
       const txt = String((r && r.stderr) || '') + String((r && r.stdout) || '');
       const m = txt.match(/version "(\d+)/);
-      if (m && parseInt(m[1], 10) >= 17) { jebJdkHomeCache = home; return home; }
+      if (!m) continue;
+      const major = parseInt(m[1], 10);
+      if (major === 17 && !best17) best17 = home;
+      else if (major > 17 && !bestOther) bestOther = home;
     } catch (e) { /* 忽略不可用的候选 */ }
   }
-  jebJdkHomeCache = '';
-  return '';
+  jebJdkHomeCache = best17 || bestOther || '';
+  return jebJdkHomeCache;
 }
 
 // JEB MCP 自动拉起：插件未监听 16161 时，用 JEB 启动器加载 scripts/MCP.py（可选打开目标文件）
@@ -1540,6 +1569,21 @@ function hardenEditorConfigs() {
     const jebBat = config.tools && config.tools.jeb;
     if (jebBat) {
       const jebRoot = path.dirname(jebBat);
+      // jvmopt.txt：JEB 启动器读取的单行 JVM 选项。JDK 18+ 下 dexdec 反混淆沙箱需要
+      // `-Djava.security.manager=allow`（否则 SecurityManager 不可用、沙箱能力受限，
+      // 重度混淆 dex 反编译会失败），并按 JEB 官方提示补 --add-opens。
+      // 仅在文件缺失或未包含该选项时写入，避免覆盖用户自定义。
+      try {
+        const jvmOptFile = path.join(jebRoot, 'jvmopt.txt');
+        const wantOpts = '-Djava.security.manager=allow --add-opens java.base/java.lang=ALL-UNNAMED';
+        let cur = '';
+        try { cur = fs.readFileSync(jvmOptFile, 'utf8').trim(); } catch (e) { cur = ''; }
+        if (!/security\.manager=allow/.test(cur)) {
+          const merged = (cur ? cur + ' ' : '') + wantOpts;
+          fs.writeFileSync(jvmOptFile, merged + '\n');
+          console.log('[JEB] 已写入 jvmopt.txt（启用 SecurityManager 白名单 + add-opens，适配 JDK 21）');
+        }
+      } catch (e) { console.error('[JEB] 写入 jvmopt.txt 失败:', e.message); }
       const cfgPath = path.join(jebRoot, 'bin', 'jeb-client.cfg');
       if (fs.existsSync(cfgPath)) {
         let txt = fs.readFileSync(cfgPath, 'utf8');

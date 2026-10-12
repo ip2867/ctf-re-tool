@@ -2043,12 +2043,18 @@ async function installApkToEmulator() {
       out = `${(result && result.stdout) || ''}\n${(result && result.stderr) || ''}`;
       installOk = /Success/i.test(out) && !/Failure|Missing APK file|no devices\/emulators found/i.test(out);
       if (installOk) break;
-      // 仅对"服务未就绪"类瞬时错误重试；testOnly/签名等确定性错误不必重试。
-      const transient = /Can't find service: package|Can't find service|device offline|device not found|closed/i.test(out);
+      // 仅对"服务未就绪/管道中断"类瞬时错误重试；testOnly/签名等确定性错误不必重试。
+      // Broken pipe / Failure calling service：多发生在 install 传输途中 adb daemon
+      // 被另一版本 adb 顶替（nox_adb v36 vs 系统 adb v41 互杀），重连后重试通常可成功。
+      const transient = /Can't find service|Failure calling service|Broken pipe|device offline|device not found|closed|error: closed/i.test(out);
       if (!transient || attempt === 3) break;
-      addLog('warning', `安装瞬时失败（${out.trim().slice(0, 160)}），${attempt * 3}s 后重试`);
+      addLog('warning', `安装瞬时失败（${out.trim().slice(0, 160)}），重建 adb 连接后重试`);
+      // 重试前重建 adb：重连设备 + 重设到 port。主进程 adb-command 内部还会在检测到
+      // 版本不匹配时 kill-server/start-server，双保险确保 daemon 属于当前客户端。
       await new Promise(r => setTimeout(r, attempt * 3000));
       await window.electronAPI.adbCommand(`connect 127.0.0.1:${adbPort}`);
+      // 重新确认 package 服务（daemon 重建后服务引用可能需重新解析）
+      try { await window.electronAPI.adbCommand('shell service check package'); } catch (e) { /* 忽略 */ }
     }
 
     if (installOk) {

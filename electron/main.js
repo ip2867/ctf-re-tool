@@ -232,6 +232,19 @@ app.whenReady().then(() => {
   loadConfig();
   createWindow();
 
+  // 主动"钉住" adb daemon 版本：用我们选定的 adb 先 start-server，
+  // 让 5037 上的 daemon 与我们的客户端版本一致，减少与 nox_adb(v36) 的互杀窗口。
+  // 失败不阻塞启动（用户可能还没装/没配置 adb）。
+  try {
+    const adb = resolveAdbPath();
+    if (adb && adb !== 'adb') {
+      const child = spawn(adb, ['start-server'], { shell: false, windowsHide: true, detached: true, stdio: 'ignore' });
+      child.on('error', () => {});
+      child.unref();
+      console.log('[adb] 已用', adb, 'start-server 固定 daemon 版本');
+    }
+  } catch (e) { /* 忽略：无 adb 时不影响其它功能 */ }
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
@@ -3648,9 +3661,12 @@ async function execFridaHook(script, target, opts) {
 // 输入 steps: [{type:'tap',x,y} | {type:'swipe',points:[[x,y],...],duration} | {type:'text',value} |
 //              {type:'key',code} | {type:'sleep',ms}]
 ipcMain.handle('drive-app-ui', async (event, steps) => {
-  const adbPath = config.tools.nox_adb;
+  // 与其它 adb 路径统一：走 resolveAdbPath()（系统 adb 优先），并在驱动前重连设备，
+  // 避免用 nox_adb(v36) 直连导致的 daemon 版本互杀（旧实现硬用 config.tools.nox_adb）。
+  const adbPath = resolveAdbPath();
   const port = config.emulator.adb_port;
   const dev = `127.0.0.1:${port}`;
+  await adbEnsureConnected(port);
   const run = (args, timeout = 15000) => new Promise((resolve) => {
     const child = spawn(adbPath, ['-s', dev, 'shell'].concat(args), { shell: false, windowsHide: true });
     let out = '', err = '';

@@ -997,8 +997,9 @@ ipcMain.handle('run-frida-hook', async (event, script, target, opts) => {
     if (!script || typeof script !== 'string') {
       return { success: false, error: 'Hook脚本为空' };
     }
-    const output = await execFridaHook(script, target, opts);
-    return { success: true, output };
+    const r = await execFridaHook(script, target, opts);
+    if (r && typeof r === 'object') return { success: r.success !== false, output: r.output || '', error: r.error || null };
+    return { success: true, output: String(r || '') };
   } catch (err) {
     return { success: false, error: err.message };
   }
@@ -3658,26 +3659,62 @@ async function execFridaHook(script, target, opts) {
   const port = config.emulator.frida_port;
   // 目标可选：'spawn:<包名>' 用 -f 自动拉起并挂启动期 hook（动态调试自动化用）；
   // 普通目标 attach 指定进程；未指定则 attach 当前前台应用（最常用）
-  const args = ['-H', `127.0.0.1:${port}`];
-  if (target && String(target).startsWith('spawn:')) {
-    args.push('-f', String(target).slice(6));
-  } else if (target) {
-    // 关键：-n 需要"进程名"，而调用方常传"包名"。先尝试解析成真实进程名；
-    // 解析不到则按原样传（部分 App 进程名确实等于包名）。
-    const resolved = await resolveFridaProcessName(target);
-    if (resolved && resolved.name) {
-      if (resolved.name.toLowerCase() !== String(target).toLowerCase()) {
-        console.log(`[Frida] 目标 "${target}" 解析为进程名 "${resolved.name}" (pid ${resolved.pid})`);
-      }
-      args.push('-n', resolved.name);
-    } else {
-      args.push('-n', target);
-    }
-  } else {
-    args.push('-F'); // 远程设备上的前台应用
-  }
-  args.push('-l', tempFile);
+  const isSpawn = target && String(target).startsWith('spawn:');
+  const spawnPkg = isSpawn ? String(target).slice(6) : '';
 
+  const buildAttachArgs = async (t) => {
+    const a = ['-H', `127.0.0.1:${port}`];
+    if (t) {
+      const resolved = await resolveFridaProcessName(t);
+      a.push('-n', (resolved && resolved.name) ? resolved.name : t);
+    } else {
+      a.push('-F');
+    }
+    a.push('-l', tempFile);
+    return a;
+  };
+
+  try {
+    if (isSpawn) {
+      const spawnArgs = ['-H', `127.0.0.1:${port}`, '-f', spawnPkg, '-l', tempFile];
+      const out = await runFridaOnce(spawnArgs, tempFile, opts);
+      // 兼容性兜底：某些 frida-server 版本在特定模拟器上 spawn 会失败
+      // （实测 frida 17.x 于 Nox Android9：java.lang.NullPointerException
+      //  queryIntentActivities）。此时 **自动回退 attach**：先用 adb 拉起 App，
+      //  再 -n attach 到其进程，同样能挂上启动期钩子（多数场景等价可用）。
+      if (out && /Failed to spawn|queryIntentActivities|NullPointerException|unable to spawn/i.test(out) && !/\[DATA\]|\[HIT\]/.test(out)) {
+        console.warn('[Frida] spawn 失败，回退 attach 模式: ' + String(out).slice(0, 200));
+        const adbPort = config.emulator.adb_port;
+        try {
+          await adbEnsureConnected(adbPort);
+          // 用 monkey 拉起主 Activity（比 am start 更省心：自动解析 launcher）
+          await new Promise((res) => {
+            const c = spawn(resolveAdbPath(), ['-s', `127.0.0.1:${adbPort}`, 'shell', 'monkey', '-p', spawnPkg, '-c', 'android.intent.category.LAUNCHER', '1'], { shell: false, windowsHide: true });
+            c.on('error', () => res()); c.on('close', () => res());
+            setTimeout(() => { try { c.kill(); } catch (e) {} res(); }, 8000);
+          });
+          await new Promise(r => setTimeout(r, 2500)); // 等进程起来
+          const attachArgs = await buildAttachArgs(spawnPkg);
+          const attachOut = await runFridaOnce(attachArgs, tempFile, opts);
+          return { success: true, output: `[spawn 失败已回退 attach]\n` + attachOut };
+        } catch (e) {
+          return { success: true, output: out };
+        }
+      }
+      return { success: true, output: out };
+    }
+    const attachArgs = await buildAttachArgs(target);
+    const out = await runFridaOnce(attachArgs, tempFile, opts);
+    return { success: true, output: out };
+  } catch (err) {
+    try { fs.unlinkSync(tempFile); } catch (e) {}
+    return { success: false, error: err.message, output: '' };
+  }
+}
+
+// 单次 frida 执行：spawn 一个 frida 进程，滚动窗口抓取输出后解析。
+// 返回合并后的输出字符串（不抛异常）。
+function runFridaOnce(args, tempFile, opts) {
   return new Promise((resolve) => {
     const child = spawn('frida', args, { shell: false });
     let stdout = '';
@@ -3701,7 +3738,8 @@ async function execFridaHook(script, target, opts) {
       try { clearTimeout(hardTimer); } catch (e) {}
       try { clearTimeout(idleTimer); } catch (e) {}
       try { child.kill(); } catch (e) {}
-      try { fs.unlinkSync(tempFile); } catch (e) {}
+      // 注意：不在此删除 tempFile —— spawn 失败回退 attach 时会复用同一脚本文件，
+      // 由 execFridaHook 在所有尝试结束后统一清理。
       resolve(msg);
     };
 
@@ -3738,7 +3776,7 @@ async function execFridaHook(script, target, opts) {
     });
 
     child.on('error', (err) => {
-      finish(`无法启动 frida: ${err.message}\n请确认已安装 frida、frida-server 已在模拟器运行并做好端口转发（adb forward tcp:${port} tcp:${port}）`);
+      finish(`无法启动 frida: ${err.message}\n请确认已安装 frida、frida-server 已在模拟器运行并做好端口转发（adb forward tcp:${config.emulator.frida_port} tcp:${config.emulator.frida_port}）`);
     });
 
     child.on('close', () => {

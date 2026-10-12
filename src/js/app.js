@@ -2172,7 +2172,20 @@ async function collectIdaNativeIntel() {
   try {
     const rs = await window.electronAPI.idaMcpCall('find_strings', { pattern: 'flag|ctf|key|secret|[0-9a-fA-F]{32,}' });
     if (rs && rs.success && rs.result) {
-      intel.strings = (typeof rs.result === 'string' ? rs.result : JSON.stringify(rs.result)).slice(0, 3000);
+      // find_regex 返回 {n, matches:[{addr,string}]}；渲染成 `addr  string` 列表，
+      // 比整段 JSON 更省 token、也便于 AI 直接引用。其他形态兜底字符串化。
+      const r = rs.result;
+      let rendered;
+      if (r && Array.isArray(r.matches)) {
+        rendered = r.matches.map(m => `${(m && m.addr) || '?'}  ${(m && (m.string || m.text)) || ''}`).join('\n');
+      } else if (Array.isArray(r)) {
+        rendered = r.map(m => (m && (m.string || m.text)) ? `${(m && m.addr) || '?'}  ${m.string || m.text}` : String(m)).join('\n');
+      } else {
+        rendered = typeof r === 'string' ? r : JSON.stringify(r);
+      }
+      intel.strings = rendered.slice(0, 3000);
+      const cnt = r && Array.isArray(r.matches) ? r.matches.length : (Array.isArray(r) ? r.length : 0);
+      addLog('info', `IDA 关键字符串: ${cnt} 条命中`);
     }
   } catch (e) { /* 忽略 */ }
 
@@ -5165,11 +5178,18 @@ async function autoSolveBinaryFlag(fileType) {
       functionsText = '函数列表解析失败';
     }
 
-    // 安全地转换字符串列表
+    // 安全地转换字符串列表（find_regex -> {n,matches:[{addr,string}]}，渲染成 addr string 列表）
     let stringsText = '暂无';
     try {
       if (analysisData.strings) {
-        stringsText = JSON.stringify(analysisData.strings).substring(0, 2000);
+        const s = analysisData.strings;
+        if (s && Array.isArray(s.matches)) {
+          stringsText = s.matches.map(m => `${(m && m.addr) || '?'}  ${(m && (m.string || m.text)) || ''}`).join('\n').substring(0, 2000);
+        } else if (Array.isArray(s)) {
+          stringsText = s.map(m => (m && (m.string || m.text)) ? `${(m && m.addr) || '?'}  ${m.string || m.text}` : String(m)).join('\n').substring(0, 2000);
+        } else {
+          stringsText = JSON.stringify(s).substring(0, 2000);
+        }
       }
     } catch (e) {
       stringsText = '字符串列表解析失败';

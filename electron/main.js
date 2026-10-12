@@ -528,11 +528,20 @@ function spawnArgv(argv, opts = {}) {
     let file = String(argv[0]);
     let args = argv.slice(1).map((a) => String(a));
     const isBatch = /\.(bat|cmd)$/i.test(file);
+    let extraOpts = {};
     if (isBatch) {
-      args = ['/d', '/s', '/c', file].concat(args);
+      // 批处理必须经 cmd.exe 执行。关键：不能简单用 ['/c', file].concat(args)——
+      // cmd /s /c 会破坏含 '=' 的参数（如 JEB 的 --script=x 会被拆成两个），
+      // 导致脚本参数错乱（实测：JEB 拿不到 --script，MCP.py 不加载、16161 不监听）。
+      // 正解：手工拼一条已加引号的命令行，配合 windowsVerbatimArguments:true，
+      // 用 cmd /s /c "<完整命令行>" 传入，参数边界即清晰无误。
+      const quote = (s) => '"' + String(s).replace(/"/g, '\\"') + '"';
+      const cmdLine = [quote(file)].concat(args.map(quote)).join(' ');
+      args = ['/s', '/c', '"' + cmdLine + '"'];
       file = process.env.ComSpec || 'cmd.exe';
+      extraOpts.windowsVerbatimArguments = true;
     }
-    const childOpts = { shell: false, windowsHide: true, timeout: opts.timeoutMs || 30000, maxBuffer: 10 * 1024 * 1024 };
+    const childOpts = Object.assign({ shell: false, windowsHide: true, timeout: opts.timeoutMs || 30000, maxBuffer: 10 * 1024 * 1024 }, extraOpts);
     if (opts.cwd && fs.existsSync(opts.cwd)) childOpts.cwd = opts.cwd;
     // detached：GUI 工具（JEB/IDA）需要"启动后立即返回、不被超时杀掉"
     if (opts.detached) { childOpts.detached = true; delete childOpts.timeout; }
@@ -845,21 +854,30 @@ ipcMain.handle('save-file', async (event, defaultName, content, filters) => {
 });
 
 // ADB 命令（spawn 参数数组）
-// adb 解析：优先系统 PATH 里的 adb（版本新、与 Android SDK 一致）。
-// 关键修复：机器上常同时存在两个 adb（如 Android SDK 的新版 + 模拟器自带的旧版
-// nox_adb 1.0.36），两个版本的 daemon 会互相顶掉对方的 5037 端口——任何程序
-// 调一次另一版本的 adb，当前 daemon 就被杀、所有已连接设备全掉（表现为
-// install 秒失败、错误信息空白 = device not found）。全程统一用同一个 adb 即可根治。
+// adb 解析：**优先模拟器自带的 nox_adb**（若已配置且存在），其次系统 PATH 里的 adb。
+//
+// 为什么优先 nox_adb：Nox 的后台服务（NoxVMSVC）会自己拉起 nox_adb(v36) 来管理它
+// 的设备；只要它一跑，就会把 5037 上的 daemon 换成 v36。如果工具坚持用系统 adb(v41)，
+// 则每轮调用都触发 "server version (41) doesn't match this client (36); killing"——
+// daemon 被反复重建、已连接设备全部掉线（表现为 devices 里 62025 突然消失、
+// service check package 失败、install 秒失败）。**与 Nox 保持同一个 adb 版本**才是根治。
+//
+// 兼容性：若未配置/不存在 nox_adb，再回退系统 adb（纯真机/非 Nox 场景）。
 let _cachedAdbPath = null;
 function resolveAdbPath() {
   if (_cachedAdbPath) return _cachedAdbPath;
+  // 1) 配置里的模拟器 adb（Nox 场景首选，与 Nox 服务版本一致）
+  const noxAdb = (config.tools && config.tools.nox_adb) || '';
+  if (noxAdb && fs.existsSync(noxAdb)) { _cachedAdbPath = noxAdb; return noxAdb; }
+  // 2) 系统 PATH 里的 adb
   try {
     const which = require('child_process')
       .execSync('where adb', { encoding: 'utf8', windowsHide: true, timeout: 5000 });
     const first = String(which || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0];
     if (first && fs.existsSync(first)) { _cachedAdbPath = first; return first; }
-  } catch (e) { /* 系统 PATH 无 adb → 回退配置里的 */ }
-  _cachedAdbPath = config.tools.nox_adb || 'adb';
+  } catch (e) { /* 系统 PATH 无 adb */ }
+  // 3) 兜底
+  _cachedAdbPath = 'adb';
   return _cachedAdbPath;
 }
 
@@ -1583,11 +1601,38 @@ function hardenEditorConfigs() {
   } catch (e) { console.error('[IDA] 固化配置失败:', e.message); }
 }
 
+// 是否已有 JEB 进程在跑（java 加载 jebc.jar）。用于避免"第一个 JEB 还在启动、
+// 端口未就绪时又拉起第二个 JEB"（两实例抢 16161/同工程 → 双双卡死）。
+function isJebProcessRunning() {
+  try {
+    const out = require('child_process').execSync('tasklist /FI "IMAGENAME eq java.exe"', { encoding: 'latin1', windowsHide: true, timeout: 5000 });
+    if (!/java\.exe/i.test(out)) return false;
+    // 进一步确认是 JEB（wmic 取命令行；失败则退化为"有 java 就当在跑"）
+    try {
+      const cl = require('child_process').execSync('wmic process where "name=\'java.exe\'" get CommandLine', { encoding: 'latin1', windowsHide: true, timeout: 6000 });
+      if (/jebc\.jar|jeb[\\/]|JEB-|jeb_wincon/i.test(cl)) return true;
+      return false;
+    } catch (e) {
+      return true; // 有 java 进程但取不到命令行：保守认为 JEB 可能在跑，等端口即可
+    }
+  } catch (e) { return false; }
+}
+
 async function ensureJebPluginRunning(targetFile) {
   let existed = false;
   // jebProbe 是异步 Promise，必须 await 才能真实反映端口状态（否则 existed 恒 true，拉起永远跳过）
   try { await jebProbe(); existed = true; } catch (e) { /* 未运行 */ }
   if (existed) return { ok: true, already: true };
+  // 端口未就绪，但已有 JEB 进程（正在启动中）：不要拉起第二个，轮询等端口即可。
+  if (!jebLaunching && isJebProcessRunning()) {
+    console.log('[JEB MCP] 检测到已有 JEB 进程在运行，等待其端口就绪（不重复启动）');
+    const deadline = Date.now() + 120000;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 4000));
+      try { await jebProbe(); return { ok: true, already: true }; } catch (e) { /* 继续等 */ }
+    }
+    return { ok: false, error: '检测到 JEB 进程在运行，但 120s 内 16161 未就绪（MCP 插件可能未加载）' };
+  }
   if (jebLaunching) return jebLaunching;
   jebLaunching = (async () => {
     try {

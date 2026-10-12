@@ -12,7 +12,8 @@ metadata:
 
 - Windows PE：`frida -n 目标.exe -l hook.js`（本机）
 - Android：`frida -H 127.0.0.1:27042 -n 包名 -l hook.js`；本工具"运行Hook"按钮抓 20 秒输出
-- 免 root/gadget：`frida -f 包名`（spawn 模式，能 Hook 到 Application.onCreate 之前的逻辑）
+- 免 root/gadget：`frida -f 包名`（spawn 模式，能 Hook 到 Application.onCreate 之前的逻辑）；若 spawn 失败则回退 attach（见"常见坑"）
+- **先自检**：`frida-ps -H 127.0.0.1:27042`。能列进程 = 环境 OK；报 `queryIntentActivities` NPE = frida 版本不兼容，降 16.7.19
 
 ## Hook 点选择树
 
@@ -104,13 +105,21 @@ Memory.scan(base, size, "aa bb cc dd", {
 
 ## 常见坑
 
+- **frida 版本兼容性（最常见、最致命）**：frida-server 与模拟器 ROM 必须**兼容**，不只是 client/server 一致。
+  实测：**frida 17.x 于 Nox/夜神 Android 9 上完全不可用**——连 `frida-ps` 都抛
+  `java.lang.NullPointerException: ... PackageManager.queryIntentActivities(...) on null`，
+  此时 spawn/attach 全部失败。**解决：把 frida 与 frida-server 一并降到 16.7.19**（广泛兼容 Android 9），
+  重启 frida-server 后 `frida-ps` 能列出进程即恢复。判断法：跑 `frida-ps -H 127.0.0.1:27042`，
+  报 NPE 就是版本问题，不是脚本问题。
+- **spawn 失败要回退 attach**：`frida -f 包名` 某些环境（旧 ROM / 特定 frida 版本 / 无 launcher 解析）
+  会 `Failed to spawn`。此时改用：先 `adb shell monkey -p 包名 -c android.intent.category.LAUNCHER 1`
+  拉起 App，再 `frida -H ... -n 进程名 -l hook.js`（attach），多数场景等价可用（本工具已内置自动回退）。
 - Hook `String.equals` 不过滤 → 日志爆炸刷屏；过滤 `length()>4` 且非系统调用
 - 不要 Hook `java.util.Objects.equals` 之类超热方法 → 每次比较都进，会把 Frida agent 打崩（实测 `Bad access due to protection failure`）；优先 hook 低频的 `Cipher.init`
 - 解密报 `Incorrect IV length (16 required)` → IV 被按错误编码解（如明文被当 base64）；key/IV 编码互相独立，见 `wiki/frida/param-encoding.md`
 - `overload` 不匹配直接异常 → 先 `.overloads.forEach` 打印真实签名再选
 - spawn 模式启动太早 Java 还没就绪，且 `ActivityThread.currentApplication()` 可能为 null → 包在 `Java.perform` 里，取 context 用 `setInterval` 轮询重试
 - `SharedPreferences` 编辑器是内部类 → `Java.use('android.app.SharedPreferencesImpl$EditorImpl')`，写成 `.EditorImpl` 会 undefined
-- Android 9 上 frida-server 需与 PC 端 frida 版本一致，否则 `unable to communicate`
 - 打印 byte[] 不要直接 toString → 用 bytesToHex
 
 ## 结果回填约定

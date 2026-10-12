@@ -57,6 +57,13 @@ APK → 查壳 → (有壳:脱壳) → Java层分析(JEB MCP 优先，软件自�
 ## 5. Frida 动态取证（本工具默认环境）
 
 - 环境：Nox Android 9（ADB 62025），frida-server 27042
+- **开工前必做环境自检**：`frida-ps -H 127.0.0.1:27042`
+  - 能列出进程 → 环境 OK，继续
+  - 报 `java.lang.NullPointerException: ... queryIntentActivities on null` → **frida 与模拟器不兼容**
+    （实测 frida 17.x 于 Nox Android 9 完全不可用）。**把 frida 与 frida-server 一并降到 16.7.19**，
+    重启 frida-server（`pkill frida-server` 后重新 `nohup /data/local/tmp/frida-server -D`），再自检通过为止。
+    否则 spawn/attach 全部失败，动态阶段会整段落空（这是"动态抓取失败"最常见的原因，且报错看着像脚本问题、实则版本问题）。
+  - 若 `-f spawn` 报 `Failed to spawn`：改用 **attach**——`adb shell monkey -p 包名 -c android.intent.category.LAUNCHER 1` 拉起后 `-n 进程名`。
 - 高价值 Hook 点（按命中率排序）：
   1. `javax.crypto.Cipher.init/doFinal` → 密钥、IV、密文一次拿全
   2. `java.lang.String.equals` → 比较点即 flag 校验点

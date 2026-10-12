@@ -8,6 +8,7 @@
 
 | 页面 | 一句话 | 何时读 |
 |---|---|---|
+| [environment-troubleshooting.md](frida/environment-troubleshooting.md) | **环境排障**：frida 版本不兼容 / 双 adb 互杀 / 装 APK 失败 / 看不到 IDA-JEB 窗口 / JEB 连不上 | 动态阶段"整段落空"、工具说启动了却看不到、装包反复失败 |
 | [in-process-decrypt.md](frida/in-process-decrypt.md) | 让 Hook 在 App 进程内自己解密，直接打印 `[FLAG]` | 抓得到密文但出不了 flag；要"Hook 出 flag" |
 | [native-key-inversion.md](frida/native-key-inversion.md) | 从 native 常量反演密钥（正逆互校） | 校验在 .so，Java 只见 `native int[] f(String)` + int[] 常量比较 |
 | [param-encoding.md](frida/param-encoding.md) | key/IV/密文编码与 IV 长度坑的自适应处理 | 报 `Incorrect IV length` / `Incorrect padding` / 解出乱码 |

@@ -1987,15 +1987,48 @@ async function installApkToEmulator() {
       return false;
     }
 
-    // 安装APK（-r 覆盖安装；-t 允许 testOnly 包——CTF 题 APK 常带此标记，
-    // 缺它会 INSTALL_FAILED_TEST_ONLY 秒失败）
-    addLog('info', '正在安装APK...');
-    const result = await window.electronAPI.adbCommand(`install -r -t "${state.currentFile}"`);
+    // 关键：设备"在线"≠"包管理器就绪"。模拟器刚开机时 system_server 尚未注册
+    // package 服务，此时 install 会秒失败 —— `cmd: Can't find service: package`
+    // （CrackMe_1_3 实战触发）。安装前先轮询 `service check package`，直到 found。
+    {
+      let pkgReady = false;
+      const deadline = Date.now() + 60000; // 最长等 60s（Android 冷启动偏慢）
+      let waited = 0;
+      while (Date.now() < deadline) {
+        try {
+          const chk = await window.electronAPI.adbCommand('shell service check package');
+          const o = `${(chk && chk.stdout) || ''}${(chk && chk.stderr) || ''}`;
+          if (/found/i.test(o) && !/not found/i.test(o)) { pkgReady = true; break; }
+        } catch (e) { /* 继续等 */ }
+        if (waited === 0) addLog('info', '等待模拟器 package 服务就绪...');
+        await new Promise(r => setTimeout(r, 2000));
+        waited += 2;
+      }
+      if (!pkgReady) {
+        addLog('warning', '模拟器 package 服务在 60s 内未就绪（系统可能仍在启动），继续尝试安装...');
+      } else if (waited > 0) {
+        addLog('info', `模拟器 package 服务已就绪（等待 ${waited}s）`);
+      }
+    }
 
-    // 必须校验 adb 的真实输出：install 成功 stdout 含 "Success"，
-    // 失败含 "Failure"/"Missing APK file"/"no devices" 等（且 stderr 非空）。
-    const out = `${(result && result.stdout) || ''}\n${(result && result.stderr) || ''}`;
-    const installOk = /Success/i.test(out) && !/Failure|Missing APK file|no devices\/emulators found/i.test(out);
+    // 安装APK（-r 覆盖安装；-t 允许 testOnly 包——CTF 题 APK 常带此标记，
+    // 缺它会 INSTALL_FAILED_TEST_ONLY 秒失败）。
+    // install 对 `Can't find service: package` 等瞬时错误做重试（最多3次，间隔递增）。
+    let result = null, out = '', installOk = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      addLog('info', attempt === 1 ? '正在安装APK...' : `重试安装APK（第${attempt}次）...`);
+      result = await window.electronAPI.adbCommand(`install -r -t "${state.currentFile}"`);
+      out = `${(result && result.stdout) || ''}\n${(result && result.stderr) || ''}`;
+      installOk = /Success/i.test(out) && !/Failure|Missing APK file|no devices\/emulators found/i.test(out);
+      if (installOk) break;
+      // 仅对"服务未就绪"类瞬时错误重试；testOnly/签名等确定性错误不必重试。
+      const transient = /Can't find service: package|Can't find service|device offline|device not found|closed/i.test(out);
+      if (!transient || attempt === 3) break;
+      addLog('warning', `安装瞬时失败（${out.trim().slice(0, 160)}），${attempt * 3}s 后重试`);
+      await new Promise(r => setTimeout(r, attempt * 3000));
+      await window.electronAPI.adbCommand(`connect 127.0.0.1:${adbPort}`);
+    }
+
     if (installOk) {
       addLog('success', '✅ APK安装成功');
 

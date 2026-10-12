@@ -2525,10 +2525,15 @@ function postClaudeStream(requestBody, onDelta) {
       path: urlObj.pathname,
       method: 'POST',
       headers: claudeHeaders(postData),
-      timeout: 600000
+      // 连接阶段超时 60s：服务不可达/排队时快速失败，避免卡满 10 分钟；
+      // 建立响应后改为空闲超时（120s 无数据即断，见 req.setTimeout）。
+      timeout: 60000
     };
 
     const req = client.request(options, (res) => {
+      // SSE 流内的空闲超时：异常连接若长时间无数据，会一直挂到硬超时，
+      // 表现为工具"卡住不动"。这里 120s 无数据即断开，交给上层重试/报错。
+      try { req.setTimeout(120000, () => { req.destroy(new Error('Claude 流空闲超时（120s 无数据）')); }); } catch (e) {}
       // 非 200：收完 body 走统一错误处理
       if (res.statusCode < 200 || res.statusCode >= 300) {
         let data = '';

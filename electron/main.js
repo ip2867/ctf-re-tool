@@ -567,6 +567,9 @@ function spawnArgv(argv, opts = {}) {
     if (opts.cwd && fs.existsSync(opts.cwd)) childOpts.cwd = opts.cwd;
     // detached：GUI 工具（JEB/IDA）需要"启动后立即返回、不被超时杀掉"
     if (opts.detached) { childOpts.detached = true; delete childOpts.timeout; }
+    // GUI 工具（IDA/JEB 等带窗口的程序）：绝不能 windowsHide=true——那会把程序自身窗口
+    // 一并隐藏（表现为"工具说已启动，但用户看不到 IDA/JEB 窗口"）。改为可见 + detached。
+    if (opts.gui) { childOpts.windowsHide = false; childOpts.detached = true; delete childOpts.timeout; }
     let child;
     try { child = spawn(file, args, childOpts); } catch (e) {
       return resolve({ success: false, stdout: '', stderr: '', error: e.message });
@@ -1701,7 +1704,8 @@ async function ensureJebPluginRunning(targetFile) {
         + (target ? ' -- "' + target + '"' : '')
         + ' > "' + logFile + '" 2>&1';
       const child = spawn('cmd.exe', ['/s', '/c', '"' + cmdLine + '"'], {
-        detached: true, stdio: 'ignore', windowsHide: true,
+        // GUI（JEB 桌面窗口）需要可见：windowsHide:false，否则用户看不到 JEB 界面
+        detached: true, stdio: 'ignore', windowsHide: false,
         windowsVerbatimArguments: true,
         // 注入 JAVA_HOME，让 jeb_wincon.bat 用 JDK 17+ 而不是 PATH 里的 Java 8
         env: Object.assign({}, process.env, { JEB_MCP_DAEMON: '1', JAVA_HOME: jdkHome })

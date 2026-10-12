@@ -631,11 +631,11 @@ async function launchTool(toolName, filePath = null) {
       const scriptArg = mcpScriptPath ? [`--script=${mcpScriptPath}`] : [];
       if (fileToOpen) {
         // 以参数数组分离启动 JEB 并加载 MCP 脚本（若为 .bat 由主进程安全回退执行）
-        result = await window.electronAPI.runToolArgs([jebPath, ...scriptArg, fileToOpen], { detached: true });
+        result = await window.electronAPI.runToolArgs([jebPath, ...scriptArg, fileToOpen], { gui: true });
         addLog('info', `JEB打开文件: ${fileToOpen}`);
         addLog('info', mcpScriptPath ? `JEB MCP脚本: ${mcpScriptPath}` : 'JEB MCP脚本路径未配置（跳过 --script）');
       } else {
-        result = await window.electronAPI.runToolArgs([jebPath, ...scriptArg], { detached: true });
+        result = await window.electronAPI.runToolArgs([jebPath, ...scriptArg], { gui: true });
         addLog('info', mcpScriptPath ? `JEB MCP脚本: ${mcpScriptPath}` : 'JEB MCP脚本路径未配置（跳过 --script）');
       }
     } else if (toolName === 'ida' || toolName === 'ida64') {
@@ -680,10 +680,10 @@ async function launchTool(toolName, filePath = null) {
         // 参数数组分离启动 IDA 并打开文件（防注入）；-A 自主模式：
         // 跳过 "Load a new file" 等人工对话框，按默认加载器自动建库分析。
         // 冷启动时若模态框卡住，MCP 插件的 autostart 永远不会执行（13337 起不来）。
-        result = await window.electronAPI.runToolArgs([idaPath, '-A', fileToOpen], { detached: true });
+        result = await window.electronAPI.runToolArgs([idaPath, '-A', fileToOpen], { gui: true });
         addLog('info', `IDA打开文件: ${fileToOpen}（-A 自主模式，跳过加载对话框）`);
       } else {
-        result = await window.electronAPI.runToolArgs([idaPath, '-A'], { detached: true });
+        result = await window.electronAPI.runToolArgs([idaPath, '-A'], { gui: true });
       }
     } else {
       result = await window.electronAPI.launchTool(toolName, fileToOpen);
@@ -764,7 +764,7 @@ async function startNoxEmulator() {
     } catch (e) { /* 路径探测失败不阻塞，交给启动结果判定 */ }
 
     // 启动安卓9实例（参数数组分离启动；替代 `start "" "path" -clone:x` 拼接）
-    const result = await window.electronAPI.runToolArgs([noxPath, `-clone:${noxInstance}`], { detached: true });
+    const result = await window.electronAPI.runToolArgs([noxPath, `-clone:${noxInstance}`], { gui: true });
 
     if (result.success) {
       addLog('info', '安卓9模拟器启动中，等待设备就绪（最长90秒）...');

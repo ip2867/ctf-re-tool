@@ -2099,10 +2099,21 @@ async function startFridaServer() {
     // 已在运行则复用（避免无谓重启造成的端口转发空窗/打断正在进行的会话）
     const already = await window.electronAPI.adbCommand('shell "ps | grep frida-server"');
     if (already.success && /frida-server/.test(already.stdout || '')) {
+      // 重新转发并探活：daemon 重建会丢 forward，光有进程不代表端口可达
       await window.electronAPI.adbCommand(`forward tcp:${fridaPort} tcp:${fridaPort}`);
-      addLog('success', `Frida 服务已在运行，复用（端口: ${fridaPort}）`);
-      setMcpStatus('frida', true);
-      return true;
+      let ok = false;
+      for (let i = 0; i < 4; i++) {
+        try { const pr = await window.electronAPI.checkPort(`http://127.0.0.1:${fridaPort}/`); ok = !!(pr && pr.listening); } catch (e) { ok = false; }
+        if (ok) break;
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      if (ok) {
+        addLog('success', `Frida 服务已在运行，复用（端口: ${fridaPort}）`);
+        setMcpStatus('frida', true);
+        return true;
+      }
+      addLog('info', 'frida-server 进程在但端口不可达，重新启动...');
+      // 落到下面走"杀残留→重启"逻辑
     }
 
     // 杀死残留的 frida-server（未正常退出时）
@@ -2121,12 +2132,33 @@ async function startFridaServer() {
     // 设置端口转发
     await window.electronAPI.adbCommand(`forward tcp:${fridaPort} tcp:${fridaPort}`);
 
-    // 验证frida-server是否运行
+    // 设置端口转发
+    await window.electronAPI.adbCommand(`forward tcp:${fridaPort} tcp:${fridaPort}`);
+
+    // 验证：进程在跑 + 端口真的可达。
+    // 不能只看 `ps | grep frida`——adb daemon 被 nox_adb 顶掉重建时 forward 会丢失，
+    // 此时进程还在但 127.0.0.1:27042 已不可达（实战中导致动态阶段被整段跳过）。
     const psResult = await window.electronAPI.adbCommand('shell "ps | grep frida"');
-    if (psResult.success && psResult.stdout.includes('frida')) {
+    const procAlive = psResult.success && /frida-server/.test(psResult.stdout || '');
+    let reachable = false;
+    for (let i = 0; i < 5 && procAlive; i++) {
+      try {
+        const pr = await window.electronAPI.checkPort(`http://127.0.0.1:${fridaPort}/`);
+        reachable = !!(pr && pr.listening);
+      } catch (e) { reachable = false; }
+      if (reachable) break;
+      // forward 可能因 daemon 重建丢失：重新转发后再探
+      await window.electronAPI.adbCommand(`forward tcp:${fridaPort} tcp:${fridaPort}`);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    if (procAlive && reachable) {
       addLog('success', `✅ Frida服务已启动 (端口: ${fridaPort})`);
       setMcpStatus('frida', true);
       return true;
+    } else if (procAlive && !reachable) {
+      addLog('warning', `frida-server 进程在运行，但 ${fridaPort} 端口不可达（端口转发可能失效）`);
+      setMcpStatus('frida', false);
+      return false;
     } else {
       addLog('warning', 'Frida启动可能失败，请手动检查');
       setMcpStatus('frida', false);
@@ -4287,9 +4319,14 @@ async function autoFridaStage() {
   addLog('info', '[阶段3] 动态调试自动化（Frida）');
   addLog('info', '========================================');
 
-  // 1. 探测 frida-server
+  // 1. 探测 frida-server（先重连设备并重新转发：daemon 被顶替时 forward 会丢失）
   const fridaPort = (state.config && state.config.emulator && state.config.emulator.frida_port) || 27042;
   let online = false;
+  try {
+    const adbPort = (state.config.emulator && state.config.emulator.adb_port) || 62025;
+    await window.electronAPI.adbCommand(`connect 127.0.0.1:${adbPort}`);
+    await window.electronAPI.adbCommand(`forward tcp:${fridaPort} tcp:${fridaPort}`);
+  } catch (e) { /* 忽略，下面探活仍会判定 */ }
   try {
     const probe = await window.electronAPI.checkPort(`http://127.0.0.1:${fridaPort}/`);
     online = !!(probe && probe.listening);

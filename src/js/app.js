@@ -4353,6 +4353,23 @@ async function autoFridaStage() {
     return;
   }
 
+  // 1b. Frida 兼容性自检：端口通不代表能用。某些 frida-server 版本在与旧版模拟器
+  //     （如 Nox Android 9）组合时，连 frida-ps 都会抛
+  //     `java.lang.NullPointerException: queryIntentActivities on null`——
+  //     spawn/attach 全部失败。这里提前探一次，明确报因并给出降级指引。
+  let fridaCompat = true;
+  try {
+    const ps = await window.electronAPI.fridaPs();
+    const psText = JSON.stringify(ps || {});
+    if (/queryIntentActivities|NullPointerException|unable to communicate|major versions match/i.test(psText)) {
+      fridaCompat = false;
+      addLog('warning', '⚠️ Frida 与当前模拟器不兼容（frida-ps 报 queryIntentActivities NullPointerException）');
+      addLog('warning', '这通常是 frida-server 版本过新、与模拟器 Android 版本不匹配所致。');
+      addLog('info', '建议：将 frida 与 frida-server 一并降到兼容版本（如 16.7.19），再重试。');
+      addSystemMessage('**⚠️ Frida 版本不兼容**\n\n`frida-ps` 报 `queryIntentActivities NullPointerException`——frida-server 与模拟器不兼容（常见于 frida 17.x + Nox Android 9）。\n\n**建议**：把 **frida 与 frida-server 都降到 16.7.19**（client 与 server 大版本需一致），重启 frida-server 后重试。');
+    }
+  } catch (e) { /* 探活失败不阻断，交给后续 spawn 回退处理 */ }
+
   // 2. 确定包名（spawn 目标）
   let packageName = null;
   const pm = String(mcpCache.manifest || '').match(/package="([^"]+)"/);

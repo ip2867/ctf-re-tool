@@ -1129,7 +1129,7 @@ async function processUserMessage(message) {
 - 搜索关键字符串：flag、encrypt、decrypt、password、key
 
 **第4步：动态分析（Frida Hook）**
-- 安装: \`<nox_adb_path> -s 127.0.0.1:62025 install app.apk\`
+- 安装: \`<adb 路径> -s 127.0.0.1:62025 install app.apk\`（adb 路径见设置页 _adb 项）
 - Hook: \`frida -H 127.0.0.1:27042 -n "AppName" -l hook.js\`
 
 **第5步：算法还原 → Python/Z3 解密脚本**

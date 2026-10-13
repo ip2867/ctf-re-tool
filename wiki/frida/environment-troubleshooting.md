@@ -21,32 +21,43 @@ frida-ps -H 127.0.0.1:27042               # 期望：列出进程列表
 netstat -ano | findstr :13337             # 期望：有 LISTENING
 ```
 
-## 1. 🔴 Frida 版本不兼容（"动态抓取失败"最常见原因）
+## 1. 🔴 Frida client 与 server 版本不匹配（"动态抓取失败"最常见原因）
 
-**症状**（看着像脚本问题、实则是版本问题）：
+**症状**（看着像脚本问题，实则是版本问题）：
 ```
 Failed to spawn: java.lang.NullPointerException:
 Attempt to invoke virtual method 'java.util.List android.content.pm.PackageManager
 .queryIntentActivities(android.content.Intent, int)' on a null object reference
 ```
-且 **`frida-ps -H ... ` 也报同样的 NPE**（这是关键判据——连列进程都不行，就不是脚本的事）。
+或
+```
+Failed to spawn: unable to communicate with remote frida-server;
+please ensure that major versions match ...
+```
+且 **`frida-ps -H ... ` 也报同样的错**（关键判据——连列进程都不行，就不是脚本的事）。
 
-**根因**：**frida 17.x 与 Nox/夜神 Android 9 不兼容**（frida-server 初始化时调 Android PackageManager 失败）。
+**根因**：**PC 端 frida 客户端 与 设备端 frida-server 版本不一致**（大版本或次版本不同）。
+（曾误判为"frida 17.x 与 Nox Android9 不兼容"，**实为误判**——实测 client/server **只要一致**，16/16 与 17/17 **都能正常** `frida-ps`+`spawn`；不一致则必崩。）
 
-**修复（实测有效）**：把 **frida 与 frida-server 一并降到 16.7.19**：
+**修复（实测有效）**：让 **client 与 server 版本完全一致**（推荐都用 16.7.19）：
 ```bash
-# PC 端
+# 1) PC 端对齐
 python -m pip install "frida==16.7.19" "frida-tools==12.5.0"
+frida --version            # 记下版本号 X
 
-# 模拟器端：push 16.7.19 的 frida-server(对应架构, 如 android-x86_64)，替换后重启
-nox_adb -s 127.0.0.1:62025 shell "su -c 'pkill frida-server'"
-nox_adb -s 127.0.0.1:62025 push frida-server-16.7.19 /data/local/tmp/frida-server-16
-nox_adb -s 127.0.0.1:62025 shell "su -c 'chmod 755 /data/local/tmp/frida-server-16'"
-nox_adb -s 127.0.0.1:62025 shell "su -c 'nohup /data/local/tmp/frida-server-16 -D >/dev/null 2>&1 &'"
-# 复检
+# 2) 设备端：把 server 换成同版本，并**覆盖工具实际使用的路径** /data/local/tmp/frida-server
+nox_adb -s 127.0.0.1:62025 shell "su -c 'pkill -f frida-server'"
+nox_adb -s 127.0.0.1:62025 push frida-server-16.7.19 /data/local/tmp/frida-server
+nox_adb -s 127.0.0.1:62025 shell "su -c 'chmod 755 /data/local/tmp/frida-server'"
+nox_adb -s 127.0.0.1:62025 shell "su -c 'nohup /data/local/tmp/frida-server -D >/dev/null 2>&1 &'"
+nox_adb -s 127.0.0.1:62025 shell "/data/local/tmp/frida-server --version"   # 必须 == X
+
+# 3) 复检
 frida-ps -H 127.0.0.1:27042               # 能列进程即成功
 ```
-> client 与 server **大版本必须一致**（16 配 16）。不一致会 `unable to communicate with remote frida-server; major versions match`。
+> **关键坑**：本工具/脚本启动 frida-server 用的是固定路径 **`/data/local/tmp/frida-server`**。
+> 若把新版本只放到 `frida-server-16` 之类的**别名**路径，工具仍会用旧的主路径文件 → 版本照旧不匹配。
+> **必须覆盖主路径** `/data/local/tmp/frida-server` 本身。
 
 **兜底**：若 `-f spawn` 仍失败，改 **attach**——先 `adb shell monkey -p 包名 -c android.intent.category.LAUNCHER 1` 拉起，再 `frida -H ... -n 进程名 -l hook.js`。
 

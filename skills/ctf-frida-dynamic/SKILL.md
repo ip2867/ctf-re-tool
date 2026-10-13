@@ -13,7 +13,7 @@ metadata:
 - Windows PE：`frida -n 目标.exe -l hook.js`（本机）
 - Android：`frida -H 127.0.0.1:27042 -n 包名 -l hook.js`；本工具"运行Hook"按钮抓 20 秒输出
 - 免 root/gadget：`frida -f 包名`（spawn 模式，能 Hook 到 Application.onCreate 之前的逻辑）；若 spawn 失败则回退 attach（见"常见坑"）
-- **先自检**：`frida-ps -H 127.0.0.1:27042`。能列进程 = 环境 OK；报 `queryIntentActivities` NPE = frida 版本不兼容，降 16.7.19
+- **先自检**：`frida-ps -H 127.0.0.1:27042`。能列进程 = 环境 OK；报 `queryIntentActivities` NPE 或 `major versions match` = client/server 版本不一致，两端对齐同一版本
 
 ## Hook 点选择树
 
@@ -105,13 +105,16 @@ Memory.scan(base, size, "aa bb cc dd", {
 
 ## 常见坑
 
-- **frida 版本兼容性（最常见、最致命）**：frida-server 与模拟器 ROM 必须**兼容**，不只是 client/server 一致。
-  实测：**frida 17.x 于 Nox/夜神 Android 9 上完全不可用**——连 `frida-ps` 都抛
-  `java.lang.NullPointerException: ... PackageManager.queryIntentActivities(...) on null`，
-  此时 spawn/attach 全部失败。**解决：把 frida 与 frida-server 一并降到 16.7.19**（广泛兼容 Android 9），
-  重启 frida-server 后 `frida-ps` 能列出进程即恢复。判断法：跑 `frida-ps -H 127.0.0.1:27042`，
-  报 NPE 就是版本问题，不是脚本问题。
-- **spawn 失败要回退 attach**：`frida -f 包名` 某些环境（旧 ROM / 特定 frida 版本 / 无 launcher 解析）
+- **frida client/server 版本必须一致（最常见、最致命）**：PC 端 frida 客户端 与 设备端 frida-server
+  **版本要完全一致**（大/次版本）。不一致时连 `frida-ps` 都失败，报
+  `java.lang.NullPointerException: ... queryIntentActivities(...) on null`
+  或 `unable to communicate with remote frida-server; please ensure that major versions match`，
+  此时 spawn/attach 全部失败。
+  **解决：两者对齐到同一版本（推荐都 16.7.19）**，并**把 server 覆盖到工具实际使用的路径
+  `/data/local/tmp/frida-server`**（只放别名如 `frida-server-16` 无效——工具仍用主路径旧文件）。
+  实测：**client/server 一致时 16/16 与 17/17 都能正常 `frida-ps`+`spawn`**；不一致必崩。
+  判断法：跑 `frida-ps -H 127.0.0.1:27042` —— 能列进程=OK，报上述错=版本不匹配（非脚本问题）。
+- **spawn 失败要回退 attach**：`frida -f 包名` 某些环境（旧 ROM / 版本不匹配 / 无 launcher 解析）
   会 `Failed to spawn`。此时改用：先 `adb shell monkey -p 包名 -c android.intent.category.LAUNCHER 1`
   拉起 App，再 `frida -H ... -n 进程名 -l hook.js`（attach），多数场景等价可用（本工具已内置自动回退）。
 - Hook `String.equals` 不过滤 → 日志爆炸刷屏；过滤 `length()>4` 且非系统调用

@@ -59,10 +59,12 @@ APK → 查壳 → (有壳:脱壳) → Java层分析(JEB MCP 优先，软件自�
 - 环境：Nox Android 9（ADB 62025），frida-server 27042
 - **开工前必做环境自检**：`frida-ps -H 127.0.0.1:27042`
   - 能列出进程 → 环境 OK，继续
-  - 报 `java.lang.NullPointerException: ... queryIntentActivities on null` → **frida 与模拟器不兼容**
-    （实测 frida 17.x 于 Nox Android 9 完全不可用）。**把 frida 与 frida-server 一并降到 16.7.19**，
-    重启 frida-server（`pkill frida-server` 后重新 `nohup /data/local/tmp/frida-server -D`），再自检通过为止。
-    否则 spawn/attach 全部失败，动态阶段会整段落空（这是"动态抓取失败"最常见的原因，且报错看着像脚本问题、实则版本问题）。
+  - 报 `java.lang.NullPointerException: ... queryIntentActivities on null` 或
+    `unable to communicate ... major versions match` → **PC 端 frida 客户端与设备端 frida-server 版本不一致**。
+    **两端对齐到同一版本（推荐都 16.7.19）**，并把 server **覆盖到工具实际使用的路径
+    `/data/local/tmp/frida-server`**（放别名无效）。重启 server 后自检通过为止。
+    否则 spawn/attach 全部失败，动态阶段整段落空（"动态抓取失败"最常见原因；报错看着像脚本问题、实则版本不匹配）。
+    （实测：client/server 一致时 16/16、17/17 都可用；不一致必崩。）
   - 若 `-f spawn` 报 `Failed to spawn`：改用 **attach**——`adb shell monkey -p 包名 -c android.intent.category.LAUNCHER 1` 拉起后 `-n 进程名`。
 - 高价值 Hook 点（按命中率排序）：
   1. `javax.crypto.Cipher.init/doFinal` → 密钥、IV、密文一次拿全

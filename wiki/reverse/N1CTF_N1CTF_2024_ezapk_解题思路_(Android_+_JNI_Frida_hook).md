@@ -52,7 +52,7 @@ key_observations:
 - Frida Java.use + .implementation 拦截 native 方法是 APK 逆向的标准武器
 - JNI 标准符号：Java_<package>_<class>_<method>（包名/类名/方法名替换）
 - JNI GetStringUTFChars 拿 jstring, ReleaseStringUTFChars 释放 = JNI 字符串转换标准范式
-- 目标密文 'iRrL63tve+H72wjr/HHiwlVu5RZU9XDcI7A=' �� base64，可能是 AES/DES/RSA
+- 目标密文 'iRrL63tve+H72wjr/HHiwlVu5RZU9XDcI7A=' 是 base64，可能是 AES/DES/RSA
 prerequisites:
 - Android APK 逆向基础（jadx + apktool + IDA/Ghidra）
 - JNI native 方法 hook（Frida Java.use / .implementation）

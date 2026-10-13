@@ -36,7 +36,7 @@ meta_path: CrackMe3_逆向分析实战_–_PowerPC架构双重加密挑战完全
 images_removed: true
 images_removed_count: 0
 schema_version: v3.0.0-P0
-summary: CrackMe3 逆向分析实战 – PowerPC架构双重加密挑战完全解析。PowerPC64 CrackMe，IDEA+RC6双重加密逆向。关键路径：file命令识别ELF 64-bit LSB PowerPC abiv2 → radare2 r2 -q -c 'aaa; iz'列字符串 → Bingo!"在0x100024a8。经验：非x86架构二进制���向需用file/readelf先...
+summary: CrackMe3 逆向分析实战 – PowerPC架构双重加密挑战完全解析。PowerPC64 CrackMe，IDEA+RC6双重加密逆向。关键路径：file命令识别ELF 64-bit LSB PowerPC abiv2 → radare2 r2 -q -c 'aaa; iz'列字符串 → Bingo!"在0x100024a8。经验：非x86架构二进制逆向需用file/readelf先...
 category: reverse
 subcategory: reverse
 tools_used:
@@ -58,7 +58,7 @@ reasoning_chain:
 - 动作：先 RC6 解密 → 再 IDEA 解密 → 与硬编码 24 字节比较 → 假设：解出的 24 字节就是用户输入 FLAG
 - 观察：非 x86 反汇编需注意寄存器映射（r3=arg/return，r1=sp，PowerPC 函数 prologue save r0/lr）
 failed_attempts:
-- 试图用 IDA 直接反汇编 PowerPC → 失败：IDA ��版对 abiv2 支持不全，r2 跨平台更稳
+- 试图用 IDA 直接反汇编 PowerPC → 失败：IDA 旧版对 abiv2 支持不全，r2 跨平台更稳
 - 试图按字符串长度硬猜算法 → 失败：必须从函数大小（2528/1196）和参数（16/24 字节）反推 IDEA+RC6
 - 试图同时解 IDEA 和 RC6 → 失败：双重加密有先后顺序，顺序反了得不出明文
 key_observations:

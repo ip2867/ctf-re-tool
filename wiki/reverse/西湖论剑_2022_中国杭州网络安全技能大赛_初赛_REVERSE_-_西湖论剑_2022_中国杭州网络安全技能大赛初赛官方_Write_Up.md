@@ -79,7 +79,7 @@ failed_attempts:
 - 试图在用户层 sub_63EA 找 flag → 失败：真 flag 在 eBPF 段
 - 试图在 32 位 IDA 看 Dual personality → 失败：必须切 64 位
 key_observations:
-- atexit 数组存储执��顺序是 Windows Reverse 入门挖法
+- atexit 数组存储执行顺序是 Windows Reverse 入门挖法
 - ELF 数据段嵌入 BPF ELF 是逆向高阶技术
 - Win10 32/64 call far 切换是反调试常见手段
 - VT VMCS Exit Handler 分析需配合 Intel SDM 卷 3 附录 C

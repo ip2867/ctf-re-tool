@@ -65,7 +65,7 @@ key_observations:
 - 自定义 RC4 + 线程修改 input 是 RE 高阶题常见组合
 - AES-128 ECB 密钥藏于 StringLiteral 拼接是 Unity RE 经典
 - Unity Android libil2cpp.so + global-metadata.dat 是 Unity RE 标配
-- Frida hook 多线程并行爆破是 Frida 高阶��法
+- Frida hook 多线程并行爆破是 Frida 高阶用法
 prerequisites:
 - IDA 反编译 + EB FF XX 字节码理解
 - Frida hook 基础（fscanf / encrypt / memcmp）

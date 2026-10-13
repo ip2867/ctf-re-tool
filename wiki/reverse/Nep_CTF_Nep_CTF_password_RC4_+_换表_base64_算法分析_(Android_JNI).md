@@ -38,7 +38,7 @@ wp_url: https://www.ctfiot.com/167920.html
 reasoning_chain:
 - Android APK 题 → 触发点：首页 verify(String str) 与 file(byte[] bArr, String str) 两块验证
 - file 函数比对硬编码 iArr2 = {139, 210, 217, 93, ...} → 假设：解密后等于该数组
-- 动作：APK 解压 → IDA 打开 so → 定�� Java_com_nepnep_app_MainActivity_verify
+- 动作：APK 解压 → IDA 打开 so → 定位 Java_com_nepnep_app_MainActivity_verify
 - 观察：JNI 函数 strcmp 比较 '3g6L2PWL2PXFmR+7ise7iq==' → 假设：v28 处理后需等于该串
 - v28 字符串处理循环：每 3 字符块 + 余数 → 触发点：sub_77C + sub_8A4
 - 自定义 base64 表：'abcdefghijklmnopqrstuvwxyz0123456789+/ABCDEFGHIJKLMNOPQRSTUVWXYZ'

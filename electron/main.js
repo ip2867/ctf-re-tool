@@ -1310,6 +1310,7 @@ async function idaMcpDiscoverTools(sessionId) {
     'find_strings': ['find_regex', 'search_text', 'find_strings', 'get_strings', 'search_strings', 'search_string', 'get_string_list', 'list_strings'],
     'decompile': ['get_function_decompile', 'decompile_function', 'get_pseudocode', 'decompile'],
     'xrefs_to': ['get_xrefs_to', 'xrefs_to', 'get_cross_references'],
+    'trace_data_flow': ['trace_data_flow', 'trace_flow', 'data_flow'],
     'get_function_by_name': ['get_function_by_name'],
     'analyze_file': ['analyze_file', 'auto_analyze']
   };
@@ -1380,6 +1381,11 @@ function normalizeIdaArgs(logicalName, args, realName) {
       if (addrs.length) out.addrs = addrs;
       if (Array.isArray(args.addrs_to)) out.addrs_to = args.addrs_to;
       return out;
+    }
+    case 'trace_data_flow': {
+      // 真实 ida-pro-mcp 的参数多为 {addr} 或 {start}；按需透传，缺失则原样（调用方已 try/catch）。
+      const a = args.addr || args.address || args.start;
+      return a ? { addr: a } : args;
     }
     case 'list_functions':
       return { queries: args.queries || {} };

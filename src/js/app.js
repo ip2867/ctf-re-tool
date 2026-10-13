@@ -2342,6 +2342,39 @@ async function collectIdaNativeIntel() {
         addLog('info', `IDA 全局符号: ${globals.length} 个（已列前 40）`);
       }
     }
+    // 段级兜底：完全无 refs / 无符号时（剥离 so），直接 dump .data/.rodata 段数据，
+      // 保证"密钥/密文/常量表"这类数据一定进上下文。用 survey_binary 取段信息。
+    if (!intel.globals || !intel.globals.length) {
+      try {
+        const sv = await window.electronAPI.idaMcpCall('survey_binary', {});
+        const svText = sv && sv.success ? (typeof sv.result === 'string' ? sv.result : JSON.stringify(sv.result)) : '';
+        // 从段信息里解析 (name, start, end/ size)：兼容 "name ... 0xSTART ... 0xEND/size" 多种排版
+        const segs = [];
+        const re = /\b(\.?(?:rodata|data|bss|data\.rel|rodata\.rel))\b[^\n]*?(0x[0-9a-fA-F]{6,})[^\n]*?(0x[0-9a-fA-F]{4,}|0x[0-9a-fA-F]{6,})?/g;
+        let mm;
+        while ((mm = re.exec(svText)) !== null) {
+          const start = parseInt(mm[2], 16);
+          let size = mm[3] ? parseInt(mm[3], 16) : 0;
+          if (size && size < start) size = size; // 若第三段是 end 地址则按 end-start
+          else if (mm[3] && parseInt(mm[3], 16) > start) size = parseInt(mm[3], 16) - start;
+          if (!size || size <= 0) size = 65536;
+          size = Math.min(size, 65536);       // 单段最多 64KB，防爆
+          segs.push({ name: mm[1], start, size });
+        }
+        if (segs.length) {
+          const regions = segs.slice(0, 4).map(s => ({ addr: '0x' + s.start.toString(16), size: s.size }));
+          const bRes = await window.electronAPI.idaMcpCall('get_bytes', { regions });
+          if (bRes && bRes.success && Array.isArray(bRes.result)) {
+            intel.segments = bRes.result.map((r, i) => ({
+              name: (segs[i] && segs[i].name) || 'seg',
+              addr: (r && r.addr) || (segs[i] && '0x' + segs[i].start.toString(16)) || '',
+              data: (r && r.data) || ''
+            })).filter(g => g.data);
+            if (intel.segments.length) addLog('success', `✅ 已 dump ${intel.segments.length} 个数据段(.rodata/.data)兜底`);
+          }
+        }
+      } catch (e) { /* 段兜底失败不阻塞 */ }
+    }
   } catch (e) { /* 采集失败不阻塞 */ }
 
   // 4. 搜关键字符串（flag/key/密文常量；含 crypto 特征：nonce/iv/salt/chacha/tea 等）
@@ -5103,19 +5136,38 @@ ${mcpCache.nativeIntel && mcpCache.nativeIntel.decompiled.length ? `
 ## IDA 已反编译的 native 函数（直接用，勿重复反编译）
 ${mcpCache.nativeIntel.decompiled.map(d => `### ${d.name}\n\`\`\`c\n${d.code}\n\`\`\``).join('\n\n')}
 ${mcpCache.nativeIntel.strings ? `\n## IDA 关键字符串\n${mcpCache.nativeIntel.strings}` : ''}
-${mcpCache.nativeIntel.globals && mcpCache.nativeIntel.globals.length ? `\n## SO 全局数据表（被反编译函数引用的常量表，逐字节 hex；密钥/密文/S盒常在此）\n${mcpCache.nativeIntel.globals.map(g => `### ${g.name} @ ${g.addr}\n${g.data}`).join('\n')}` : ''}${mcpCache.nativeIntel.globalsList ? `\n## SO 全局符号清单\n${mcpCache.nativeIntel.globalsList}` : ''}` : ''}
+${mcpCache.nativeIntel.globals && mcpCache.nativeIntel.globals.length ? `\n## SO 全局数据表（被反编译函数引用的常量表，逐字节 hex；密钥/密文/S盒常在此）\n${mcpCache.nativeIntel.globals.map(g => `### ${g.name} @ ${g.addr}\n${g.data}`).join('\n')}` : ''}${mcpCache.nativeIntel.segments && mcpCache.nativeIntel.segments.length ? `\n## SO 数据段 dump（.rodata/.data 全段 hex，用于兜底取常量；量大，按需解析）\n${mcpCache.nativeIntel.segments.map(g => `### ${g.name} @ ${g.addr}\n${String(g.data).slice(0, 6000)}`).join('\n')}` : ''}${mcpCache.nativeIntel.globalsList ? `\n## SO 全局符号清单\n${mcpCache.nativeIntel.globalsList}` : ''}` : ''}
 
-## 你必须做的（按需调用工具，不要只凭已有片段下结论）
-1. 用 jeb_get_all_classes 拿到完整类列表；对**混淆类**（短包名单字母类名，如 N0/d、C/h、K0/a）以及任何与校验/加密/状态相关的类，用 jeb_get_class_decompiled **逐个反编译**——真正的校验逻辑几乎总在这些类里，Activity 只是 UI。
-2. 读关键资源：用 bash 或 read_file 查看 strings.xml / resources.arsc（flag 或校验常量常在其中），以及 SharedPreferences 里用到的键名。
-3. 若题目含 native SO：用 bash 找到 lib/*.so，用 run_python(capstone) 反汇编导出的 JNI 函数（Java_<包>_<类>_<方法>），还原算法；也可用 IDA MCP（ida_decompile / ida_find_strings）。
-4. 用 run_python 写求解脚本并**本地验证**（正反双向：反推 key 后正向加密对回目标常量）。
-5. 仅在确实无法推进时才停；有把握就给出 flag。
+## 你必须**严格按 4 个阶段推进**（每阶段先产出证据，再进下一阶段；不要跳步臆测）
+> 若上文未提供某项数据（nativeIntel 为空 / 类列表不全），**先自己调工具补齐再继续**。
+
+**阶段① 收集（把"代码+数据"喂全，缺一不可）**
+- 校验逻辑定位：\`jeb_get_all_classes\` 拿全类清单 → 对**混淆类**（N0/d、C/h、K0/a 这类单字母包/类）
+  以及**名字含 check/verify/encrypt/key/stage/Util/Encoder** 的类，\`jeb_get_class_decompiled\` 逐个反编译；
+  Activity 只是 UI，真逻辑在别的类。
+- 常量数据：读 \`strings.xml\` / \`resources.arsc\`（\`bash\`/\`read_file\`）、\`SharedPreferences\` 键名。
+- **native SO（关键，最易漏）**：若含 \`lib/*.so\` 且校验在 native，**必须**采到：
+  - 目标函数**反编译代码**（\`ida_decompile\`：JNI 入口 + 它调用的 sub_* ）；
+  - 函数**引用的常量表**（\`ida_list_globals\` + \`ida_get_bytes\`，密钥/密文/S盒/VM字节码都在 .data/.rodata）；
+  - 关键字符串（\`ida_find_strings\`：flag/key/nonce/salt）。
+  - ⚠️ **只给代码不给常量表 = 数学上无解**：算法认得出，但 key/密文拿不到，算不出 flag。
+
+**阶段② 定位算法（只定性，不急求 flag）**
+- 在反编译代码里认出**算法特征**：TEA 魔数 \`0x9E3779B9\`、RC4 双 S 盒、AES S 盒、XOR 流、
+  自定义查表/VM（跳转表 + 取指解释器）。写清：算法名 + 关键地址（函数/RVA）+ 输入输出形态。
+
+**阶段③ 写求解脚本并本地验证**
+- 用 \`run_python\` 实现还原，**正反双向**验证（反推 key 后，正向加密要能对回目标密文常量）。
+- 需要爆破/约束/符号执行时用 Z3 / angr / Unicorn（见 ctf-reverse-tooling 技能）。
+- **脚本必须真跑**，把输出贴出来；不要只给"我认为应该是"。
+
+**阶段④ 出结论**
+- 有把握才给 flag；证据不足就明确写"待人工验证 + 还缺什么"，**不要猜**。
 
 **输出契约（必须遵守）：**
 1. 得到 flag：单独一行 \`[FLAG]flag内容[/FLAG]\`
 2. 必须附验证数据（工具会本地复现）：
-   \`[VERIFY]{"algo":"rc4|tea|xtea|xxtea|xor|aes_ecb|aes_cbc|des_ecb|des_cbc|des3_ecb|sm4_ecb|base64|base64_custom|node_js|custom","key":"密钥","key_encoding":"ascii|hex","ciphertext":"密文","encoding":"hex|base64|ascii","expected":"flag或前缀","iv":"(aes_cbc/des_cbc 需要)","code":"(custom/node_js 需要)完整函数"}[/VERIFY]\`
+   \`[VERIFY]{"algo":"rc4|tea|xtea|xxtea|xor|aes_ecb|aes_cbc|des_ecb|des_cbc|des3_ecb|sm4_ecb|chacha20|base64|base64_custom|node_js|custom","key":"密钥","key_encoding":"ascii|hex","ciphertext":"密文","encoding":"hex|base64|ascii","expected":"flag或前缀","iv":"(aes_cbc/des_cbc 需要)","iv_encoding":"ascii|hex|base64","code":"(custom/node_js 需要)完整函数"}[/VERIFY]\`
 3. 多个候选组合：\`[HYPOTHESES][{...},{...}][/HYPOTHESES]\`
 4. 回答最后输出 \`[EXPERIENCE]...[/EXPERIENCE]\`（每条一行，最多5条）
 不要臆造工具结果；工具失败时换一条路径继续，不要重复同一失败写法。`;
@@ -5679,7 +5731,7 @@ function buildSystemPrompt() {
    - 解题前：先读上方「历史经验速查」，同类场景直接复用已验证套路与避坑点；需要完整方法论时用 read_skill 加载对应技能（ctf-reverse-binary / ctf-reverse-android / ctf-jsreverse 等）；遇到具体手法/踩坑（Frida 进程内解密、native 常量反演 key、IV 编码坑、多阶段 APK 停在首页等）先用 wiki_search 检索知识库，命中即 wiki_read 取完整代码片段。禁止无视知识库从零摸索
    - 解题中：严格按知识库流程执行，知识库已记录的坑（如 VM 题必须连常量表一起采集、mingw 入口是 _main、IV 编码不能借用 key 的编码）不得重踩
    - 解题后（无论成功失败）：回答最后输出 [EXPERIENCE]每条一行，格式"题型特征→关键套路/踩过的坑→下次怎么做"[/EXPERIENCE]，工具自动写入经验库；没有新收获则写"无新增经验"
-${skillsIndex}${wikiIndex}${state.experience ? `\n## 历史经验速查（此前解题沉淀，同类场景优先复用）\n${state.experience.trim().split('\n').slice(-15).join('\n')}\n` : ''}
+${skillsIndex}${wikiIndex}${state.experience ? `\n## 历史经验速查（此前解题沉淀，同类场景优先复用）\n${state.experience.trim().split('\n').slice(-15).join('\n')}\n` : ''}${(state.findings && ((state.findings.flags || []).length || (state.findings.algorithms || []).length)) ? `\n## 本题已收集的结论（勿重复劳动/勿推翻已验证项）\n${(state.findings.flags || []).map(f => `- Flag: ${f.flag}${f.verified ? '（✅已验证）' : '（⚠️未验证）'}`).join('\n')}\n${(state.findings.algorithms || []).length ? `- 已识别算法: ${state.findings.algorithms.map(a => (a && a.text) || a).join('; ')}` : ''}\n` : ''}
 
 ## 工具使用约定（Windows 环境，务必遵守）
 - 本机是 Windows。shell 工具（bash/run_command）由 cmd.exe 执行，默认工作目录已是当前题目所在文件夹：

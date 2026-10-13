@@ -2241,33 +2241,73 @@ async function collectIdaNativeIntel() {
   }
   if (fnText) intel.exports = fnText.slice(0, 4000);
 
-  // 2. 挑 JNI 导出函数（Java_…）与语义关键函数名
-  const jniNames = [...new Set((fnText.match(/Java_[A-Za-z0-9_]+/g) || []))].slice(0, 8);
-  const semantic = [...new Set((fnText.match(/\b[A-Za-z_][A-Za-z0-9_]*(?:encrypt|decrypt|cipher|check|verify|key|flag|crypt|sign|hash|stage)[A-Za-z0-9_]*\b/gi) || []))].slice(0, 8);
+  // 2. 挑要反编译的函数：
+  //    (a) JNI 导出（Java_…）——最高优先
+  //    (b) 语义名（encrypt/decrypt/check/verify/key/flag/crypt/sign/hash/stage…）
+  //    (c) 剥离符号后的 sub_XXXX：无法靠名字，改为**多取一批**（真逻辑常在里面），
+  //        并在第(3)步按"反编译后是否含常量比较/循环XOR/查表/memcmp"二次筛选。
+  const jniNames = [...new Set((fnText.match(/Java_[A-Za-z0-9_]+/g) || []))].slice(0, 12);
+  const semantic = [...new Set((fnText.match(/\b[A-Za-z_][A-Za-z0-9_]*(?:encrypt|decrypt|cipher|check|verify|key|flag|crypt|sign|hash|stage|init|load|jni)[A-Za-z0-9_]*\b/gi) || []))].slice(0, 10);
+  // sub_XXXX / FUN_xxx（IDA 对无符号函数的默认命名）最多取前 40 个，供行为筛选
+  const subs = [...new Set((fnText.match(/\b(?:sub|FUN|j_|nullsub)_[0-9A-Fa-f]+\b/g) || []))].slice(0, 40);
+  const ordered = [...jniNames, ...semantic, ...subs].filter((v, i, a) => v && a.indexOf(v) === i);
   intel.jniFuncs = [...jniNames, ...semantic].filter((v, i, a) => a.indexOf(v) === i);
 
-  // 3. 逐个反编译（优先 JNI 函数）
-  for (const name of intel.jniFuncs.slice(0, 6)) {
+  // 行为特征：反编译文本里出现下列任一项 → 该函数值得保留（真算法/校验函数几乎必中一条）
+  const BEHAVIOR = [
+    /0x9[eE]3779[bB]9/,       // TEA/XTEA 魔数
+    /0x[0-9a-fA-F]{8,}/,       // 大常量（查表/密钥/模数）
+    /\^|<<|>>/,                // 位运算（异或/移位，流密码/哈希特征）
+    /memcmp|strcmp|strncmp|Arrays|equals/i,
+    /for\s*\(|while\s*\(/,     // 存在循环
+    /\[[^\]]+\]\s*[;=]/,       // 数组下标读写（查表）
+    /sbox|Sbox|RC4|MD5|SHA|AES|DES|TEA|ChaCha|Salsa/i,
+  ];
+
+  // 3. 逐个反编译：先按 ordered 走，边反编译边按行为打分；step 上限放宽到 15 个函数、
+  //    单个函数上限放宽到 12000 字符（之前 6×6000 会漏掉/截断真正承载算法的 sub_）。
+  const decompiledNames = new Set();
+  let behavioralKept = 0;
+  for (const name of ordered) {
+    if (intel.decompiled.length >= 15) break;
+    if (decompiledNames.has(name)) continue;
+    decompiledNames.add(name);
     try {
-      const r = await window.electronAPI.idaMcpCall('decompile', { address: name });
+      const r = await window.electronApi.idaMcpCall('decompile', { address: name });
       if (r && r.success && r.result) {
         const code = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
-        // 保留 raw（含 refs，供 3b 步骤采集被引用的全局数据表）
-        intel.decompiled.push({ name, code: code.slice(0, 6000), raw: r.result });
-        addLog('success', `IDA 已反编译: ${name}（${code.length} 字符）`);
+        // 行为打分：sub_*/无符号函数只有在命中行为特征时才保留，避免噪声淹没有效信息；
+        // JNI 导出与语义名则无条件保留。
+        const isPriority = jniNames.includes(name) || semantic.includes(name);
+        const hits = BEHAVIOR.filter(re => re.test(code)).length;
+        if (isPriority || hits >= 2) {
+          intel.decompiled.push({ name, code: code.slice(0, 12000), raw: r.result, hits });
+          if (!isPriority) behavioralKept++;
+          addLog('info', `IDA 已反编译: ${name}（${code.length} 字符, 行为特征 ${hits}）`);
+        }
       }
     } catch (e) { /* 单个失败继续 */ }
   }
+  if (behavioralKept) addLog('success', `IDA 采集：额外按行为特征保留 ${behavioralKept} 个无名函数(sub_*)`);
 
   // 3b. 采集被引用的全局数据表（关键！）
   //     SO 里的密钥常量 / 密文表 / S 盒 / ChaCha 常量 通常放在 .data/.rodata 全局数组里，
   //     只给反编译代码、不给常量表 → AI 永远还原不出算法（本类题"动态失败+静态缺数据"的典型）。
   //     复用 PE 流程同款逻辑：从反编译结果的 refs 取被引用地址 → list_globals 匹配 → get_bytes 取值。
   try {
+    // 被引用地址有两个来源，取并集（raw.refs 常缺失，故必须再从反编译文本里抠）：
+    //  (1) raw.refs（IDA MCP decompile 返回的引用列表）
+    //  (2) 反编译文本中的符号名 —— off_XXX/byte_XXX/dword_XXX/qword_XXX/unk_XXX/&xxx 等
+    //      （IDA 伪代码里全局数组几乎都以这类名字出现；抠出名字后交给 IDA 按名解析地址）
     const refAddrs = idaCollectRefAddrs(intel.decompiled.map(d => ({ refs: (d && d.raw && d.raw.refs) || [] })));
-    if (refAddrs.size) {
-      const gRes = await window.electronAPI.idaMcpCall('list_globals', { queries: {} });
-      const globals = (gRes && gRes.success && Array.isArray(gRes.result)) ? gRes.result : [];
+    const refNames = new Set();
+    for (const d of intel.decompiled) {
+      const m = String(d.code || '').match(/\b(?:off|byte|word|dword|qword|unk|flt|dbl|stru|algn)_[0-9A-Fa-f]{4,}\b/g) || [];
+      for (const s of m) refNames.add(s);
+    }
+    const gRes = await window.electronAPI.idaMcpCall('list_globals', { queries: {} });
+    const globals = (gRes && gRes.success && Array.isArray(gRes.result)) ? gRes.result : [];
+    if (refAddrs.size || refNames.size || globals.length) {
       const byAddr = globals
         .map(g => ({ addr: String((g && g.addr) || ''), name: String((g && g.name) || ''), val: parseInt((g && g.addr) || '', 16) }))
         .filter(g => Number.isFinite(g.val))
@@ -2275,7 +2315,9 @@ async function collectIdaNativeIntel() {
       const wanted = [];
       for (let i = 0; i < byAddr.length; i++) {
         const g = byAddr[i];
-        if (!refAddrs.has(g.addr.toLowerCase())) continue;
+        const hitByAddr = refAddrs.has(g.addr.toLowerCase());
+        const hitByName = refNames.has(g.name);
+        if (!hitByAddr && !hitByName) continue;
         const next = byAddr[i + 1];
         let size = next ? next.val - g.val : 256;
         if (!(size > 0) || size > 8192) size = 256;

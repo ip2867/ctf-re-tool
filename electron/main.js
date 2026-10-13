@@ -1367,8 +1367,20 @@ function normalizeIdaArgs(logicalName, args, realName) {
       // 其他实现（get_strings 等）：尽力透传 pattern
       return { pattern: pat, limit };
     }
-    case 'xrefs_to':
-      return { address: args.address || args.addr || '' };
+    case 'xrefs_to': {
+      // 真实 ida-pro-mcp 的 xrefs_to 参数是数组形式 {addrs:[...]}（实测：传 {addrs:['0x..']}
+      // 正常返回 [{addr, xrefs:[...]}]）。旧代码返回 {address:...}（单数）→ 被判"缺 addrs"报错。
+      // 只发实际提供的字段，避免严格 schema 拒绝未知键。
+      const out = {};
+      let addrs = args.addrs;
+      if (!Array.isArray(addrs)) {
+        const one = args.address || args.addr || args.function_name || '';
+        addrs = one ? [one] : [];
+      }
+      if (addrs.length) out.addrs = addrs;
+      if (Array.isArray(args.addrs_to)) out.addrs_to = args.addrs_to;
+      return out;
+    }
     case 'list_functions':
       return { queries: args.queries || {} };
     default:

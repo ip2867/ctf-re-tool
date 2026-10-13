@@ -1030,11 +1030,13 @@ ipcMain.handle('run-frida-hook', async (event, script, target, opts) => {
 });
 
 // Frida 列出进程（spawn 参数数组）
-ipcMain.handle('frida-ps', async (event) => {
+ipcMain.handle('frida-ps', async (event, opts) => {
   const port = config.emulator.frida_port;
+  // opts.apps=true 时用 -a（应用列表：PID/Name/Identifier 三列），否则进程列表
+  const extra = (opts && opts.apps) ? ['-a'] : [];
 
   return new Promise((resolve) => {
-    const child = spawn('frida-ps', ['-H', `127.0.0.1:${port}`], { shell: false, windowsHide: true });
+    const child = spawn('frida-ps', ['-H', `127.0.0.1:${port}`].concat(extra), { shell: false, windowsHide: true });
     let stdout = '', stderr = '';
     const timer = setTimeout(() => { try { child.kill(); } catch (e) {} }, 10000);
     child.stdout.on('data', (d) => { stdout += d.toString(); });
@@ -3650,32 +3652,51 @@ async function execAdbCommand(command) {
 }
 
 // 用 frida-ps 列出远程设备进程，把"包名"解析成真实的"进程名"。
-// Android 上进程名常是 App 名（如 "Hook My Secret"）而非包名（com.x.y），
-// frida 的 -n 需要的是进程名，直接用包名会 "Failed to spawn: unable to find process"。
+// Android 上进程名常是 App 名（如 "My Application"）而非包名（com.cr.myapplication），
+// frida 的 -n 需要的是**进程名**，直接用包名会 "unable to find process with name 'com.x.y'"。
+// 关键：`frida-ps` 默认列的是进程名；加 `-a` 才带 "PID  Name  Identifier" 三列，
+// Identifier 才是包名。两个列表都要查，才能把包名映射到进程名。
 // 返回 { pid, name } 或 null。
 function resolveFridaProcessName(target) {
-  return new Promise((resolve) => {
-    const port = config.emulator.frida_port;
-    const child = spawn('frida-ps', ['-H', `127.0.0.1:${port}`], { shell: false, windowsHide: true });
+  const port = config.emulator.frida_port;
+  const runPs = (extraArgs) => new Promise((resolve) => {
+    const child = spawn('frida-ps', ['-H', `127.0.0.1:${port}`].concat(extraArgs), { shell: false, windowsHide: true });
     let out = '';
-    const t = setTimeout(() => { try { child.kill(); } catch (e) {} resolve(null); }, 12000);
+    const t = setTimeout(() => { try { child.kill(); } catch (e) {} resolve(''); }, 12000);
     child.stdout.on('data', d => { out += d.toString(); });
-    child.on('error', () => { clearTimeout(t); resolve(null); });
-    child.on('close', () => {
-      clearTimeout(t);
-      // 输出行形如 " 3372  Hook My Secret"（也可能含应用标识符列）
-      const lines = out.split(/\r?\n/).filter(l => /^\s*\d+\s+\S/.test(l));
-      const rows = lines.map(l => { const m = l.match(/^\s*(\d+)\s+(.+?)\s*$/); return m ? { pid: Number(m[1]), name: m[2] } : null; }).filter(Boolean);
-      // 归一化：去皮、去空格、小写 —— 包名末段（如 "myapp"）与进程名（"My App"）需归一后比对
-      const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, '');
-      const q = norm(target);
-      const seg = q.split('.').pop();
-      let hit = rows.find(r => norm(r.name) === q)
-        || rows.find(r => norm(r.name).includes(q) || q.includes(norm(r.name)))
-        || (seg.length >= 4 ? rows.find(r => norm(r.name).includes(seg) || seg.includes(norm(r.name))) : null);
-      resolve(hit || null);
-    });
+    child.on('error', () => { clearTimeout(t); resolve(''); });
+    child.on('close', () => { clearTimeout(t); resolve(out); });
   });
+  return (async () => {
+    // `-a`：应用列表，形如 " 3372  My Application  com.cr.myapplication"
+    const appOut = await runPs(['-a']);
+    // 默认：进程列表，形如 " 3372  My Application"
+    const psOut = await runPs([]);
+    const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, '');
+    const q = norm(target);
+    const seg = q.split('.').pop();
+    // 解析 -a 三列：PID  Name  Identifier
+    const appRows = appOut.split(/\r?\n/)
+      .map(l => l.match(/^\s*(\d+)\s+(.+?)\s{2,}(\S+)\s*$/))
+      .filter(Boolean)
+      .map(m => ({ pid: Number(m[1]), name: m[2].trim(), identifier: m[3].trim() }));
+    // 优先：Identifier（包名）精确/包含匹配 → 取其 Name 作为 frida -n 目标
+    if (q) {
+      const byId = appRows.find(r => norm(r.identifier) === q)
+        || appRows.find(r => norm(r.identifier).includes(q) || q.includes(norm(r.identifier)));
+      if (byId) return byId;
+    }
+    // 退而求其次：按进程名匹配（可能 target 本就是进程名）
+    const psRows = psOut.split(/\r?\n/)
+      .filter(l => /^\s*\d+\s+\S/.test(l))
+      .map(l => { const m = l.match(/^\s*(\d+)\s+(.+?)\s*$/); return m ? { pid: Number(m[1]), name: m[2] } : null; })
+      .filter(Boolean);
+    const allRows = psRows.concat(appRows.map(r => ({ pid: r.pid, name: r.name })));
+    return allRows.find(r => norm(r.name) === q)
+      || allRows.find(r => norm(r.name).includes(q) || q.includes(norm(r.name)))
+      || (seg.length >= 4 ? allRows.find(r => norm(r.name).includes(seg) || seg.includes(norm(r.name))) : null)
+      || null;
+  })();
 }
 
 // 执行Frida Hook
@@ -3730,6 +3751,25 @@ async function execFridaHook(script, target, opts) {
         }
       }
       return { success: true, output: out };
+    }
+    // 普通 attach 路径：若目标是包名且当前没有对应进程，frida 的 -n 会
+    // "unable to find process"（App 还没启动）。这里先自动用 adb 拉起 App，再 attach，
+    // 避免"未在运行进程中找到"直接失败（本题场景：装包成功后 App 未启动就点运行 Hook）。
+    if (target) {
+      const resolved = await resolveFridaProcessName(target);
+      if (!resolved) {
+        // 目标看起来是包名（含点）→ 尝试拉起来
+        if (/^[a-zA-Z][\w]*(\.[\w]+)+$/.test(String(target))) {
+          const adbPort = config.emulator.adb_port;
+          await adbEnsureConnected(adbPort);
+          await new Promise((res) => {
+            const c = spawn(resolveAdbPath(), ['-s', `127.0.0.1:${adbPort}`, 'shell', 'monkey', '-p', String(target), '-c', 'android.intent.category.LAUNCHER', '1'], { shell: false, windowsHide: true });
+            c.on('error', () => res()); c.on('close', () => res());
+            setTimeout(() => { try { c.kill(); } catch (e) {} res(); }, 8000);
+          });
+          await new Promise(r => setTimeout(r, 2500)); // 等进程起来
+        }
+      }
     }
     const attachArgs = await buildAttachArgs(target);
     const out = await runFridaOnce(attachArgs, tempFile, opts);

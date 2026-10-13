@@ -38,7 +38,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Frida 命令
   fridaCommand: (args) => ipcRenderer.invoke('frida-command', args),
   runFridaHook: (script, target, opts) => ipcRenderer.invoke('run-frida-hook', script, target, opts),
-  fridaPs: () => ipcRenderer.invoke('frida-ps'),
+  fridaPs: (opts) => ipcRenderer.invoke('frida-ps', opts),
   validateFridaScript: (src) => ipcRenderer.invoke('validate-frida-script', src),
 
   // 窗口控制

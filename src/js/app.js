@@ -2035,23 +2035,30 @@ async function installApkToEmulator() {
 
     // 安装APK（-r 覆盖安装；-t 允许 testOnly 包——CTF 题 APK 常带此标记，
     // 缺它会 INSTALL_FAILED_TEST_ONLY 秒失败）。
-    // install 对 `Can't find service: package` 等瞬时错误做重试（最多3次，间隔递增）。
+    // install 对"服务未就绪/冷启动未就绪/管道中断"等瞬时错误做重试（最多 4 次，间隔递增）。
     let result = null, out = '', installOk = false;
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (let attempt = 1; attempt <= 4; attempt++) {
       addLog('info', attempt === 1 ? '正在安装APK...' : `重试安装APK（第${attempt}次）...`);
       result = await window.electronAPI.adbCommand(`install -r -t "${state.currentFile}"`);
       out = `${(result && result.stdout) || ''}\n${(result && result.stderr) || ''}`;
       installOk = /Success/i.test(out) && !/Failure|Missing APK file|no devices\/emulators found/i.test(out);
       if (installOk) break;
-      // 仅对"服务未就绪/管道中断"类瞬时错误重试；testOnly/签名等确定性错误不必重试。
-      // Broken pipe / Failure calling service：多发生在 install 传输途中 adb daemon
-      // 被另一版本 adb 顶替（nox_adb v36 vs 系统 adb v41 互杀），重连后重试通常可成功。
-      const transient = /Can't find service|Failure calling service|Broken pipe|device offline|device not found|closed|error: closed/i.test(out);
-      if (!transient || attempt === 3) break;
-      addLog('warning', `安装瞬时失败（${out.trim().slice(0, 160)}），重建 adb 连接后重试`);
+      // 瞬时失败类型（值得重试）：
+      //  - 服务未就绪/管道中断：Can't find service / Failure calling service / Broken pipe / offline
+      //  - 冷启动期通用安装失败：adb 输出 `Failed to install <path>:`（原因常为空），
+      //    这是模拟器刚开机、installd/dexopt 尚未就绪的典型症状（本题 03:51 复现）。
+      //    确定性错误（INSTALL_FAILED_TEST_ONLY / 签名 / NO_CERTIFICATE 等）不重试。
+      const definitive = /INSTALL_FAILED_TEST_ONLY|INSTALL_PARSE_FAILED|INSTALL_FAILED_UPDATE_INCOMPATIBLE|NO_CERTIFICATE|signatures do not match|INSTALL_FAILED_INSUFFICIENT_STORAGE|INSTALL_FAILED_ALREADY_EXISTS\b(?!.*-r)/i.test(out);
+      const transient = !definitive && (
+        /Can't find service|Failure calling service|Broken pipe|device offline|device not found|closed|error: closed/i.test(out)
+        || /Failed to install/i.test(out)   // 冷启动期通用失败（含原因为空）
+      );
+      if (!transient || attempt === 4) break;
+      addLog('warning', `安装瞬时失败（${out.trim().slice(0, 160) || '模拟器冷启动未就绪'}），重建 adb 连接后重试`);
       // 重试前重建 adb：重连设备 + 重设到 port。主进程 adb-command 内部还会在检测到
       // 版本不匹配时 kill-server/start-server，双保险确保 daemon 属于当前客户端。
-      await new Promise(r => setTimeout(r, attempt * 3000));
+      // 冷启动场景等待更久（installd/dexopt 就绪需要时间）。
+      await new Promise(r => setTimeout(r, 3000 + attempt * 4000));
       await window.electronAPI.adbCommand(`connect 127.0.0.1:${adbPort}`);
       // 重新确认 package 服务（daemon 重建后服务引用可能需重新解析）
       try { await window.electronAPI.adbCommand('shell service check package'); } catch (e) { /* 忽略 */ }
@@ -2227,16 +2234,28 @@ async function collectIdaNativeIntel() {
   addLog('info', 'IDA 采集中：枚举函数与导出...');
   const intel = { exports: '', jniFuncs: [], decompiled: [] };
 
-  // 1. 枚举函数（IDA MCP 有多种命名，逐个试到可用）
+  // 1. 枚举函数（IDA MCP 工具名/参数随版本变化，逐个试到可用）
+  // 实测 ida-pro-mcp v1.0.0：真实工具是 list_funcs（参数 {queries:{filter,count}}）与
+  // func_query；旧代码用的 export_funcs {}(缺 addrs 报错) / list_functions(不存在) 全部失败，
+  // 导致 fnText 为空 → 一个函数都反编译不了（本题「未取到反编译结果」的真因）。
   let fnText = '';
   for (const [tool, args] of [
-    ['export_funcs', {}],
-    ['list_functions', { queries: {} }],
-    ['survey_binary', {}]
+    ['list_funcs', { queries: {} }],                       // 全量函数列表（ida-pro-mcp 实际工具；{} 才返回全部，勿加 count:0）
+    ['func_query', { queries: {} }],
+    ['list_functions', { queries: {} }],                   // 旧/其他实现兼容
+    ['export_funcs', { addrs: [] }],                       // 万不得已（通常为空）
+    ['survey_binary', {}]                                  // 最后兜底：至少给元数据/函数名
   ]) {
     try {
       const r = await window.electronAPI.idaMcpCall(tool, args);
-      if (r && r.success && r.result) { fnText = typeof r.result === 'string' ? r.result : JSON.stringify(r.result); break; }
+      if (r && r.success && r.result) {
+        const txt = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
+        // 判定"拿到了函数清单"：出现 sub_/Java_/函数名或 addr+name 结构
+        if (/sub_[0-9A-Fa-f]+|Java_[A-Za-z0-9_]+|"name"\s*:|0x[0-9a-f]{4,}\s+\S/.test(txt)) {
+          fnText = txt; addLog('info', `IDA 函数清单来源: ${tool}`); break;
+        }
+        if (!fnText) fnText = txt; // 先留个底，继续试更好的
+      }
     } catch (e) { /* 换下一个工具名 */ }
   }
   if (fnText) intel.exports = fnText.slice(0, 4000);
@@ -2274,12 +2293,16 @@ async function collectIdaNativeIntel() {
   const MIN_KEEP = 15, MAX_KEEP = 28;
   const decompiledNames = new Set();
   let behavioralKept = 0;
+  let decompileErrors = 0;
   for (const name of ordered) {
     if (intel.decompiled.length >= MAX_KEEP) break;
     if (decompiledNames.has(name)) continue;
     decompiledNames.add(name);
     try {
-      const r = await window.electronApi.idaMcpCall('decompile', { address: name });
+      // 注意：必须用 window.electronAPI（大写 API）。曾误写为 electronApi → 每次调用
+      // 都抛 TypeError 并被下面的 catch 静默吞掉 → 一个函数都反编译不了（本题「未取到
+      // 反编译结果」的真因：IDA 明明连上了、get_bytes/list_globals 都成功，唯独代码为空）。
+      const r = await window.electronAPI.idaMcpCall('decompile', { address: name });
       if (r && r.success && r.result) {
         const code = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
         // 行为打分：sub_*/无符号函数只有在命中行为特征时才保留；JNI 导出与语义名无条件保留。
@@ -2293,7 +2316,14 @@ async function collectIdaNativeIntel() {
           addLog('info', `IDA 已反编译: ${name}（${code.length} 字符, 行为特征 ${hits}）`);
         }
       }
-    } catch (e) { /* 单个失败继续 */ }
+    } catch (e) {
+      // 不再静默：把前 3 个失败原因记到日志，避免"IDA 连上了却 0 反编译"这类问题被吞掉无从排查
+      decompileErrors++;
+      if (decompileErrors <= 3) addLog('warning', `IDA 反编译失败(${name}): ${e && e.message ? e.message : e}`);
+    }
+  }
+  if (!intel.decompiled.length && ordered.length) {
+    addLog('warning', `IDA 反编译 0 个函数（尝试 ${ordered.length} 个，失败 ${decompileErrors} 个）——请检查 IDA MCP 的 decompile 工具是否可用`);
   }
   if (behavioralKept) addLog('success', `IDA 采集：额外按行为特征保留 ${behavioralKept} 个无名函数(sub_*)`);
 
@@ -3624,28 +3654,42 @@ async function runHook() {
   let target = null;
   const pkg = state.fileType === 'APK' ? await getPackageNameFromAPK() : null;
   try {
-    const ps = await window.electronAPI.fridaPs();
-    if (ps && ps.success && ps.stdout) {
-      const rows = String(ps.stdout).split(/\r?\n/)
-        .map(l => { const m = l.match(/^\s*(\d+)\s+(.+?)\s*$/); return m ? { pid: Number(m[1]), name: m[2] } : null; })
-        .filter(Boolean);
-      const q = String(pkg || '').toLowerCase();
-      const seg = q.split('.').pop();
-      // 归一化去空格：包名末段（如 "myapp"）对应进程名（如 "My App"）
-      const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, '');
-      let hit = null;
-      if (q) {
-        const nq = norm(q), ns = norm(seg);
-        hit = rows.find(r => norm(r.name) === nq)
-          || rows.find(r => norm(r.name).includes(nq) || nq.includes(norm(r.name)))
-          || (ns.length >= 4 ? rows.find(r => norm(r.name).includes(ns) || ns.includes(norm(r.name))) : null);
+    // 同时取"应用列表(-a：含 Identifier 包名列)"与"进程列表"，两者都要比对：
+    // Android 进程名常是 App 显示名（"My Application"），只有 -a 的 Identifier 才是包名。
+    const psApp = await window.electronAPI.fridaPs({ apps: true });
+    const psProc = await window.electronAPI.fridaPs();
+    const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, '');
+    const q = norm(pkg || '');
+    const seg = q.split('.').pop();
+    // -a 三列：PID  Name  Identifier
+    const appRows = (psApp && psApp.success ? String(psApp.stdout) : '').split(/\r?\n/)
+      .map(l => l.match(/^\s*(\d+)\s+(.+?)\s{2,}(\S+)\s*$/))
+      .filter(Boolean)
+      .map(m => ({ pid: Number(m[1]), name: m[2].trim(), identifier: m[3].trim() }));
+    const procRows = (psProc && psProc.success ? String(psProc.stdout) : '').split(/\r?\n/)
+      .map(l => { const m = l.match(/^\s*(\d+)\s+(.+?)\s*$/); return m ? { pid: Number(m[1]), name: m[2] } : null; })
+      .filter(Boolean);
+    let hit = null;
+    if (q) {
+      // 1) 优先用 -a 的 Identifier（包名）精确/包含匹配 → 取 App 的进程名
+      hit = appRows.find(r => norm(r.identifier) === q)
+        || appRows.find(r => norm(r.identifier).includes(q) || q.includes(norm(r.identifier)));
+      // 2) 退回进程名匹配（含末段关键词）
+      if (!hit) {
+        const all = procRows.concat(appRows.map(r => ({ pid: r.pid, name: r.name })));
+        const ns = norm(seg);
+        hit = all.find(r => norm(r.name) === q)
+          || all.find(r => norm(r.name).includes(q) || q.includes(norm(r.name)))
+          || (ns.length >= 4 ? all.find(r => norm(r.name).includes(ns) || ns.includes(norm(r.name))) : null);
       }
-      if (hit) {
-        target = hit.name;
-        addLog('info', `已解析目标：包名 ${pkg || '(无)'} → 进程名 "${hit.name}" (pid ${hit.pid})`);
-      } else if (rows.length) {
-        addLog('info', `未在运行进程中找到与 ${pkg || '当前文件'} 匹配的进程；可先在模拟器启动 App，或手动输入进程名`);
-      }
+    }
+    if (hit) {
+      target = hit.name;
+      addLog('info', `已解析目标：包名 ${pkg || '(无)'} → 进程名 "${hit.name}" (pid ${hit.pid})`);
+    } else if (pkg && appRows.length) {
+      // App 未运行：交给主进程自动拉起后再 attach（见 execFridaHook 的自动拉起逻辑）
+      addLog('info', `App 未在运行（包名 ${pkg}），将尝试自动启动后再附加`);
+      target = pkg;
     }
   } catch (e) { /* 忽略，走人工输入 */ }
 
@@ -6450,6 +6494,50 @@ def dec_sm4(d, k):
     c = CryptSM4(); c.set_key(k, SM4_DECRYPT)
     return c.crypt_ecb(d)
 
+def dec_chacha20(d, k, nonce, counter=0, variant="chacha20"):
+    """ChaCha20 stream cipher. nonce: 12B (IETF, 32-bit counter) or 8B (original, 64-bit counter).
+    counter: initial block counter (many CTF binaries start at 1, not 0!) — handled via seek(64*counter)."""
+    from Crypto.Cipher import ChaCha20
+    c = ChaCha20.new(key=k, nonce=nonce)
+    if counter:
+        c.seek(64 * int(counter))
+    return c.decrypt(d)
+
+def dec_chacha20_try(d, k, ivb, explicit_ctr=None):
+    """枚举 counter/大小端候选：CTF 里 counter 编码极易搞错（本题 iv=nonce12+counter4，
+    counter 是大端 1；但若按小端读会变成 16777216）。这里把所有合理候选都试一遍，
+    返回第一个解出可打印/flag 形态的结果；都不行则返回第一个候选。"""
+    cands = []
+    nonce = ivb
+    ctrs = []
+    if explicit_ctr is not None:
+        ctrs = [int(explicit_ctr)]
+    elif ivb and len(ivb) == 16:
+        nonce = ivb[:12]
+        ctrs = [int.from_bytes(ivb[12:16], "big"), int.from_bytes(ivb[12:16], "little"), 0, 1]
+    elif ivb and len(ivb) == 12:
+        ctrs = [0, 1]
+    elif ivb and len(ivb) == 8:
+        ctrs = [0, 1]
+    else:
+        ctrs = [0, 1]
+    seen = set()
+    for ctr in ctrs:
+        if ctr in seen:
+            continue
+        seen.add(ctr)
+        try:
+            out = dec_chacha20(d, k, nonce, ctr)
+            cands.append(out)
+            if FLAG_RE.search(out):
+                return out
+            t = printable(out)
+            if t.startswith("flag{") or t.startswith("ctf{"):
+                return out
+        except Exception:
+            pass
+    return cands[0] if cands else b""
+
 def dec_b64(d, table=None):
     s = d.decode("utf-8", "ignore").strip() if isinstance(d, (bytes, bytearray)) else str(d).strip()
     if table:
@@ -6548,6 +6636,13 @@ def run_one(i, a):
                 out = dec_des3(ct, k)
             elif algo == "sm4_ecb":
                 out = dec_sm4(ct, k)
+            elif algo in ("chacha20", "chacha20_ietf", "chacha20_original", "salsa20"):
+                # ChaCha20：key 32B，nonce 12B(IETF)/8B(original)。
+                # iv 字段可能给 12B nonce，或 16B「nonce(12B)+counter(4B)」（本项目约定）。
+                # counter 初值常非 0（本题=1）且大小端易错 → 交给 dec_chacha20_try 枚举候选。
+                ivb = iv_bytes(a)
+                ctr = a.get("counter")
+                out = dec_chacha20_try(ct, k, ivb, ctr)
             elif algo == "base64":
                 out = dec_b64(ct)
             elif algo == "base64_custom":

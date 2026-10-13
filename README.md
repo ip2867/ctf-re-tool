@@ -310,6 +310,9 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 ### v1.3.6 (2026-10-14) — 实战阻塞修复（安装 / IDA 采集 / 验证器）
 本次用运行中的 IDA MCP + 真实 CrackMe 题逐项复现定位，修掉三个会直接导致解题失败的问题：
+- **多候选密文交叉校验（防"变种题"陷阱）**：native so 里常有多组加密常量（如 C++ 静态 `std::array<std::string,8>`）。若只取第一条当密文，遇到"密文被换过、key/nonce 不变"的变种题，会算出**自洽但版本不对**的 flag（`encrypt(flag)==该密文` 成立，但那条密文并非 App 真正比对的那条）。现从 native intel 抽**全部** hex 常量（globals/segments/strings/反编译代码，16~128B 去重）与 AI 密文并列枚举；若存在"另一条也能出 flag 的候选"→ 告警 + 列出全部候选 + 提示核对"校验函数实际引用哪条"。深度求解提示词阶段③同步补该指引
+- **统一 `[VERIFY]` 契约为单一权威常量**：此前 5 处提示词各写一份 algo 清单且内容漂移（3 处漏 `chacha20`/`node_js`）——正是 chacha20 漏实现的同类隐患。现集中为 `VERIFY_ALGOS`/`VERIFY_CONTRACT`，5 处统一插值；新增 `salsa20`
+
 - **修复 IDA 采集 0 反编译（最严重）**：`src/js/app.js` 误写 `window.electronApi`（小写 `pi`）→ 每次 `decompile` 都抛 `TypeError` 且被空 `catch` 静默吞掉 → **一个 native 函数都拿不到**，AI 只能回一句"请人工打开 IDA 分析"，解题直接卡死。改为 `electronAPI`；同时函数枚举改用真实工具名 `list_funcs`（旧的 `export_funcs{}`/`list_functions` 全部失败），反编译失败不再静默（打日志 + 0 个时明确告警）。实测：反编译 **0 → 19 个**（含 `JNI_OnLoad`、`RegisterNatives`、真正做 ChaCha20 校验的 `sub_257A0`）
 - **验证器补齐 ChaCha20**：提示词早已承诺 `algo:"chacha20"`，但求解器 Python 里**没有该分支**，导致"本地复现失败 → unknown algo chacha20"。新增 `chacha20`/`chacha20_ietf`/`salsa20` 分支，并处理 CTF 里最常见的坑——**counter 初值非 0 且大小端易错**（枚举候选自动命中）。实测 `[HIT]` 复现出 flag
 - **APK 安装冷启动失败**：日志错误是 `Failed to install <path>:`（原因为空），属模拟器刚开机 `installd` 未就绪的瞬时错误，但不在原重试正则内 → 不重试直接失败。现纳入可重试（增至 4 次 + 递增等待）；`INSTALL_FAILED_TEST_ONLY`/签名等确定性错误仍不重试

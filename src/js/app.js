@@ -5422,8 +5422,8 @@ ${mcpCache.nativeIntel.globals && mcpCache.nativeIntel.globals.length ? `\n## SO
 - ⚠️ **多候选密文（变种题陷阱）**：native so 里常有多组常量（如 C++ 静态初始化一个
   \`std::array<std::string,N>\`，或 .rodata 里多条 hex）。**不要取第一条就下结论**——要先确认
   **校验函数实际引用的是哪条**（看引用它的函数、或哪条与 key/nonce 同处一个初始化块）。
-  若多组都能解密出 flag 形态，说明题目有版本差异：以"被校验函数真正 set/compare 的那条"为准，
-  并把全部候选都列出交人工定案。工具会自动做交叉校验，但你要在证据里指明依据。
+  工具会在本地复现后**自动枚举全部候选**并用 IDA xrefs 判定"被校验函数引用的那条"（自动裁决）；
+  你应在证据里写明：用的密文地址/符号 + 引用它的函数名。若工具告警"未能判定权威"，再回 IDA 看。
 
 **阶段④ 出结论**
 - 有把握才给 flag；证据不足就明确写"待人工验证 + 还缺什么"，**不要猜**。
@@ -6710,25 +6710,29 @@ async function runContractScript(attempts) {
 function extractNativeCandidates(intel) {
   intel = intel || {};
   const blobs = [];
-  // 1) 全局数据表（get_bytes 的 data 字段是 "0x.. 0x.." 形式）
+  // 1) 全局数据表（get_bytes 的 data 字段是 "0x.. 0x.." 形式；带 addr）
   for (const g of (intel.globals || [])) {
     const hex = String(g.data || '').replace(/0x|\s+/g, '');
-    if (hex) blobs.push({ src: `global:${g.name || g.addr}`, hex });
+    if (hex) blobs.push({ src: `global:${g.name || g.addr}`, hex, addr: g.addr || '', name: g.name || '' });
   }
-  // 2) 数据段 dump
+  // 2) 数据段 dump（addr 是段起始，一般不是常量精确地址，仅作兜底来源）
   for (const s of (intel.segments || [])) {
     const hex = String(s.data || '').replace(/0x|\s+/g, '');
-    if (hex) blobs.push({ src: `segment:${s.name || s.addr}`, hex });
+    if (hex) blobs.push({ src: `segment:${s.name || s.addr}`, hex, addr: s.addr || '', name: s.name || '' });
   }
-  // 3) 关键字符串里的 hex 长串
+  // 3) 关键字符串里的 hex 长串（渲染形如 "0xADDR  HEX..."，解析出 addr）
   for (const line of String(intel.strings || '').split('\n')) {
-    const m = line.match(/([0-9a-fA-F]{32,})/);
-    if (m) blobs.push({ src: 'string', hex: m[1] });
+    const m = line.match(/^\s*(0x[0-9a-fA-F]+)\s+([0-9a-fA-F]{32,})/);
+    if (m) blobs.push({ src: `string@${m[1]}`, hex: m[2], addr: m[1], name: '' });
+    else {
+      const m2 = line.match(/([0-9a-fA-F]{32,})/);
+      if (m2) blobs.push({ src: 'string', hex: m2[1], addr: '', name: '' });
+    }
   }
-  // 4) 反编译代码里出现的"长 hex 字符串字面量"（C++ 静态初始化常见）
+  // 4) 反编译代码里出现的"长 hex 字符串字面量"（C++ 静态初始化常见；无 addr，靠 xref 名称间接定位）
   for (const d of (intel.decompiled || [])) {
     const code = String(d.code || '');
-    for (const m of code.matchAll(/"([0-9a-fA-F]{32,})"/g)) blobs.push({ src: `code:${d.name}`, hex: m[1] });
+    for (const m of code.matchAll(/"([0-9a-fA-F]{32,})"/g)) blobs.push({ src: `code:${d.name}`, hex: m[1], addr: '', name: '' });
   }
   // 归一化：只保留偶数长度、长度像"密文/常量"的十六进制串（16B~128B 最像密文/密钥），去重
   const out = [];
@@ -6742,11 +6746,90 @@ function extractNativeCandidates(intel) {
     const key = hex.slice(0, 24) + ':' + hex.length;   // 去重键（前 12 字节 + 长度）
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ src: b.src, hex });
+    out.push({ src: b.src, hex, addr: b.addr || '', name: b.name || '' });
     if (out.length >= 24) break;                       // 上限，防爆（24 组够覆盖"多常量"场景）
   }
   return out;
 }
+
+// ============ 自动裁决"权威密文"（哪条被校验函数真正引用）============
+// 思路（在有 IDA MCP 时可用，纯静态启发式、失败即静默降级）：
+//   对每个带地址的候选常量，查 IDA xrefs_to → 找出"引用它的函数"；
+//   若该引用函数同时（在已反编译集合里，且）代码含比较语义（memcmp/strcmp/==/Arrays.equals/
+//   或对解密结果做逐字节比较），则该候选极可能是"真校验用的那条"。
+//   再叠加：候选符号名出现在"比较类函数"的反编译文本中 → 加分。
+// 返回按可信度降序的候选列表，每项附 { refFns:[], score, authoritative:bool }。
+async function rankCandidatesByXref(cands, intel) {
+  intel = intel || {};
+  if (!Array.isArray(cands) || !cands.length) return cands || [];
+  // 已反编译函数名集合 + 各函数代码（用于判断"引用它的函数是否做比较"）
+  const decMap = new Map();
+  for (const d of (intel.decompiled || [])) decMap.set(String(d.name || ''), String(d.code || ''));
+  const CMP_RE = /memcmp|strcmp|strncmp|Arrays\s*\.?\s*equals|\.equals\s*\(|==|!=/;
+  const refCache = new Map();  // addr -> xrefs
+  let queried = 0;
+  for (const k of cands) {
+    let score = 0;
+    const refFns = [];
+    const addr = String(k.addr || '').trim();
+    if (addr && queried < 12) {                 // 最多查 12 个，控成本
+      try {
+        if (!refCache.has(addr)) {
+          const r = await window.electronAPI.idaMcpCall('xrefs_to', { addrs: [addr] });
+          refCache.set(addr, (r && r.success && r.result) || null);
+        }
+        const xr = refCache.get(addr);
+        // 归一化各种返回形态：
+        //   [{addr, xrefs:[...]}]（实测 ida-pro-mcp）/ {addr, xrefs:[...]} / {addrs:[...]} / 直接 xrefs:[...]
+        let list = [];
+        if (Array.isArray(xr)) list = xr;
+        else if (xr && Array.isArray(xr.addrs)) list = xr.addrs;
+        else if (xr && Array.isArray(xr.xrefs)) list = [xr];
+        else if (xr && typeof xr === 'object') list = [xr];
+        for (const item of list) {
+          const xrefs = (item && item.xrefs) || [];
+          for (const x of xrefs) {
+            // fn 可能是对象 {name}、字符串(函数名)，或 xref 自带 name/func_name
+            let fnName = '';
+            if (x && typeof x.fn === 'string') fnName = x.fn;
+            else if (x && x.fn && x.fn.name) fnName = x.fn.name;
+            else if (x && (x.name || x.func_name)) fnName = x.name || x.func_name;
+            if (fnName) {
+              refFns.push(fnName);
+              // 引用它的函数在反编译集合里 → 很可能是校验链上的函数
+              if (decMap.has(fnName)) score += 3;
+              // 该函数代码含比较语义 → 几乎可确定是"解密后比对"
+              const code = decMap.get(fnName) || '';
+              if (code && CMP_RE.test(code)) score += 3;
+            }
+          }
+        }
+        queried++;
+      } catch (e) { /* xref 失败不影响主流程 */ }
+    }
+    k.refFns = [...new Set(refFns)];
+    k.score = score;
+  }
+  // 符号名出现在"比较类函数"文本里 → 加分（无 addr 的候选也能受益）
+  const cmpText = [...decMap.values()].filter(c => CMP_RE.test(String(c))).join('\n');
+  for (const k of cands) {
+    if (k.name && cmpText.includes(k.name)) k.score = (k.score || 0) + 2;
+    if (k.addr && cmpText.includes(String(k.addr).toLowerCase())) k.score = (k.score || 0) + 2;
+  }
+  cands.sort((a, b) => (b.score || 0) - (a.score || 0));
+  // 只有"最高分明显领先"时才标 authoritative（避免误判）：
+  //  - 必须真有 xref（refFns 非空）或强名命中，不能只靠弱加分
+  //  - 且分数需比第二名至少高 2 分（拉开差距），同分则不裁决（降级为告警）
+  const top = cands[0];
+  const second = cands[1];
+  const topScore = (top && top.score) || 0;
+  const hasRealRef = top && ((top.refFns && top.refFns.length) || (top.name && top.name.length));
+  if (top && topScore >= 3 && hasRealRef && (cands.length === 1 || topScore - ((second && second.score) || 0) >= 2)) {
+    top.authoritative = true;
+  }
+  return cands;
+}
+
 
 // 交叉校验：把"AI 给的密文"与"so 里抽到的候选密文"并列，用同一 key/iv/algo 逐个尝试，
 // 报告每个候选能否解出 flag 形态结果。返回 { aiHit, nativeHits:[{src,hex,flag}], tried }
@@ -6754,8 +6837,10 @@ async function crossCheckCandidates(contract) {
   const c = contract || {};
   const flagRe = /^(?:flag|ctf|nctf|nssctf|sctf|dasctf|hgame|iscc|sictf|moectf|hnctf|bjdctf|gwht|picoctf|cyberpeace)\{/i;
   const intel = (mcpCache && mcpCache.nativeIntel) || {};
-  const cands = extractNativeCandidates(intel);
+  let cands = extractNativeCandidates(intel);
   if (!cands.length) return { tried: 0, nativeHits: [], aiHit: null };
+  // 用 IDA xrefs 给候选打分，标出"最像被校验函数引用的那条"（失败静默降级）
+  try { cands = await rankCandidatesByXref(cands, intel); } catch (e) { /* 降级：保持原顺序 */ }
 
   const base = {
     algo: c.algo, key: c.key, key_encoding: c.key_encoding,
@@ -6767,7 +6852,7 @@ async function crossCheckCandidates(contract) {
   attempts.push(Object.assign({}, base, { ciphertext: c.ciphertext, _src: 'AI' }));
   for (const k of cands) {
     if (k.hex === aiCt) continue;
-    attempts.push(Object.assign({}, base, { ciphertext: k.hex, _src: k.src, _nativeHex: k.hex }));
+    attempts.push(Object.assign({}, base, { ciphertext: k.hex, _src: k.src, _nativeHex: k.hex, _score: k.score || 0, _auth: !!k.authoritative, _refFns: k.refFns || [] }));
   }
   if (attempts.length <= 1) return { tried: 0, nativeHits: [], aiHit: null };
 
@@ -6784,9 +6869,13 @@ async function crossCheckCandidates(contract) {
     const a = attempts[idx] || {};
     if (a._src === 'AI') { aiHit = flag; continue; }
     // 只认 flag 形态
-    if (flagRe.test(flag)) nativeHits.push({ src: a._src, hex: (a._nativeHex || '').slice(0, 32) + '…', flag });
+    if (flagRe.test(flag)) nativeHits.push({ src: a._src, hex: (a._nativeHex || '').slice(0, 32) + '…', flag, score: a._score || 0, authoritative: !!a._auth, refFns: a._refFns || [] });
   }
-  return { tried: attempts.length, nativeHits, aiHit, output: r.output };
+  // 每个候选（含未出 flag 的）带分排序，供裁决：authoritative 优先
+  nativeHits.sort((a, b) => (b.authoritative - a.authoritative) || (b.score - a.score));
+  // 若"被校验函数引用(authoritative)"的那条能出 flag，则它即权威答案
+  const authHit = nativeHits.find(h => h.authoritative) || null;
+  return { tried: attempts.length, nativeHits, aiHit, authHit, ranked: cands.map(k => ({ src: k.src, score: k.score || 0, authoritative: !!k.authoritative, refFns: k.refFns || [] })) };
 }
 
 // 验证闭环：解析 [VERIFY] → 本地复现 → 标记 flag 验证状态
@@ -6817,8 +6906,9 @@ async function runVerification(aiText) {
 
   // ===== 多候选密文交叉校验（防"变种题"陷阱）=====
   // 即使本地复现"通过"了，也要确认用的是 so 里**真正被校验**的那条密文，而不是随便一条。
-  // 条件：AI 用了密文 + native intel 里抽到 >=2 组候选常量。此时把候选都跑一遍看哪些能出 flag。
-  let cross = null;
+  // 条件：AI 用了密文 + native intel 里抽到 >=2 组候选常量。此时把候选都跑一遍看哪些能出 flag，
+  // 并用 IDA xrefs 判定"哪条被校验函数引用" → 尝试自动裁决（无法判定时降级为告警）。
+  let cross = null, verdict = null;
   try {
     const hasNativeIntel = mcpCache && mcpCache.nativeIntel &&
       ((mcpCache.nativeIntel.globals || []).length || (mcpCache.nativeIntel.segments || []).length ||
@@ -6826,29 +6916,51 @@ async function runVerification(aiText) {
     const c0 = contracts.find(c => c && c.ciphertext && c.key && (c.algo !== 'custom' && c.algo !== 'node_js'));
     if (hasNativeIntel && c0) {
       cross = await crossCheckCandidates(c0);
+      const aiFlag = (flagHits[0] || '').trim();
       if (cross && cross.nativeHits && cross.nativeHits.length) {
-        // so 里存在**另一条**能解出 flag 的候选密文 → 说明 AI 用的可能不是真校验那条（变种题风险）
-        const aiFlag = (flagHits[0] || '').trim();
         const others = cross.nativeHits.filter(h => (h.flag || '').trim() !== aiFlag);
-        if (others.length) {
+        const authHit = cross.authHit;
+        if (authHit) {
+          // ✅ 自动裁决：找到了"被校验函数引用"的那条候选，且它能出 flag
+          const authFlag = (authHit.flag || '').trim();
+          if (authFlag && authFlag !== aiFlag) {
+            // 权威密文解出的 flag 与 AI 不同 → 以权威为准，并把 AI 原答案降级为未验证
+            if (state.findings && Array.isArray(state.findings.flags)) {
+              const prev = state.findings.flags.find(f => f.flag === aiFlag);
+              if (prev) { prev.verified = false; if (!String(prev.source).includes('superseded')) prev.source += ',superseded'; persistFindings(); }
+            }
+            recordFlag(authFlag, 'native-authoritative', true);
+            flagHits.length = 0; flagHits.push(authFlag);
+            const msg = `✅ 自动裁决：以「被校验函数引用的密文」为权威\n` +
+              `  • 权威候选 [${authHit.src}]${authHit.refFns && authHit.refFns.length ? ' 被 ' + authHit.refFns.join(', ') + ' 引用' : ''}\n` +
+              `    ct=${authHit.hex} → ${authFlag}\n` +
+              `  • AI 原答案（已降级为候选）：${aiFlag || '(无)'}\n` +
+              `（依据 IDA xrefs：该密文地址被校验函数引用，且引用它的函数含比较语义）`;
+            addLog('success', '[交叉校验] ' + msg.replace(/\n/g, ' '));
+            addSolveNote('交叉校验裁决', msg.replace(/\n/g, ' '));
+            addSystemMessage(`**🧭 多候选密文自动裁决**\n\n${msg}`);
+            verdict = { authoritative: authFlag, source: authHit.src, refFns: authHit.refFns || [], replacedAI: !!aiFlag };
+          } else {
+            addLog('success', `[交叉校验] AI 用的密文与「被校验函数引用的候选」一致 ✓（${authHit.src}）`);
+            verdict = { authoritative: authFlag || aiFlag, source: authHit.src, refFns: authHit.refFns || [], replacedAI: false };
+          }
+        } else if (others.length) {
+          // 无法自动判定权威（xref 没查到明确引用）→ 保持告警，交人工/AI 复核
           const msg = `⚠️ 检测到 ${others.length} 条 so 候选密文也能解出 flag（与 AI 给的不同）：\n` +
-            others.map(h => `  • [${h.src}] ct=${h.hex} → ${h.flag}`).join('\n') +
-            `\nAI 用的是：${aiFlag || '(无)'}\n请核对「校验函数实际引用的是哪条密文」再定案（变种题常见陷阱）。`;
+            others.map(h => `  • [${h.src}]${h.refFns && h.refFns.length ? ' 被 ' + h.refFns.join(', ') + ' 引用' : ''} score=${h.score || 0} → ${h.flag}`).join('\n') +
+            `\nAI 用的是：${aiFlag || '(无)'}\n未能从 xref 明确判定权威密文，请回 IDA 看 xrefs_to 密文地址后定案。`;
           addLog('warning', '[交叉校验] ' + msg.replace(/\n/g, ' '));
           addSolveNote('交叉校验告警', msg.replace(/\n/g, ' '));
           addSystemMessage(`**⚠️ 多候选密文交叉校验**\n\n${msg}\n\n（工具已枚举 so 内全部候选常量，非仅第一条）`);
           others.forEach(h => recordFlag(h.flag, 'native-candidate', false));
-        } else {
-          addLog('success', `[交叉校验] so 内 ${cross.tried} 组候选密文中，仅 AI 那条能出 flag（一致 ✓）`);
         }
       } else if (cross && cross.tried) {
-        // AI 那条能出但 native 候选都不出 → 正常（AI 可能用的是运行时/计算出的密文）
         addLog('info', `[交叉校验] 已试 ${cross.tried} 组候选，仅 AI 密文出 flag（其余为噪声/密钥表）`);
       }
     }
   } catch (e) { /* 交叉校验失败不阻断主流程 */ }
 
-  return { verified: flagHits.length > 0, intermediateVerified: verified, hits: r.hits, flagHits, cross };
+  return { verified: flagHits.length > 0, intermediateVerified: verified, hits: r.hits, flagHits, cross, verdict };
 }
 
 // 本地枚举：解析 [HYPOTHESES] → 并行尝试全部组合 → 命中即记

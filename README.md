@@ -1,4 +1,4 @@
-# CTF-RE-TOOL v1.3.5
+# CTF-RE-TOOL v1.3.6
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -307,6 +307,13 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 
 ## 更新日志
+
+### v1.3.6 (2026-10-14) — 实战阻塞修复（安装 / IDA 采集 / 验证器）
+本次用运行中的 IDA MCP + 真实 CrackMe 题逐项复现定位，修掉三个会直接导致解题失败的问题：
+- **修复 IDA 采集 0 反编译（最严重）**：`src/js/app.js` 误写 `window.electronApi`（小写 `pi`）→ 每次 `decompile` 都抛 `TypeError` 且被空 `catch` 静默吞掉 → **一个 native 函数都拿不到**，AI 只能回一句"请人工打开 IDA 分析"，解题直接卡死。改为 `electronAPI`；同时函数枚举改用真实工具名 `list_funcs`（旧的 `export_funcs{}`/`list_functions` 全部失败），反编译失败不再静默（打日志 + 0 个时明确告警）。实测：反编译 **0 → 19 个**（含 `JNI_OnLoad`、`RegisterNatives`、真正做 ChaCha20 校验的 `sub_257A0`）
+- **验证器补齐 ChaCha20**：提示词早已承诺 `algo:"chacha20"`，但求解器 Python 里**没有该分支**，导致"本地复现失败 → unknown algo chacha20"。新增 `chacha20`/`chacha20_ietf`/`salsa20` 分支，并处理 CTF 里最常见的坑——**counter 初值非 0 且大小端易错**（枚举候选自动命中）。实测 `[HIT]` 复现出 flag
+- **APK 安装冷启动失败**：日志错误是 `Failed to install <path>:`（原因为空），属模拟器刚开机 `installd` 未就绪的瞬时错误，但不在原重试正则内 → 不重试直接失败。现纳入可重试（增至 4 次 + 递增等待）；`INSTALL_FAILED_TEST_ONLY`/签名等确定性错误仍不重试
+- **Frida 附加"未找到进程"**：`resolveFridaProcessName` 只用 `frida-ps`（只列进程名），而包名在 `frida-ps -a` 的 Identifier 列；改用 `-a` 解析"包名 → 进程名"；且 App 未运行时**自动 monkey 拉起再 attach**。实测：包名 `com.cr.myapplication` → 进程名 `My Application` 解析成功
 
 ### v1.3.5 (2026-10-13) — 结构化知识库 + 解题成功率优化
 - **知识库重构为「结构化 + RAG 友好」**：新增全局检索索引 `AI-SEARCH-INDEX.md` 与速查表 `PAYLOAD-CHEATSHEET.md`

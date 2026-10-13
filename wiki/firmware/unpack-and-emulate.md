@@ -1,3 +1,13 @@
+---
+title: 固件解包与仿真实操（踩坑版）
+category: firmware
+vuln_type: [reverse, iot, firmware]
+tags: [binwalk, squashfs, unsquashfs, QEMU, 固件, 仿真, IoT, 文件系统解包]
+difficulty: medium
+one_liner: binwalk 只按签名切分不解文件系统；squashfs/cpio 需二次解包，仿真要注意大小端与 init
+keywords: [binwalk, squashfs, QEMU, 固件, 仿真, IoT]
+---
+
 # 固件解包与仿真实操（踩坑版）
 
 > 配合 `ctf-iot-firmware` 技能使用。本页只放**能直接抄的命令**和**真会卡住的坑**。

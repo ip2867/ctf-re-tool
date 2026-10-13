@@ -1,3 +1,13 @@
+---
+title: Android 多阶段校验题（Hook 视角）
+category: dynamic
+vuln_type: [reverse, android, multistage]
+tags: [多阶段, 手势, 停首页, SharedPreferences, SQLite, 状态注入跳关, driveAppIteratively, R8混淆]
+difficulty: medium
+one_liner: 分多关 APK flag 只在最后一关；被动 Hook 全是启动噪音，需主动驱动界面或注入状态跳关
+keywords: [多阶段, 停首页, 手势, SharedPreferences, 状态注入, 跳关]
+---
+
 # Android 多阶段校验题（Hook 视角）
 
 > 适用：APK 分多关（手势 → 输入 → 最终校验），flag 只在最后一关的加密里出现；

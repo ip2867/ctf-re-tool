@@ -6020,8 +6020,12 @@ function buildSystemPrompt() {
     ? `\n## 可用技能（用 read_skill 工具读取全文）\n${state.skills.map(s => `- ${s.name}：${s.description}`).join('\n')}\n`
     : '';
   // 知识库注入：优先提示"先读全局索引 AI-SEARCH-INDEX"，再列页面清单。
-  const wikiIndex = (state.wikiPages && state.wikiPages.length)
-    ? `\n## 知识库 Wiki（解题前先检索）\n**首选**：\`wiki_read(path=AI-SEARCH-INDEX.md)\` 读全局检索索引（按技术标签定位资源）；速查用 \`wiki_read(path=PAYLOAD-CHEATSHEET.md)\`。\n可用页面（用 wiki_search 按关键词检索 / wiki_read 读整页）：\n${state.wikiPages.map(p => `- ${p.rel}`).join('\n')}\n遇到具体手法/踩坑（Frida 进程内解密、native 常量反演、IV 编码坑、多阶段 APK、逆向题 attack_chain）先 wiki_search 检索，命中即 wiki_read 取完整片段。\n`
+  // 注意：逆向条目库(reverse/)有 40+ 篇，只靠 wiki_search 命中即可，不必逐条列名
+  //（逐条列名会白白吃掉上下文，且文件名长、对定位无帮助）。只列"手法页"清单。
+  const wikiPages = state.wikiPages || [];
+  const revCount = wikiPages.filter(p => String(p.rel || '').startsWith('reverse/')).length;
+  const wikiIndex = wikiPages.length
+    ? `\n## 知识库 Wiki（解题前先检索）\n**首选**：\`wiki_read(path=AI-SEARCH-INDEX.md)\` 读全局检索索引（按技术标签定位资源）；速查用 \`wiki_read(path=PAYLOAD-CHEATSHEET.md)\`。\n手法页（用 wiki_search 按关键词检索 / wiki_read 读整页）：\n${wikiPages.filter(p => !String(p.rel || '').startsWith('reverse/')).map(p => `- ${p.rel}`).join('\n')}\n${revCount ? `另有**历年逆向题条目库 ${revCount} 篇**（含 attack_chain 解法链 / reasoning_chain 思维链 / failed_attempts 避坑）：用题目特征词（算法名/混淆方式/工具/大赛名）\`wiki_search\` 检索，或先读 \`reverse/_INDEX.md\` 看总表。\n` : ''}遇到具体手法/踩坑（Frida 进程内解密、native 常量反演、IV 编码坑、多阶段 APK）先 wiki_search 检索，命中即 wiki_read 取完整片段。\n`
     : '';
   let prompt = `你是 CTF 逆向解题专家，就像在 Claude Code 中一样工作。
 

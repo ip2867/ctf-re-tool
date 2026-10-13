@@ -2256,7 +2256,10 @@ async function collectIdaNativeIntel() {
   // 行为特征：反编译文本里出现下列任一项 → 该函数值得保留（真算法/校验函数几乎必中一条）
   const BEHAVIOR = [
     /0x9[eE]3779[bB]9/,       // TEA/XTEA 魔数
-    /0x[0-9a-fA-F]{8,}/,       // 大常量（查表/密钥/模数）
+    // 大常量：排除裸地址（sub_/loc_/函数地址多为 0x401000 这类 6-7 位、或等于本函数内的 loc），
+    // 只认 8 位以上且**带异或/比较语义**的常量，避免"人人命中"把名额占满。
+    /(?:==|!=|\^|&|\|)\s*0x[0-9a-fA-F]{8,}/,
+    /0x[0-9a-fA-F]{12,}/,      // 更长常量（64 位模数/密钥片段）
     /\^|<<|>>/,                // 位运算（异或/移位，流密码/哈希特征）
     /memcmp|strcmp|strncmp|Arrays|equals/i,
     /for\s*\(|while\s*\(/,     // 存在循环
@@ -2264,23 +2267,27 @@ async function collectIdaNativeIntel() {
     /sbox|Sbox|RC4|MD5|SHA|AES|DES|TEA|ChaCha|Salsa/i,
   ];
 
-  // 3. 逐个反编译：先按 ordered 走，边反编译边按行为打分；step 上限放宽到 15 个函数、
-  //    单个函数上限放宽到 12000 字符（之前 6×6000 会漏掉/截断真正承载算法的 sub_）。
+  // 3. 逐个反编译：先按 ordered 走，边反编译边按行为打分；
+  //    分两个上限：保底 15 个（够写进上下文）+ 硬上限 28 个（防爆上下文）。
+  //    优先级函数（JNI/语义名）一律保留并占用名额；无名 sub_* 命中行为特征保留。
+  //    单个函数上限 12000 字符（之前 6×6000 会漏掉/截断真正承载算法的 sub_）。
+  const MIN_KEEP = 15, MAX_KEEP = 28;
   const decompiledNames = new Set();
   let behavioralKept = 0;
   for (const name of ordered) {
-    if (intel.decompiled.length >= 15) break;
+    if (intel.decompiled.length >= MAX_KEEP) break;
     if (decompiledNames.has(name)) continue;
     decompiledNames.add(name);
     try {
       const r = await window.electronApi.idaMcpCall('decompile', { address: name });
       if (r && r.success && r.result) {
         const code = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
-        // 行为打分：sub_*/无符号函数只有在命中行为特征时才保留，避免噪声淹没有效信息；
-        // JNI 导出与语义名则无条件保留。
+        // 行为打分：sub_*/无符号函数只有在命中行为特征时才保留；JNI 导出与语义名无条件保留。
         const isPriority = jniNames.includes(name) || semantic.includes(name);
         const hits = BEHAVIOR.filter(re => re.test(code)).length;
-        if (isPriority || hits >= 2) {
+        // 优先函数 / 命中≥2 / (未达保底数时命中≥1) 都保留
+        const keep = isPriority || hits >= 2 || (intel.decompiled.length < MIN_KEEP && hits >= 1);
+        if (keep) {
           intel.decompiled.push({ name, code: code.slice(0, 12000), raw: r.result, hits });
           if (!isPriority) behavioralKept++;
           addLog('info', `IDA 已反编译: ${name}（${code.length} 字符, 行为特征 ${hits}）`);
@@ -2320,7 +2327,9 @@ async function collectIdaNativeIntel() {
         if (!hitByAddr && !hitByName) continue;
         const next = byAddr[i + 1];
         let size = next ? next.val - g.val : 256;
-        if (!(size > 0) || size > 8192) size = 256;
+        // 大表（VM 字节码/密文表/S盒）常 >8KB：上限放宽到 64KB（超过则截，而非一刀切退 256）
+        if (!(size > 0)) size = 256;
+        else if (size > 65536) size = 65536;
         wanted.push({ addr: g.addr, name: g.name, size });
       }
       if (wanted.length) {
@@ -5394,7 +5403,9 @@ async function autoSolveBinaryFlag(fileType) {
         if (!refAddrs.has(g.addr.toLowerCase())) continue;
         const next = byAddr[i + 1];
         let size = next ? next.val - g.val : 256;
-        if (!(size > 0) || size > 8192) size = 256;
+        // 大表（VM 字节码/密文表/S盒）常 >8KB：上限放宽到 64KB（超过则截，而非一刀切退 256）
+        if (!(size > 0)) size = 256;
+        else if (size > 65536) size = 65536;
         wanted.push({ addr: g.addr, name: g.name, size });
       }
       if (wanted.length) {
@@ -5599,6 +5610,13 @@ ${verifiedFlags.length ? `**Flag（✅已验证）**: \`${verifiedFlags[0].flag}
 ${result.text}`;
 
       addSystemMessage(resultMsg);
+
+      // 阶段2.5（二进制）：静态一次性分析未出已验证 flag 时，进入 Tool-Use 深挖
+      // （与 APK 流程对齐：让 AI 自主调 ida_decompile/find_strings/get_xrefs/run_python 继续求解）。
+      const stillNoVerified = !((state.findings ? state.findings.flags : []) || []).some(f => f.verified);
+      if (stillNoVerified) {
+        await toolUseDeepSolveBinary(analysisData, fileType);
+      }
     } else if (result.aborted || /已取消/.test(result.error || '')) {
       endStreamMessage();
       addLog('info', '自动求解已停止');
@@ -5613,6 +5631,79 @@ ${result.text}`;
     addLog('error', 'AI分析异常: ' + err.message);
     addLog('error', '错误详情: ' + (err.stack || '无'));
     addSystemMessage('**AI分析异常**\n\n错误: ' + err.message);
+  } finally {
+    state.aiBusy = false;
+  }
+}
+
+// PE/ELF 的 Tool-Use 深挖（与 APK 的 toolUseDeepSolve 对齐）：
+// 静态一次性分析未出已验证 flag 时，把 IDA MCP / run_python 等工具交给 AI 自主驱动，
+// 让它在"收集→定位→写脚本→验证"里继续推进，而不是卡住即止。
+async function toolUseDeepSolveBinary(analysisData, fileType) {
+  addLog('info', '========================================');
+  addLog('info', '[阶段2.5] Tool-Use 深度求解（AI 自主调用 IDA/脚本）');
+  addLog('info', '========================================');
+
+  const fnSummary = analysisData.functions
+    ? (typeof analysisData.functions === 'string' ? analysisData.functions : JSON.stringify(analysisData.functions)).slice(0, 4000)
+    : '（未获取）';
+  const prompt = `我在解一道 CTF ${fileType || '二进制'} 题，静态固定清单分析未得出 flag。请**使用工具**自主深入分析并求出 flag。
+
+文件路径：${state.currentFile}
+
+## 已获取的函数列表（节选）
+${fnSummary}
+${analysisData.mainCode ? `\n## 入口函数反编译\n\`\`\`c\n${String(analysisData.mainCode).slice(0, 4000)}\n\`\`\`` : ''}
+${analysisData.otherFunctions && analysisData.otherFunctions.length ? `\n## 已反编译的其它函数\n${analysisData.otherFunctions.map(f => `### ${f.name}\n\`\`\`c\n${String(f.code).slice(0, 3000)}\n\`\`\``).join('\n\n')}` : ''}
+${analysisData.strings ? `\n## 关键字符串\n${typeof analysisData.strings === 'string' ? analysisData.strings.slice(0, 2000) : JSON.stringify(analysisData.strings).slice(0, 2000)}` : ''}
+
+## 你必须严格按 4 阶段推进（每阶段先出证据）
+① **收集（代码+数据缺一不可）**：用 \`ida_decompile\` 反编译入口与关键函数；**务必**用
+   \`ida_list_globals\` + \`ida_get_bytes\` 取出被引用的**常量表**（密钥/密文/S盒/VM字节码都在 .data/.rodata）；
+   用 \`ida_find_strings\` 搜 flag/key/密文特征串。⚠️ **只给代码不给常量表 = 无解**。
+   （IDA MCP 未连接时，用 run_python 配 capstone/pefile 手工解析。）
+② **定位算法**：认出算法特征（TEA 魔数 0x9E3779B9 / RC4 双 S 盒 / AES S 盒 / XOR 流 / 自定义 VM/查表），
+   写清算法名 + 关键地址 + 输入输出形态。
+③ **写脚本本地验证**：用 run_python 实现还原，正反双向验证（反推 key 后正向加密对回目标常量）；
+   需要约束/符号执行/模拟执行时用 Z3 / angr / Unicorn。
+④ **结论**：有把握才给 flag；证据不足就写明"待人工验证 + 还缺什么"，不要猜。
+
+**输出契约：**
+1. flag：单独一行 \`[FLAG]flag内容[/FLAG]\`
+2. 附 \`[VERIFY]{"algo":"rc4|tea|xtea|xxtea|xor|aes_ecb|aes_cbc|des_ecb|des_cbc|des3_ecb|sm4_ecb|chacha20|base64|base64_custom|node_js|custom","key":"...","key_encoding":"ascii|hex","ciphertext":"...","encoding":"hex|base64|ascii","expected":"...","iv":"(aes_cbc/des_cbc 需要)","iv_encoding":"ascii|hex|base64","code":"(custom 需要)完整函数"}[/VERIFY]\`
+3. 多个候选：\`[HYPOTHESES][{...},{...}][/HYPOTHESES]\`
+4. 末尾 \`[EXPERIENCE]每条一行,最多5条[/EXPERIENCE]\`
+不要臆造工具结果；工具失败时换一条路径继续。`;
+
+  try {
+    state.aiBusy = true;
+    beginStreamMessage();
+    const startTime = Date.now();
+    const result = await window.electronAPI.claudeChat(
+      [{ role: 'user', content: prompt }],
+      buildSystemPrompt()
+    );
+    endStreamMessage();
+    addLog('info', `Tool-Use 深度求解完成，耗时 ${((Date.now() - startTime) / 1000).toFixed(1)} 秒`);
+
+    if (result.success && result.text) {
+      state.lastAiText = result.text;
+      addSolveNote('求解结果(Tool-Use)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
+      await harvestExperience(result.text);
+      const vr = await runVerification(result.text);
+      if (vr && !vr.verified) await runHypotheses(result.text);
+      extractFlags(result.text).forEach(f => { recordFlag(f, 'ai-deep', false); addSolveNote('Flag', f); });
+      const vf = (state.findings ? state.findings.flags : []).filter(f => f.verified);
+      addSystemMessage(`**🎯 Tool-Use 深度求解结果**\n\n${vf.length ? `**Flag（✅已验证）**: \`${vf[0].flag}\`` : ''}\n\n${result.text}`);
+      return vf.length > 0;
+    }
+    if (result.aborted || /已取消/.test(result.error || '')) { addLog('info', 'Tool-Use 深度求解已停止'); return false; }
+    addLog('warning', 'Tool-Use 深度求解未返回内容: ' + (result.error || '未知'));
+    return false;
+  } catch (err) {
+    try { endStreamMessage(); } catch (e) {}
+    addLog('warning', 'Tool-Use 深度求解异常: ' + err.message);
+    return false;
   } finally {
     state.aiBusy = false;
   }
@@ -5683,6 +5774,38 @@ ${result.text}`;
   }
 }
 
+// 从经验库文本里挑选与"当前题"最相关的条目注入系统提示。
+// 旧实现只取末 15 行 —— 失败题教训/早期高价值经验会被淹没。改为：
+//   1) 按当前题特征（文件类型关键词 + 已识别的算法/包名）命中打分；
+//   2) 命中优先，其次补齐"最近 N 条"（保证上下文新鲜）；
+//   3) 去重、限总条数，避免撑爆 token。
+function selectRelevantExperience(expText, findings) {
+  const lines = String(expText || '').split('\n').map(s => s.trim()).filter(s => s && s.length > 8);
+  if (!lines.length) return '';
+  // 当前题特征词
+  const kws = [];
+  const ft = (state.fileType || '').toUpperCase();
+  if (ft) kws.push(ft);
+  if (/APK|DEX/i.test(ft)) kws.push('APK', 'so', 'native', 'JEB', 'Frida', 'smali', 'SharedPreferences');
+  else if (/PE|ELF|EXE|BIN/i.test(ft)) kws.push('native', 'IDA', 'PE', 'ELF', 'VM', '常量表');
+  const pkg = (state.findings && state.findings.meta && state.findings.meta.packageName) || '';
+  if (pkg) kws.push(pkg);
+  for (const a of (findings && findings.algorithms) || []) { const t = (a && a.text) || String(a); if (t) kws.push(t.slice(0, 20)); }
+  const kwSet = kws.filter(Boolean);
+  const score = (l) => kwSet.reduce((n, k) => n + (l.toLowerCase().includes(String(k).toLowerCase()) ? 1 : 0), 0);
+  const scored = lines.map((l, i) => ({ l, i, s: score(l) }));
+  const hit = scored.filter(x => x.s > 0).sort((a, b) => (b.s - a.s) || (b.i - a.i));
+  const recent = scored.slice(-8); // 最近 8 条兜底（含最新教训）
+  const picked = [];
+  const seen = new Set();
+  for (const x of hit.concat(recent)) {
+    if (seen.has(x.l)) continue;
+    seen.add(x.l); picked.push(x.l);
+    if (picked.length >= 18) break;
+  }
+  return picked.join('\n');
+}
+
 // 构建系统提示（连接状态取真实探测结果，不夸大）
 function buildSystemPrompt() {
   const mc = state.mcpStatus;
@@ -5706,6 +5829,7 @@ function buildSystemPrompt() {
 - JEB MCP：${st(mc.jeb)}（端口16161）- 可分析APK/DEX
 - IDA MCP：${st(mc.ida)}（端口13337）- 可分析PE/ELF
 - Burp MCP：${st(mc.burp)} - 可搜索代理历史/取HTTP报文（Web/JS逆向）
+- 浏览器 MCP：${st(mc.browser)} - 网页搜索/内容抓取
 - 安卓9模拟器：${st(mc.emulator)}
 - Frida：${st(mc.frida)}
 
@@ -5725,13 +5849,13 @@ function buildSystemPrompt() {
 4. 回答用代码块展示关键信息
 5. 如果用户说"求出flag"，直接分析当前文件并给出答案
 6. 得到 flag 时用 [FLAG]flag内容[/FLAG] 标记
-7. 给出验证数据：[VERIFY]{"algo":"rc4|tea|xtea|xxtea|xor|aes_ecb|aes_cbc|des_ecb|des_cbc|des3_ecb|sm4_ecb|base64|base64_custom|node_js|custom","key":"密钥","key_encoding":"ascii|hex","ciphertext":"密文","encoding":"hex|base64|ascii","expected":"期望的flag或前缀"}[/VERIFY]，工具会本地复现验证；custom 需附 "code":"def decrypt(data,key): 完整函数"；JS逆向还原的加密函数用 node_js：附 "code":"function decrypt(input){...}"（返回字符串或Uint8Array）和 "input":"抓到的参数原文"
+7. 给出验证数据：[VERIFY]{"algo":"rc4|tea|xtea|xxtea|xor|aes_ecb|aes_cbc|des_ecb|des_cbc|des3_ecb|sm4_ecb|chacha20|base64|base64_custom|node_js|custom","key":"密钥","key_encoding":"ascii|hex","ciphertext":"密文","encoding":"hex|base64|ascii","expected":"期望的flag或前缀","iv":"(aes_cbc/des_cbc 需要)","iv_encoding":"ascii|hex|base64"}[/VERIFY]，工具会本地复现验证；custom 需附 "code":"def decrypt(data,key): 完整函数"；JS逆向还原的加密函数用 node_js：附 "code":"function decrypt(input){...}"（返回字符串或Uint8Array）和 "input":"抓到的参数原文"
 8. 有多个候选（算法/字节序/密钥变体）时：[HYPOTHESES][{...},{...}][/HYPOTHESES]，工具会本地枚举
 9. 解题学习闭环（每次解题强制遵守）：
    - 解题前：先读上方「历史经验速查」，同类场景直接复用已验证套路与避坑点；需要完整方法论时用 read_skill 加载对应技能（ctf-reverse-binary / ctf-reverse-android / ctf-jsreverse 等）；遇到具体手法/踩坑（Frida 进程内解密、native 常量反演 key、IV 编码坑、多阶段 APK 停在首页等）先用 wiki_search 检索知识库，命中即 wiki_read 取完整代码片段。禁止无视知识库从零摸索
    - 解题中：严格按知识库流程执行，知识库已记录的坑（如 VM 题必须连常量表一起采集、mingw 入口是 _main、IV 编码不能借用 key 的编码）不得重踩
    - 解题后（无论成功失败）：回答最后输出 [EXPERIENCE]每条一行，格式"题型特征→关键套路/踩过的坑→下次怎么做"[/EXPERIENCE]，工具自动写入经验库；没有新收获则写"无新增经验"
-${skillsIndex}${wikiIndex}${state.experience ? `\n## 历史经验速查（此前解题沉淀，同类场景优先复用）\n${state.experience.trim().split('\n').slice(-15).join('\n')}\n` : ''}${(state.findings && ((state.findings.flags || []).length || (state.findings.algorithms || []).length)) ? `\n## 本题已收集的结论（勿重复劳动/勿推翻已验证项）\n${(state.findings.flags || []).map(f => `- Flag: ${f.flag}${f.verified ? '（✅已验证）' : '（⚠️未验证）'}`).join('\n')}\n${(state.findings.algorithms || []).length ? `- 已识别算法: ${state.findings.algorithms.map(a => (a && a.text) || a).join('; ')}` : ''}\n` : ''}
+${skillsIndex}${wikiIndex}${state.experience ? `\n## 历史经验速查（此前解题沉淀，同类场景优先复用）\n${selectRelevantExperience(state.experience, state.findings)}\n` : ''}${(state.findings && ((state.findings.flags || []).length || (state.findings.algorithms || []).length)) ? `\n## 本题已收集的结论（勿重复劳动/勿推翻已验证项）\n${(state.findings.flags || []).map(f => `- Flag: ${f.flag}${f.verified ? '（✅已验证）' : '（⚠️未验证）'}`).join('\n')}\n${(state.findings.algorithms || []).length ? `- 已识别算法: ${state.findings.algorithms.map(a => (a && a.text) || a).join('; ')}` : ''}\n` : ''}
 
 ## 工具使用约定（Windows 环境，务必遵守）
 - 本机是 Windows。shell 工具（bash/run_command）由 cmd.exe 执行，默认工作目录已是当前题目所在文件夹：

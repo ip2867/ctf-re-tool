@@ -214,22 +214,22 @@ ctf-tool-v2/
 
 本应用会读取 CCSwitch/Claude Code 使用的环境变量，并直接调用 Anthropic-compatible `/v1/messages` 接口：
 
-- `ANTHROPIC_BASE_URL`：例如 `https://your-api-endpoint.example.com`
-- `ANTHROPIC_AUTH_TOKEN`：CCSwitch 当前 Token
-- `ANTHROPIC_MODEL`：例如 `glm-5.3`
+- `ANTHROPIC_BASE_URL`：你的 AI 接口地址（如 `https://api.anthropic.com`，或自建/中转地址）
+- `ANTHROPIC_AUTH_TOKEN`：你的 API Token / 鉴权 Token
+- `ANTHROPIC_MODEL`：模型名，例如 `claude-sonnet-4-5`、`glm-5.3`
 
-也支持 `CTF_CLAUDE_BASE_URL`、`CTF_CLAUDE_API_KEY`、`CTF_CLAUDE_MODEL` 覆盖上述值。启动前可在 PowerShell 中设置（不要把真实 Token 写入源码或 README）：
+也支持 `CTF_CLAUDE_BASE_URL`、`CTF_CLAUDE_API_KEY`、`CTF_CLAUDE_MODEL` 覆盖上述值。也可以在应用「设置 → AI 接口」里直接填写 Base URL / API Key（保存到用户目录 config.json，不进源码）。启动前可在 PowerShell 中设置（不要把真实 Token 写入源码或 README）：
 
 ```powershell
 $env:ANTHROPIC_BASE_URL = "https://your-api-endpoint.example.com"
-$env:ANTHROPIC_AUTH_TOKEN = "重新生成的 Token"
-$env:ANTHROPIC_MODEL = "glm-5.3"
+$env:ANTHROPIC_AUTH_TOKEN = "<你的 Token>"
+$env:ANTHROPIC_MODEL = "claude-sonnet-4-5"
 npm start
 ```
 
-应用会自动请求 `${ANTHROPIC_BASE_URL}/v1/messages`。如果 CCSwitch 提供的是完整 `/v1/messages` URL，请去掉该后缀。若从 CCSwitch 启动本应用，请确认 Electron 子进程继承了这些环境变量；否则将变量设置为 Windows 用户环境变量或使用同一 PowerShell 启动。
+未配置 Base URL 时，应用会在调用 AI 时明确报错并提示去哪里配置。
 
-你在对话中贴出的 Token 已经暴露，请在 CCSwitch/服务端立即撤销并重新生成。
+应用会自动请求 `${ANTHROPIC_BASE_URL}/v1/messages`。如果你的服务提供的是完整 `/v1/messages` URL，请去掉该后缀。若从 CCSwitch 启动本应用，请确认 Electron 子进程继承了这些环境变量；否则将变量设置为 Windows 用户环境变量或使用同一 PowerShell 启动。
 
 
 本项目默认使用 **夜神模拟器 Nox（Android 9）**，不是雷电（LDPlayer）。默认配置为：

@@ -23,9 +23,10 @@ process.on('unhandledRejection', (reason) => { _crashLog('unhandledRejection', r
 
 
 // Claude API 基础配置（从 CC Switch 读取环境变量；config.claude 可覆盖 baseUrl/model/max_tokens）
+// 注意：baseUrl 默认留空，必须由环境变量或设置页提供——不在源码里硬编码任何(私有)中转地址。
 const CLAUDE_ENV = {
   // 兼容 CCSwitch / Claude Code 环境变量；CTF_* 仅作为显式覆盖项
-  baseUrl: process.env.CTF_CLAUDE_BASE_URL || process.env.ANTHROPIC_BASE_URL || 'https://your-api-endpoint.example.com',
+  baseUrl: process.env.CTF_CLAUDE_BASE_URL || process.env.ANTHROPIC_BASE_URL || '',
   apiKey: process.env.CTF_CLAUDE_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY || '',
   model: process.env.CTF_CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || 'glm-5.3'
 };
@@ -2552,7 +2553,9 @@ function claudeHeaders(postData) {
 function postClaudeJSON(requestBody) {
   return new Promise((resolve, reject) => {
     const cfg = getClaudeConfig();
-    const urlObj = new URL(cfg.baseUrl + '/v1/messages');
+    const base = String(cfg.baseUrl || '').trim();
+    if (!base) return reject(new Error('未配置 AI 接口地址（Base URL）：请在「设置 → AI 接口」填写，或设置环境变量 ANTHROPIC_BASE_URL / CTF_CLAUDE_BASE_URL。'));
+    const urlObj = new URL(base.replace(/\/+$/, '') + '/v1/messages');
     const isHttps = urlObj.protocol === 'https:';
     const client = isHttps ? https : http;
 
@@ -2586,7 +2589,9 @@ function postClaudeJSON(requestBody) {
 function postClaudeStream(requestBody, onDelta) {
   return new Promise((resolve, reject) => {
     const cfg = getClaudeConfig();
-    const urlObj = new URL(cfg.baseUrl + '/v1/messages');
+    const base = String(cfg.baseUrl || '').trim();
+    if (!base) return reject(new Error('未配置 AI 接口地址（Base URL）：请在「设置 → AI 接口」填写，或设置环境变量 ANTHROPIC_BASE_URL / CTF_CLAUDE_BASE_URL。'));
+    const urlObj = new URL(base.replace(/\/+$/, '') + '/v1/messages');
     const isHttps = urlObj.protocol === 'https:';
     const client = isHttps ? https : http;
 

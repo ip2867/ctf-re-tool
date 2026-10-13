@@ -1,3 +1,13 @@
+---
+title: 从 native 常量反演密钥
+category: dynamic
+vuln_type: [reverse, android, native]
+tags: [native, 常量反演, key, so, IDA, 正逆互校, Arrays.equals, JNI]
+difficulty: medium
+one_liner: 校验在 native 做时，从 so 常量表反推可逆变换，正逆互校求 key（只给代码不给常量表=数学上无解）
+keywords: [native key, 常量反演, so 常量表, 可逆变换, 正逆互校, JNI]
+---
+
 # 从 native 常量反演密钥
 
 > 适用：校验在 native（.so）里做，Java 层只看到 `native int[] encryptStage2(String)` 之类；

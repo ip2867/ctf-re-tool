@@ -4254,14 +4254,28 @@ function wikiSearch(query, max = 5) {
     const low = content.toLowerCase();
     const rel = p.rel.toLowerCase();
     const firstLine = (content.split('\n').find(l => /^#\s/.test(l)) || '').replace(/^#\s*/, '');
-    // 解析 YAML front matter 的加权字段
-    let tags = '', attack = '', reasoning = '', keys = '', one = '';
+    // 解析结构化 meta 的加权字段。兼容两种写法：
+    //   ① YAML front matter（`---` 包裹，用于 wiki 通用页）
+    //   ② 正文中的 ```yaml 围栏块（逆向条目库 reverse/*.md 用的是这种）
+    // 早先只认 ①，导致 43 篇逆向条目的 tags/attack_chain 加权**完全失效**（结构化 meta 形同虚设）。
+    let metaText = '';
     const fmM = content.match(/^---\n([\s\S]*?)\n---/);
-    if (fmM) {
-      const fm = fmM[1].toLowerCase();
-      const pick = (k) => { const m = fm.match(new RegExp('^' + k + ':[\\s\\S]*?(?=\\n[a-z_]+:|$)', 'm')); return m ? m[0] : ''; };
-      tags = pick('tags'); attack = pick('attack_chain'); reasoning = pick('reasoning_chain');
-      keys = pick('key_observations') + pick('key_payload'); one = pick('one_liner');
+    if (fmM) metaText = fmM[1];
+    else {
+      const fenceM = content.match(/(?:^|\n)[ \t]*```ya?ml[^\n]*\n([\s\S]*?)\n[ \t]*```/);
+      if (fenceM) metaText = fenceM[1];
+    }
+    const hasMeta = !!metaText;
+    // 命中打分用小写；展示片段（one_liner/attack_chain 含 flag、密钥，大小写敏感）保留原文。
+    let tags = '', attack = '', reasoning = '', keys = '', one = '', vtype = '';
+    let oneRaw = '', attackRaw = '';
+    if (metaText) {
+      const fm = metaText.toLowerCase();
+      const pick = (src, k) => { const m = src.match(new RegExp('^' + k + ':[\\s\\S]*?(?=\\n[a-zA-Z_]+:|$)', 'm')); return m ? m[0] : ''; };
+      tags = pick(fm, 'tags'); attack = pick(fm, 'attack_chain'); reasoning = pick(fm, 'reasoning_chain');
+      keys = pick(fm, 'key_observations') + pick(fm, 'key_payload') + pick(fm, 'failed_attempts'); one = pick(fm, 'one_liner');
+      vtype = pick(fm, 'vuln_type') + pick(fm, 'contest') + pick(fm, 'difficulty');
+      oneRaw = pick(metaText, 'one_liner'); attackRaw = pick(metaText, 'attack_chain');
     }
     let score = 0;
     for (const t of terms) {
@@ -4274,17 +4288,27 @@ function wikiSearch(query, max = 5) {
       score += (attack.includes(t) ? 4 : 0);
       score += (reasoning.includes(t) ? 4 : 0);
       score += (keys.includes(t) ? 5 : 0);
+      score += (vtype.includes(t) ? 3 : 0);
     }
     if (!terms.length) score = 1;
-    if (score > 0) scored.push({ score, page: p, content, title: firstLine, hasMeta: !!fmM });
+    if (score > 0) scored.push({ score, page: p, content, title: firstLine, hasMeta, oneRaw, attackRaw });
   }
   scored.sort((a, b) => (b.score - a.score) || (b.hasMeta - a.hasMeta));
   const top = scored.slice(0, Math.max(1, Math.min(Number(max) || 5, 20)));
   if (!top.length) return `未找到与「${query}」相关的知识页。可用页面：\n` + pages.map(p => `- ${p.rel}`).join('\n');
   return top.map(r => {
-    const lines = r.content.split('\n');
-    const idx = lines.findIndex(l => l.toLowerCase().includes(terms[0] || '\u0000'));
-    const snippet = lines.slice(Math.max(0, idx), Math.max(0, idx) + 6).join('\n').slice(0, 600);
+    // 带结构化 meta 的条目：优先给 one_liner / attack_chain（决策最有用），
+    // 而不是从正文里随便凑 6 行；无 meta 的页面仍按关键词行取上下文。
+    let snippet = '';
+    if (r.hasMeta && (r.oneRaw || r.attackRaw)) {
+      const fmt = (s) => s.replace(/^[a-z_]+:\s*/i, '').replace(/\s+/g, ' ').trim().slice(0, 300);
+      snippet = [r.oneRaw && `要点：${fmt(r.oneRaw)}`, r.attackRaw && `解法链：${fmt(r.attackRaw)}`].filter(Boolean).join('\n');
+    }
+    if (!snippet) {
+      const lines = r.content.split('\n');
+      const idx = lines.findIndex(l => l.toLowerCase().includes(terms[0] || '\u0000'));
+      snippet = lines.slice(Math.max(0, idx), Math.max(0, idx) + 6).join('\n').slice(0, 600);
+    }
     return `### ${r.title || r.page.name}  [${r.page.rel}]${r.hasMeta ? '  ★含结构化meta' : ''}\n${snippet}`;
   }).join('\n\n') + `\n\n（用 wiki_read(path=<rel>) 读取整页）`;
 }

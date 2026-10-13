@@ -1,3 +1,13 @@
+---
+title: 加密参数编码与 IV 长度坑
+category: dynamic
+vuln_type: [reverse, crypto, encoding]
+tags: [IV长度, Incorrect IV length, Incorrect padding, base64, hex, 编码不一致, normalizeCrypto, 乱码]
+difficulty: easy
+one_liner: key/iv/ciphertext 编码不统一导致解密报错或乱码；IV 必须单独按其编码解，不能借用 key 的编码
+keywords: [IV 长度, 编码坑, base64, hex, padding, 乱码]
+---
+
 # 加密参数编码与 IV 长度坑
 
 > 适用：契约/脚本里的 `key`、`iv`、`ciphertext` 编码不统一（hex / base64 / 明文混用），

@@ -4332,18 +4332,26 @@ if (typeof Java !== 'undefined' && Java.available) {
 `;
 }
 
-function buildFallbackFridaScript(packageName, crypto) {
+function buildFallbackFridaScript(packageName, crypto, targets) {
   crypto = normalizeCrypto(crypto);
   // crypto（可选）：已求解的加密参数 {key, iv, ciphertext, encoding, iv_encoding, algo}
   // 有了它，Hook 可在 App 进程内**直接解密并打印 [FLAG]**，实现"Hook 出 flag"，
   // 不依赖人工在模拟器里逐屏操作（本题外网/离线的多阶段题尤其如此）。
+  // targets（可选）：从静态分析抽出的**针对性 hook 目标** {classes,natives,methods,keywords}。
+  // ⚠️ 关键：兜底模板不再"只会盲扫"——它会把题目已知的类/方法/native 函数**优先 hook**，
+  //    使"AI 脚本失败后的兜底"也具备针对性（否则固定盲扫大概率抓不到关键数据）。
   const c = (crypto && typeof crypto === 'object') ? crypto : {};
+  const T = (targets && typeof targets === 'object') ? targets : {};
   const j = (v) => JSON.stringify(v == null ? '' : String(v));
+  const jlist = (a) => JSON.stringify((Array.isArray(a) ? a : []).map(String));
   return `'use strict';
 send('[*] fallback hook script loaded');
 ${fridaSolvePreamble(crypto)}
 function hr(b){ try { var h=''; for (var i=0;i<b.length;i++){ var c=b[i]&0xff; h+=(c<16?'0':'')+c.toString(16);} return h; } catch(e){ return '<err>'; } }
 function ia(a){ try { var s=[]; for(var i=0;i<a.length;i++) s.push(a[i]); return '['+s.join(',')+']'; } catch(e){ return '<err>'; } }
+// ===== 针对性 hook（来自静态分析情报，优先执行）=====
+var __CTF_TARGETS = { pkg: ${j(T.pkg)}, classes: ${jlist(T.classes)}, natives: ${jlist(T.natives)}, methods: ${jlist(T.methods)}, keywords: ${jlist(T.keywords)} };
+send('[HIT] targets: classes=' + __CTF_TARGETS.classes.length + ' natives=' + __CTF_TARGETS.natives.join('/') + ' methods=' + __CTF_TARGETS.methods.join('/'));
 // 三视图打印器：优先用 okhttp okio.ByteString（一行出 hex/base64/utf8，比手写更健壮），
 // 不可用时降级到手写 hr()/utfb()。给 [B 型数据统一输出，避免漏看非可见字节。
 var __BS = null; try { __BS = Java.use('com.android.okhttp.okio.ByteString'); } catch (e) { try { __BS = Java.use('okio.ByteString'); } catch (e2) {} }
@@ -4412,6 +4420,32 @@ ${crypto && crypto.hookClass ? `    try {
         send('[HIT] hooked ${crypto.hookClass}.${crypto.hookMethod}');
       }` : ''}
     } catch (e) { send('[!] hookClass: ' + e); }` : ''}
+    // 0a) 【针对性 hook】按静态分析情报，主动 hook 题目已知的类/方法（不依赖盲扫）
+    try {
+      __CTF_TARGETS.classes.forEach(function (cn) {
+        try {
+          var C = Java.use(cn);
+          // 该类的所有方法里，命中"语义名"或情报里的方法名 → 优先 hook
+          C.class.getDeclaredMethods().forEach(function (md) {
+            try {
+              var nm = md.getName();
+              var want = __CTF_TARGETS.methods.indexOf(nm) >= 0 || __CTF_TARGETS.natives.indexOf(nm) >= 0
+                || /check|verify|encrypt|decrypt|sign|hash|calc|validate|native/i.test(nm);
+              if (!want || !C[nm]) return;
+              C[nm].overloads.forEach(function (ov) {
+                ov.implementation = function () {
+                  var a = Array.prototype.slice.call(arguments);
+                  var r = ov.apply(this, arguments);
+                  send('[DATA] ' + cn + '.' + nm + '(' + a.map(function (x) { return x === null ? 'null' : (x.length !== undefined ? ia(x) : String(x)); }).join(',') + ') = ' + (r === null || r === undefined ? String(r) : (r.length !== undefined ? ia(r) : String(r))));
+                  return r;
+                };
+              });
+              send('[HIT] targeted hook ' + cn + '.' + nm);
+            } catch (e) {}
+          });
+        } catch (e) {}
+      });
+    } catch (e) {}
     // 0b) 反调试 / Frida 检测 绕过（CTF 题常带；命中即替换返回值，避免 App 退出）
     try {
       var DEBUGCLASSES = ['android.os.Debug', 'android.app.Application'];
@@ -4646,6 +4680,31 @@ ${crypto && crypto.hookClass && crypto.hookMethod ? `      try {
 `;
 }
 
+// 从静态分析结果中抽取"要 hook 的目标情报"（类名/方法名/native函数/包名），
+// 供 fallback 模板做**针对性** hook（而非盲目通扫）。来源：类列表、AI 结论、关键类代码。
+function extractHookTargets(analysisData, packageName) {
+  const t = { pkg: packageName || '', classes: [], natives: [], methods: [], keywords: [] };
+  const classes = (analysisData && Array.isArray(analysisData.classes)) ? analysisData.classes : [];
+  const pkg = String(packageName || '');
+  // 1) 题目自身包下的类优先 + 名字含语义关键词的类
+  const semantic = /check|verify|encrypt|decrypt|cipher|crypt|key|flag|native|bridge|sign|hash|token|secret|util|stage|jni/i;
+  const selfClasses = classes.filter(c => !pkg || String(c).indexOf(pkg) === 0);
+  const picked = (selfClasses.length ? selfClasses : classes)
+    .filter(c => semantic.test(String(c)) || /^[A-Z][A-Za-z0-9_]{2,}$/.test(String(c).split('/').pop() || ''));
+  for (const c of picked.slice(0, 20)) t.classes.push(String(c));
+  // 2) 从 AI 结论/关键类代码里抠 native 方法名与可疑方法名
+  const blob = [state.lastAiText || '', mcpCache.mainCode || '', Object.values(mcpCache.otherClasses || {}).join('\n')].join('\n');
+  const nativeRe = /(?:native\s+[\w\[\]<>.]+\s+|public\s+native\s+[\w\[\]<>.]+\s+)([A-Za-z_$][\w$]*)\s*\(/g;
+  let m; while ((m = nativeRe.exec(blob)) !== null) if (t.natives.indexOf(m[1]) < 0) t.natives.push(m[1]);
+  const methRe = /\b([A-Za-z_$][\w$]{1,30})\s*\([^)]*\)\s*\{/g;
+  while ((m = methRe.exec(blob)) !== null) { const n = m[1]; if (/check|verify|encrypt|decrypt|sign|hash|calc|verify|validate/i.test(n) && t.methods.indexOf(n) < 0) t.methods.push(n); }
+  // 3) 关键词（算法名），供模板里做优先 hook
+  for (const kw of ['rc4', 'tea', 'xtea', 'xxtea', 'aes', 'des', '3des', 'sm4', 'chacha', 'salsa', 'xor', 'base64', 'md5', 'sha']) {
+    if (new RegExp(kw, 'i').test(blob)) t.keywords.push(kw);
+  }
+  return t;
+}
+
 async function autoFridaStage() {
   if (state.fileType !== 'APK' || !state.currentFile) return;
 
@@ -4757,28 +4816,31 @@ ${mcpCache.nativeIntel.decompiled && mcpCache.nativeIntel.decompiled.length ? '�
   // 报 "invalid regular expression flags" 而整脚本不加载（表现为零输出、白等 25s）。
   // 这里做静态语法预检，并尝试自动修复"正则中裸露的 /"这类高频错误。
   let vres = await validateAndRepairFridaScript(script);
-  // 校验失败：让 AI 带着"具体错误"重新生成一次（覆盖截断 Unexpected end of input、
-  // 以及 missing )/unexpected token 等语法笔误——AI 生成的长脚本常少个 '+' 或括号）。
-  // 仍失败才落到内置模板。
-  if (!vres.ok) {
-    addLog('info', `AI 脚本语法校验未通过（${String(vres.error || '').slice(0, 80)}），带错误信息重新生成一次...`);
+  // 校验失败：让 AI 带着"具体错误"**反复重生成**（最多 2 轮），每轮都带全题目情报——
+  // 绝不轻易退化成"固定模板"。语法笔误（少 '+'/括号）是 AI 长脚本的高频问题，重生成命中率高。
+  for (let round = 1; round <= 2 && !vres.ok; round++) {
+    addLog('info', `AI 脚本语法校验未通过（${String(vres.error || '').slice(0, 80)}），第 ${round}/2 轮带错误重新生成...`);
     try {
       const retry = await window.electronAPI.claudeChat(
-        [{ role: 'user', content: genPrompt + `\n\n注意：你上一次输出的脚本**无法通过语法校验**，错误是：\n  ${String(vres.error || '').slice(0, 200)}\n请重新输出一个**语法绝对正确、完整可运行**的脚本：仔细检查每一处字符串拼接（该有 '+' 的地方别漏）、括号/花括号配对完整、正则里的 '/' 已转义。总长度控制在一屏内。` }],
+        [{ role: 'user', content: genPrompt + `\n\n注意：你上一次输出的脚本**无法通过语法校验**，错误是：\n  ${String(vres.error || '').slice(0, 200)}\n请重新输出一个**语法绝对正确、完整可运行**的脚本：仔细检查每一处字符串拼接（该有 '+' 的地方别漏）、括号/花括号配对完整、方括号与引号成对、正则里的 '/' 已转义。宁可精简也不要漏写符号。只输出一个 [FRIDA_SCRIPT] 块。` }],
         '你是 Frida 动态插桩专家。只输出一个 [FRIDA_SCRIPT] 块。不要调用任何工具。',
         { model: String((state.config && state.config.claude && state.config.claude.fastModel) || '').trim() || undefined, maxTokens: 16384 });
       const sm2 = retry && retry.success ? String(retry.text || '').match(/\[FRIDA_SCRIPT\]([\s\S]+?)\[\/FRIDA_SCRIPT\]/) : null;
       if (sm2) {
         const cand = sm2[1].replace(/^```(?:javascript|js)?\s*/i, '').replace(/```\s*$/, '').trim();
         const v2 = await validateAndRepairFridaScript(cand);
-        if (v2.ok) { vres = v2; addLog('info', '脚本已按错误信息重新生成并通过校验'); }
+        if (v2.ok) { vres = v2; addLog('success', `脚本已按错误信息重新生成并通过校验（第 ${round} 轮）`); break; }
+        vres = v2; // 记录最新错误供下一轮
       }
-    } catch (e) { /* 重试失败 → 走内置模板兜底 */ }
+    } catch (e) { addLog('warning', '重生成异常: ' + e.message); }
   }
   const cryptoParams = pickCryptoParams();
+  const hookTargets = extractHookTargets(analysisData, packageName);
   if (!vres.ok) {
-    addLog('warning', 'AI Hook 脚本语法校验未通过（' + vres.error + '）；改用内置模板脚本');
-    script = buildFallbackFridaScript(packageName, cryptoParams);
+    // 语法失败 → 已经不在此处直接落"固定模板"了：上面的重试循环已带错误+情报重生成多次。
+    // 仅当所有重试都失败，才用"情报增强版"兜底模板（会优先 hook 题目已知的类/方法/native）。
+    addLog('warning', 'AI Hook 脚本多次重生成仍语法失败（' + vres.error + '）；改用**情报增强版**内置模板（按题目已知目标针对性 hook）');
+    script = buildFallbackFridaScript(packageName, cryptoParams, hookTargets);
   } else {
     if (vres.repaired) addLog('info', 'Hook 脚本已自动修复语法问题（正则转义）');
     script = vres.script;

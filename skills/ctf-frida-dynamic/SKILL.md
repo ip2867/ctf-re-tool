@@ -22,11 +22,52 @@ metadata:
 ├── 加密密钥/IV → Cipher.init / SecretKeySpec 构造 / EVP_CipherInit(native)
 ├── 加密前后数据 → Cipher.doFinal / 自定义 encrypt 函数 onEnter+onLeave
 ├── 比较点(输入对不对) → String.equals / strcmp / memcmp
-├── 哈希输入 → MessageDigest.digest / MD5_Init+Update+Final
+├── 哈希/签名 → MessageDigest.digest / Mac.doFinal / Signature.sign / HMAC
 ├── 编解码 → Base64.decode/encode
 ├── 配置/密文常量 → SharedPreferences.getString / 资源读取 / .rodata 内存扫描
+├── native 动态注册校验 → RegisterNatives（见下，无 Java_ 导出时的唯一入口）
 └── 未知地址函数 → Interceptor.attach(基址+RVA)，x64: RCX RDX R8 R9，x86: 栈
 ```
+
+> **JCE 通杀自吐**：不必逐个追业务类，直接在 JCA/JCE 标准层挂 hook 就能吐出「算法名+密钥+IV+明文+密文」——
+> 绝大多数 App（含混淆/加固）最终都走 `javax.crypto.*` / `java.security.*`。挂全这几个即通杀：
+> `Cipher.init/doFinal`（列全 7 个 init、6 个 doFinal 重载）、`MessageDigest.getInstance/update/digest`、
+> `Mac.getInstance/doFinal`、`Signature.update/sign`、`SecretKeySpec`/`DESKeySpec`/`IvParameterSpec` 构造、`RSAPublicKeySpec(N,E)`。
+> 判断加/解密方向：`Cipher.init` 的 opmode（1=ENCRYPT / 2=DECRYPT）。
+> RSA 私钥坑：`arguments[1]` 若是 `OpenSSLRSAPrivateKey`，`getEncoded()` 会抛异常，先 `JSON.stringify` 判类名跳过。
+
+## native 函数定位（四种，按稳定性）
+
+| 方式 | 写法 | 场景 |
+|---|---|---|
+| 导出名 | `Module.findExportByName(so, name)` | 有导出的 `Java_*` / 自定义导出 |
+| 符号表 | `Process.findModuleByName(so).enumerateSymbols()` + 子串过滤 | libart/libc、C++ mangled、静态 so |
+| 地址偏移 | `Module.findBaseAddress(so).add(offset)`（**ARM32/Thumb 要 +1**）| IDA 里拿到 RVA，无符号 |
+| inline | `Interceptor.attach(任意地址)` | 任意函数（含非导出） |
+
+```javascript
+// 主动调用 so 内函数（不依赖 App 触发）
+var f = new NativeFunction(Module.findBaseAddress("libx.so").add(0x1234), 'pointer', ['pointer']);
+var arg = Memory.alloc(32); arg.writeUtf8String("test");
+console.log(hexdump(f(arg), { length: 64 }));
+```
+
+> **RegisterNatives（关键）**：加固/动态注册的 native 函数**没有 `Java_` 导出**，只能在 `libart.so` 的
+> `RegisterNatives` 处拦截，遍历 `JNINativeMethod{name, sig, fnPtr}`（结构体步长 `pointerSize*3`），
+> 从 `fnPtr` 直接 attach 真实实现——这是这类题唯一的 native 入口。
+> 另可用「JNIEnv 函数表 vtable 偏移」hook `GetStringUTFChars`(169)/`NewStringUTF`(167) 抓 Java↔Native 字符串。
+
+## 反检测绕过（逆向加固题常需）
+
+- **反 Frida 字符串检测**：hook `libc` 的 `strstr/strcmp`，命中 `frida/gum-js-loop/gmain/gdbus/linjector/27042/tmp` → `retval.replace(0)`。
+- **反调试线程**：`Interceptor.replace(pthread_create)`，对回调名含 `detect/frida/anti/debug/check` 的线程直接返回 0（不创建）。
+- **自实现 syscall 绕过 libc**：扫 `svc` 机器码（arm64 `01 00 00 D4` / arm `00 00 00 EF`）找 open(56/5) 等系统调用点。
+- **SSL Pinning**：Java 层造万能 `X509TrustManager` 并劫持 `SSLContext.init`，再逐层 hook `okhttp3.CertificatePinner.check`、`conscrypt.TrustManagerImpl.verifyChain`、`WebViewClient.onReceivedSslError`；native 兜底 hook `libssl` 的 `SSL_read/SSL_write`（r0capture 原理）。
+
+## 脱壳（内存扫描 DEX）
+
+内存扫 DEX 魔数 `64 65 78 0a 30 ?? ?? 00`（`dex\n035`），校验 `+0x3C` 的 `string_ids_off == 0x70`、`+0x20` 读出的 `file_size`，dump 出来交给 jadx。
+现成工具：`frida-dexdump -U -f <pkg>`（整体加固）/ BlackDex（免 root）。
 
 ## 实用片段
 

@@ -4344,6 +4344,13 @@ send('[*] fallback hook script loaded');
 ${fridaSolvePreamble(crypto)}
 function hr(b){ try { var h=''; for (var i=0;i<b.length;i++){ var c=b[i]&0xff; h+=(c<16?'0':'')+c.toString(16);} return h; } catch(e){ return '<err>'; } }
 function ia(a){ try { var s=[]; for(var i=0;i<a.length;i++) s.push(a[i]); return '['+s.join(',')+']'; } catch(e){ return '<err>'; } }
+// 三视图打印器：优先用 okhttp okio.ByteString（一行出 hex/base64/utf8，比手写更健壮），
+// 不可用时降级到手写 hr()/utfb()。给 [B 型数据统一输出，避免漏看非可见字节。
+var __BS = null; try { __BS = Java.use('com.android.okhttp.okio.ByteString'); } catch (e) { try { __BS = Java.use('okio.ByteString'); } catch (e2) {} }
+function utfb(b){ try { return String(Java.use('java.lang.String').$new(b, 'UTF-8')); } catch (e) { return ''; } }
+function view(tag, d){ try {
+  if (__BS && __BS.of) { var z = __BS.of(d); send('[DATA] ' + tag + ' hex=' + z.hex() + ' b64=' + z.base64()); return; }
+} catch (e) {} send('[DATA] ' + tag + ' hex=' + hr(d) + ' str=' + utfb(d)); }
 if (Java.available) {
   Java.perform(function () {
     // 0) 【通用关键】主动 hook Java 层声明的 native 方法（含 RegisterNatives 动态注册的）。
@@ -4405,6 +4412,76 @@ ${crypto && crypto.hookClass ? `    try {
         send('[HIT] hooked ${crypto.hookClass}.${crypto.hookMethod}');
       }` : ''}
     } catch (e) { send('[!] hookClass: ' + e); }` : ''}
+    // 0b) 反调试 / Frida 检测 绕过（CTF 题常带；命中即替换返回值，避免 App 退出）
+    try {
+      var DEBUGCLASSES = ['android.os.Debug', 'android.app.Application'];
+      // Debug.isDebuggerConnected -> false
+      try { Java.use('android.os.Debug').isDebuggerConnected.implementation = function () { send('[HIT] bypass Debug.isDebuggerConnected'); return false; }; } catch (e) {}
+      // 常见的一些检测点（存在才改）
+      try { var Sys = Java.use('java.lang.System'); if (Sys.getProperty) { var __gp = Sys.getProperty; Sys.getProperty.overload('java.lang.String').implementation = function (k) { var v = __gp.call(this, k); if (/frida|debug|xposed|magisk|hook/i.test(k)) { send('[HIT] bypass System.getProperty(' + k + ')'); return null; } return v; }; } } catch (e) {}
+      // 文件检测：/proc/self/maps 里 frida 关键字读取（只能观察，无法轻易替换内核结果）
+      send('[HIT] anti-debug hooks installed');
+    } catch (e) {}
+    // 0c) System.loadLibrary 监控 + 动态加载监控（so/DEX 加载时机，配合 attach native）
+    try {
+      var Sys2 = Java.use('java.lang.System');
+      Sys2.loadLibrary.overload('java.lang.String').implementation = function (name) { send('[DATA] System.loadLibrary("' + name + '")'); return this.loadLibrary(name); };
+    } catch (e) {}
+    try {
+      var DCL = Java.use('dalvik.system.DexClassLoader');
+      DCL.loadClass.overload('java.lang.String').implementation = function (n) { send('[DATA] DexClassLoader.loadClass(' + n + ')'); return this.loadClass(n); };
+    } catch (e) {}
+    // 0c2) dlopen/dlsym 监控（native so 动态加载链，配合 attach native）
+    try {
+      var dlopen = Module.findExportByName('libc.so', 'dlopen');
+      if (dlopen) Interceptor.attach(dlopen, { onEnter: function (a) { try { var p = Memory.readCString(a[0]); if (p && /\\.so/.test(p)) send('[DATA] dlopen ' + p); } catch (e) {} } });
+      var dlsym = Module.findExportByName('libc.so', 'dlsym');
+      if (dlsym) Interceptor.attach(dlsym, { onEnter: function (a) { try { var s = Memory.readCString(a[1]); if (s && /frida|anti|debug|check|inject/i.test(s)) send('[DATA] dlsym ' + s); } catch (e) {} } });
+    } catch (e) {}
+    // 0c3) 反调试线程阻断（pthread_create 白名单：拦截常见"反调试循环"线程，直接不创建）
+    try {
+      var pc = Module.findExportByName('libc.so', 'pthread_create');
+      if (pc) {
+        var __pc = new NativeFunction(pc, 'int', ['pointer', 'pointer', 'pointer', 'pointer']);
+        Interceptor.replace(pc, new NativeCallback(function (a0, a1, a2, a3) {
+          try {
+            var name = DebugSymbol.fromAddress(a2);
+            var nm = (name && name.name) ? name.name : '';
+            if (/frida|anti|detect|debug|check|inject|ptrace/i.test(nm)) { send('[HIT] blocked anti-debug thread: ' + nm); return 0; }
+          } catch (e) {}
+          return __pc(a0, a1, a2, a3);
+        }, 'int', ['pointer', 'pointer', 'pointer', 'pointer']));
+        send('[HIT] pthread_create guard installed');
+      }
+    } catch (e) {}
+    // 0d) SSL Pinning 绕过（抓 HTTPS 流量；TrustManager + HostnameVerifier + okhttp）
+    try {
+      var X509TM = Java.use('javax.net.ssl.X509TrustManager');
+      var SSLContext = Java.use('javax.net.ssl.SSLContext');
+      var TrustManager = Java.use('javax.net.ssl.TrustManager');
+      var tm = Java.registerClass({ name: 'ctf.TrustAll', implements: [X509TM], methods: {
+        checkClientTrusted: function () {}, checkServerTrusted: function () {}, getAcceptedIssuers: function () { return []; }
+      }});
+      var ctx = SSLContext.getInstance('TLS');
+      ctx.init(null, [tm.$new()], null);
+      try { SSLContext.init.overload('[Ljavax.net.ssl.KeyManager;', '[Ljavax.net.ssl.TrustManager;', 'java.security.SecureRandom').implementation = function (a, b, c) { send('[HIT] bypass SSLContext.init'); return this.init(a, [tm.$new()], c); }; } catch (e) {}
+      var HV = Java.use('javax.net.ssl.HostnameVerifier');
+      var hv = Java.registerClass({ name: 'ctf.HV', implements: [HV], methods: { verify: function () { return true; } } });
+      try { Java.use('javax.net.ssl.HttpsURLConnection').setDefaultHostnameVerifier(hv.$new()); } catch (e) {}
+      send('[HIT] ssl-pinning bypass installed');
+    } catch (e) {}
+    // 0e) 打印调用栈（定位"谁调用了这个校验函数"；仅对含关键字的类名打印，降噪）
+    try {
+      var Throwable = Java.use('java.lang.Throwable');
+      Throwable.$init.overload().implementation = function () {
+        var r = this.$init();
+        try {
+          var st = Java.use('android.util.Log').getStackTraceString(this);
+          if (/flag|check|verify|encrypt|decrypt|NativeBridge|native|crypt/i.test(st)) send('[DATA] stack: ' + st.replace(/\\n/g, ' | ').slice(0, 600));
+        } catch (e) {}
+        return r;
+      };
+    } catch (e) {}
     // 2) JNI 导出（扫题目自带 lib*.so，不写死具体 so 名）
     try {
       Process.enumerateModules().forEach(function (m) {
@@ -4418,6 +4495,53 @@ ${crypto && crypto.hookClass ? `    try {
         }
       });
     } catch (e) {}
+    // 2b) RegisterNatives 拦截（关键！动态注册的 native 函数没有 Java_ 导出，
+    //     只有在这里能拿到「方法名 → 真实实现指针」，再 attach 实现即抓到入参/返回）。
+    try {
+      var libart = Process.findModuleByName('libart.so');
+      var rn = null;
+      if (libart) {
+        libart.enumerateSymbols().forEach(function (sy) {
+          if (sy.name.indexOf('RegisterNatives') >= 0 && sy.name.indexOf('CheckJNI') < 0) rn = sy.address;
+        });
+      }
+      if (rn) {
+        Interceptor.attach(rn, { onEnter: function (args) {
+          try {
+            var cnt = args[3].toInt32();
+            var methods = args[2];
+            var env = Java.vm.getEnv();
+            var cls = env.getClassName(args[1]);
+            for (var i = 0; i < cnt; i++) {
+              var mi = methods.add(i * Process.pointerSize * 3);   // JNINativeMethod{name,sig,fnPtr}
+              var nm = Memory.readCString(Memory.readPointer(mi));
+              var sig = Memory.readCString(Memory.readPointer(mi.add(Process.pointerSize)));
+              var fn = Memory.readPointer(mi.add(Process.pointerSize * 2));
+              send('[HIT] RegisterNatives ' + cls + '.' + nm + sig + ' @' + fn);
+              try {
+                Interceptor.attach(fn, {
+                  onEnter: function (a) { this.a0 = a[0]; this.a1 = a[1]; this.a2 = a[2]; this.a3 = a[3]; send('[DATA] ' + nm + ' enter'); },
+                  onLeave: function (r) { send('[DATA] ' + nm + ' return ' + r); }
+                });
+              } catch (e) {}
+            }
+          } catch (e) { send('[!] RegisterNatives parse: ' + e); }
+        }});
+        send('[HIT] RegisterNatives hooked');
+      }
+    } catch (e) {}
+    // 2c) native 定位封装：导出名 / 符号(子串) / 偏移(+thumb) —— 交给 AI/脚本按需调用
+    function findFunc(soName, nameOrOffset, kind) {
+      try {
+        var m = Process.findModuleByName(soName); if (!m) return null;
+        if (kind === 'offset') { var off = parseInt(nameOrOffset, 16); return m.base.add(off); }
+        if (kind === 'symbol') {
+          var hit = null; m.enumerateSymbols().forEach(function (sy) { if (!hit && sy.name.indexOf(nameOrOffset) >= 0) hit = sy.address; }); return hit;
+        }
+        return m.findExportByName ? m.findExportByName(nameOrOffset) : Module.findExportByName(soName, nameOrOffset);
+      } catch (e) { return null; }
+    }
+    globalThis.__ctfFindFunc = findFunc;
     // 3) Cipher
     try {
       var Cipher = Java.use('javax.crypto.Cipher');
@@ -4447,6 +4571,26 @@ ${crypto && crypto.hookClass ? `    try {
         };
       });
       send('[HIT] Cipher hooked');
+    } catch (e) {}
+    // 3b) JCE 通杀自吐：密钥来源类 + Mac + Signature + RSA（无需追业务代码，注入即吐算法/密钥/明文）
+    try {
+      // 密钥/IV 构造点（比 hook Cipher.init 更早、更全）
+      var SKS = Java.use('javax.crypto.spec.SecretKeySpec');
+      SKS.$init.overload('[B', 'java.lang.String').implementation = function (k, alg) {
+        send('[DATA] SecretKeySpec alg=' + alg + ' keyHex=' + hr(k) + ' keyStr=' + ia(k)); return this.$init(k, alg);
+      };
+      try { var IVS = Java.use('javax.crypto.spec.IvParameterSpec'); IVS.$init.overload('[B').implementation = function (iv) { send('[DATA] IvParameterSpec ivHex=' + hr(iv)); return this.$init(iv); }; } catch (e) {}
+      try { var DKS = Java.use('javax.crypto.spec.DESKeySpec'); DKS.$init.overload('[B').implementation = function (k) { send('[DATA] DESKeySpec keyHex=' + hr(k)); return this.$init(k); }; } catch (e) {}
+      // MessageDigest.getInstance 拿算法名
+      var md2 = Java.use('java.security.MessageDigest');
+      try { md2.getInstance.overload('java.lang.String').implementation = function (a) { send('[HIT] MessageDigest.getInstance ' + a); return this.getInstance(a); }; } catch (e) {}
+      // Mac（HMAC）
+      try { var Mac = Java.use('javax.crypto.Mac'); Mac.getInstance.overload('java.lang.String').implementation = function (a) { send('[HIT] Mac algo=' + a); return this.getInstance(a); }; Mac.doFinal.overload('[B').implementation = function (d) { var r = this.doFinal(d); send('[DATA] Mac.doFinal in=' + hr(d) + ' out=' + hr(r)); return r; }; } catch (e) {}
+      // Signature（数字签名/验签）
+      try { var Sig = Java.use('java.security.Signature'); try { Sig.update.overload('[B', 'int', 'int').implementation = function (d, o, l) { send('[DATA] Signature.update ' + ia(d)); return this.update(d, o, l); }; } catch (e) {} try { Sig.sign.overload().implementation = function () { var r = this.sign(); send('[DATA] Signature.sign=' + hr(r)); return r; }; } catch (e) {} } catch (e) {}
+      // RSA 公钥 (N,E)
+      try { Java.use('java.security.spec.RSAPublicKeySpec').$init.overload('java.math.BigInteger', 'java.math.BigInteger').implementation = function (n, e) { send('[DATA] RSA N=' + n.toString(16) + ' E=' + e.toString(16)); return this.$init(n, e); }; } catch (e) {}
+      send('[HIT] JCE crypto self-leak installed');
     } catch (e) {}
     // 4) MessageDigest / Base64
     try {

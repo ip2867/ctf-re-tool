@@ -310,7 +310,7 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 ### v1.3.6 (2026-10-14) — 实战阻塞修复（安装 / IDA 采集 / 验证器）
 本次用运行中的 IDA MCP + 真实 CrackMe 题逐项复现定位，修掉三个会直接导致解题失败的问题：
-- **多候选密文交叉校验 + 自动裁决（防"变种题"陷阱）**：native so 里常有多组加密常量（如 C++ 静态 `std::array<std::string,8>`）。若只取第一条当密文，遇到"密文被换过、key/nonce 不变"的变种题，会算出**自洽但版本不对**的 flag（`encrypt(flag)==该密文` 成立，但那条密文并非 App 真正比对的那条）。现从 native intel 抽**全部** hex 常量（globals/segments/strings/反编译代码，16~128B 去重）与 AI 密文并列枚举；并用 **IDA `xrefs_to` 自动裁决**"哪条被校验函数引用"——引用函数已反编译 + 含比较语义（memcmp/strcmp/==/Arrays.equals）的候选优先；若权威候选与 AI 答案不同则**自动以权威为准**（AI 原答案标 superseded），无法判定时回落为告警交人工复核
+- **多候选密文交叉校验 + 自动裁决（防"变种题"陷阱）**：native so 里常有多组加密常量（如 C++ 静态 `std::array<std::string,8>`）。若只取第一条当密文，遇到"密文被换过、key/nonce 不变"的变种题，会算出**自洽但版本不对**的 flag（`encrypt(flag)==该密文` 成立，但那条密文并非 App 真正比对的那条）。现从 native intel 抽**全部** hex 常量（globals/segments/strings/反编译代码，16~128B 去重）与 AI 密文并列枚举；并用 **IDA `xrefs_to` 自动裁决**"哪条被校验函数引用"——引用函数**按需反编译**（不限于预采集的 28 个）+ 含比较语义（memcmp/strcmp/==/Arrays.equals）优先，可用时再叠加 **`trace_data_flow`**（常量地址是否流向比较点）强判据；若权威候选与 AI 答案不同则**自动以权威为准**（AI 原答案标 superseded），无法判定时回落为告警交人工复核。裁决消息附依据（why）与 score 便于核对
 - **修复 `xrefs_to` 参数漂移**：旧代码返回 `{address:..}` 被真实 ida-pro-mcp 判"缺 addrs" → 改为 `{addrs:[..]}`（同类工具名/参数漂移，与 IDA 采集那次同源）
 - **统一 `[VERIFY]` 契约为单一权威常量**：此前 5 处提示词各写一份 algo 清单且内容漂移（3 处漏 `chacha20`/`node_js`）——正是 chacha20 漏实现的同类隐患。现集中为 `VERIFY_ALGOS`/`VERIFY_CONTRACT`，5 处统一插值；新增 `salsa20`
 

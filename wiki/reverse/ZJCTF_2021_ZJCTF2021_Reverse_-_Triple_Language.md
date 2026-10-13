@@ -48,7 +48,7 @@ reasoning_chain:
 - 观察:uc_open 第一个参数 3=MIPS 4=ARM,说明有两段模拟代码 → 下一步:提取 MIPS_CODE @0x10000 + ARM_CODE @0x200000
 - 动作:写 Python Unicorn 代码 + Capstone 反汇编 → 观察:MIPS 段把输入前 6 字符 × 'zjgcjy' 字节得 {0x2F2E,0x282A,0x2C42,0x2A8A,0x13E0,0x36D4}
 - 动作:C 脚本 flag[i] = res[i] / key[i] → 观察:前 6 字符 = 'cann0t'
-- 触���点:后 16 字符是 x-y=key1, x+y=key2 → 假设:解方程 → 动作:爆破 32-126
+- 触发点:后 16 字符是 x-y=key1, x+y=key2 → 假设:解方程 → 动作:爆破 32-126
 - 观察:解出 8 对 (a,b) → flag = 'cann0t_be_t0o_carefu1'
 - 触发点:ARM 段 hook 回调改 r3 → 假设:hook 是为改字符比对 res[] → 动作:提取 res[] 22 字节
 - 动作:字符重组 3+2+1 位 split + chunk 16 字节 base64-style 解 → 观察:得 'when_faclng_ianguage' 后 16 字符

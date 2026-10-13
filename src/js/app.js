@@ -5273,7 +5273,7 @@ ${otherClassesText}
 **输出契约（必须遵守）：**
 1. 得到 flag 时：单独一行 \`[FLAG]flag内容[/FLAG]\`
 2. 若能给出算法+密钥+密文，必须附验证数据（工具会本地复现）：
-   \`[VERIFY]{"algo":"rc4|tea|xtea|xxtea|xor|aes_ecb|aes_cbc|des_ecb|des_cbc|des3_ecb|sm4_ecb|base64|base64_custom|custom","key":"密钥","key_encoding":"ascii|hex","ciphertext":"密文","encoding":"hex|base64|ascii","expected":"flag或前缀"}[/VERIFY]\`
+   \`${VERIFY_CONTRACT}\`
    （custom 需附 "code":"def decrypt(data,key): ...完整函数"；多个候选时输出 \`[HYPOTHESES][{...},{...}][/HYPOTHESES]\` 供本地枚举）
 
 如果无法可靠得到完整 flag，不要只回复“无法分析”，必须输出以下结构：
@@ -5426,7 +5426,7 @@ ${mcpCache.nativeIntel.globals && mcpCache.nativeIntel.globals.length ? `\n## SO
 **输出契约（必须遵守）：**
 1. 得到 flag：单独一行 \`[FLAG]flag内容[/FLAG]\`
 2. 必须附验证数据（工具会本地复现）：
-   \`[VERIFY]{"algo":"rc4|tea|xtea|xxtea|xor|aes_ecb|aes_cbc|des_ecb|des_cbc|des3_ecb|sm4_ecb|chacha20|base64|base64_custom|node_js|custom","key":"密钥","key_encoding":"ascii|hex","ciphertext":"密文","encoding":"hex|base64|ascii","expected":"flag或前缀","iv":"(aes_cbc/des_cbc 需要)","iv_encoding":"ascii|hex|base64","code":"(custom/node_js 需要)完整函数"}[/VERIFY]\`
+   \`${VERIFY_CONTRACT}\`
 3. 多个候选组合：\`[HYPOTHESES][{...},{...}][/HYPOTHESES]\`
 4. 回答最后输出 \`[EXPERIENCE]...[/EXPERIENCE]\`（每条一行，最多5条）
 不要臆造工具结果；工具失败时换一条路径继续，不要重复同一失败写法。`;
@@ -5788,7 +5788,7 @@ ${globalsText}
 **输出契约（必须遵守）：**
 1. 得到 flag 时：单独一行 \`[FLAG]flag内容[/FLAG]\`
 2. 若能给出算法+密钥+密文，必须附验证数据（工具会本地复现）：
-   \`[VERIFY]{"algo":"rc4|tea|xtea|xxtea|xor|aes_ecb|aes_cbc|des_ecb|des_cbc|des3_ecb|sm4_ecb|base64|base64_custom|custom","key":"密钥","key_encoding":"ascii|hex","ciphertext":"密文","encoding":"hex|base64|ascii","expected":"flag或前缀"}[/VERIFY]\`
+   \`${VERIFY_CONTRACT}\`
    （custom 需附 "code":"def decrypt(data,key): ...完整函数"；多个候选时输出 \`[HYPOTHESES][{...},{...}][/HYPOTHESES]\` 供本地枚举）
 
 如果无法可靠得到完整 flag，不要只回复“无法分析”，必须输出以下结构：
@@ -5920,7 +5920,7 @@ ${analysisData.strings ? `\n## 关键字符串\n${typeof analysisData.strings ==
 
 **输出契约：**
 1. flag：单独一行 \`[FLAG]flag内容[/FLAG]\`
-2. 附 \`[VERIFY]{"algo":"rc4|tea|xtea|xxtea|xor|aes_ecb|aes_cbc|des_ecb|des_cbc|des3_ecb|sm4_ecb|chacha20|base64|base64_custom|node_js|custom","key":"...","key_encoding":"ascii|hex","ciphertext":"...","encoding":"hex|base64|ascii","expected":"...","iv":"(aes_cbc/des_cbc 需要)","iv_encoding":"ascii|hex|base64","code":"(custom 需要)完整函数"}[/VERIFY]\`
+2. 附 \`${VERIFY_CONTRACT}\`
 3. 多个候选：\`[HYPOTHESES][{...},{...}][/HYPOTHESES]\`
 4. 末尾 \`[EXPERIENCE]每条一行,最多5条[/EXPERIENCE]\`
 不要臆造工具结果；工具失败时换一条路径继续。`;
@@ -6104,7 +6104,7 @@ function buildSystemPrompt() {
 4. 回答用代码块展示关键信息
 5. 如果用户说"求出flag"，直接分析当前文件并给出答案
 6. 得到 flag 时用 [FLAG]flag内容[/FLAG] 标记
-7. 给出验证数据：[VERIFY]{"algo":"rc4|tea|xtea|xxtea|xor|aes_ecb|aes_cbc|des_ecb|des_cbc|des3_ecb|sm4_ecb|chacha20|base64|base64_custom|node_js|custom","key":"密钥","key_encoding":"ascii|hex","ciphertext":"密文","encoding":"hex|base64|ascii","expected":"期望的flag或前缀","iv":"(aes_cbc/des_cbc 需要)","iv_encoding":"ascii|hex|base64"}[/VERIFY]，工具会本地复现验证；custom 需附 "code":"def decrypt(data,key): 完整函数"；JS逆向还原的加密函数用 node_js：附 "code":"function decrypt(input){...}"（返回字符串或Uint8Array）和 "input":"抓到的参数原文"
+7. 给出验证数据：${VERIFY_CONTRACT}，工具会本地复现验证；custom 需附 "code":"def decrypt(data,key): 完整函数"；JS逆向还原的加密函数用 node_js：附 "code":"function decrypt(input){...}"（返回字符串或Uint8Array）和 "input":"抓到的参数原文"
 8. 有多个候选（算法/字节序/密钥变体）时：[HYPOTHESES][{...},{...}][/HYPOTHESES]，工具会本地枚举
 9. 解题学习闭环（每次解题强制遵守）：
    - 解题前：先读上方「历史经验速查」，同类场景直接复用已验证套路与避坑点；需要完整方法论时用 read_skill 加载对应技能（ctf-reverse-binary / ctf-reverse-android / ctf-jsreverse 等）；遇到具体手法/踩坑（Frida 进程内解密、native 常量反演 key、IV 编码坑、多阶段 APK 停在首页等）先用 wiki_search 检索知识库，命中即 wiki_read 取完整代码片段。禁止无视知识库从零摸索
@@ -6354,6 +6354,14 @@ function utf8ToBase64(str) {
   for (const b of bytes) bin += String.fromCharCode(b);
   return btoa(bin);
 }
+
+// [VERIFY] 契约里 algo 的**唯一权威清单**。
+// 教训：此前 5 处提示词各写一份、内容漂移，其中有的漏了 chacha20 → 求解器也没实现，
+// 导致"契约承诺支持但本地复现报 unknown algo"。此处集中一份，且必须与 buildSolvePython
+// 里的分支保持同步（新增算法：改这里 + 加求解器分支，两处一起改）。
+const VERIFY_ALGOS = 'rc4|tea|xtea|xxtea|xor|aes_ecb|aes_cbc|des_ecb|des_cbc|des3_ecb|sm4_ecb|chacha20|salsa20|base64|base64_custom|node_js|custom';
+// 完整契约示例（含 iv/code 等可选字段说明），供各提示词统一插值。
+const VERIFY_CONTRACT = `[VERIFY]{"algo":"${VERIFY_ALGOS}","key":"密钥","key_encoding":"ascii|hex","ciphertext":"密文","encoding":"hex|base64|ascii","expected":"flag或前缀","iv":"(aes_cbc/des_cbc/chacha20 需要；chacha20 的 iv 可为 12B nonce 或 16B=nonce12+counter4)","iv_encoding":"ascii|hex|base64","counter":"(chacha20 可选，counter 初值；不给则自动枚举)","code":"(custom/node_js 需要)完整函数"}[/VERIFY]`;
 
 function buildSolvePython(attempts) {
   // 契约走 base64 内嵌：AI 的 custom code 可能含 ''' / 反斜杠等，任何引号方案都会碎

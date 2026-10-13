@@ -6019,8 +6019,9 @@ function buildSystemPrompt() {
   const skillsIndex = state.skills.length
     ? `\n## 可用技能（用 read_skill 工具读取全文）\n${state.skills.map(s => `- ${s.name}：${s.description}`).join('\n')}\n`
     : '';
+  // 知识库注入：优先提示"先读全局索引 AI-SEARCH-INDEX"，再列页面清单。
   const wikiIndex = (state.wikiPages && state.wikiPages.length)
-    ? `\n## 知识库 Wiki（可检索：用 wiki_search 找页 / wiki_read 读全文）\n${state.wikiPages.map(p => `- ${p.rel}`).join('\n')}\n遇到具体手法/踩坑（如 Frida 进程内解密、native 常量反演、IV 编码坑、多阶段 APK）先用 wiki_search 检索，命中即 wiki_read 取完整代码片段。\n`
+    ? `\n## 知识库 Wiki（解题前先检索）\n**首选**：\`wiki_read(path=AI-SEARCH-INDEX.md)\` 读全局检索索引（按技术标签定位资源）；速查用 \`wiki_read(path=PAYLOAD-CHEATSHEET.md)\`。\n可用页面（用 wiki_search 按关键词检索 / wiki_read 读整页）：\n${state.wikiPages.map(p => `- ${p.rel}`).join('\n')}\n遇到具体手法/踩坑（Frida 进程内解密、native 常量反演、IV 编码坑、多阶段 APK、逆向题 attack_chain）先 wiki_search 检索，命中即 wiki_read 取完整片段。\n`
     : '';
   let prompt = `你是 CTF 逆向解题专家，就像在 Claude Code 中一样工作。
 
@@ -6060,7 +6061,11 @@ function buildSystemPrompt() {
 9. 解题学习闭环（每次解题强制遵守）：
    - 解题前：先读上方「历史经验速查」，同类场景直接复用已验证套路与避坑点；需要完整方法论时用 read_skill 加载对应技能（ctf-reverse-binary / ctf-reverse-android / ctf-jsreverse 等）；遇到具体手法/踩坑（Frida 进程内解密、native 常量反演 key、IV 编码坑、多阶段 APK 停在首页等）先用 wiki_search 检索知识库，命中即 wiki_read 取完整代码片段。禁止无视知识库从零摸索
    - 解题中：严格按知识库流程执行，知识库已记录的坑（如 VM 题必须连常量表一起采集、mingw 入口是 _main、IV 编码不能借用 key 的编码）不得重踩
-   - 解题后（无论成功失败）：回答最后输出 [EXPERIENCE]每条一行，格式"题型特征→关键套路/踩过的坑→下次怎么做"[/EXPERIENCE]，工具自动写入经验库；没有新收获则写"无新增经验"
+   - 解题后（无论成功失败）：回答最后输出 [EXPERIENCE]经验块[/EXPERIENCE]，工具自动写入经验库。**格式（支持多步攻击链）**：
+     · 每条经验一行起头，**用 → 串联成"多步攻击链/思维链"**（特征→关键步骤→坑→下次怎么做），例如：
+       "APK多阶段题→反查常量串定位校验类→native 反演 key→AES 解 flag→坑:IV 单独按 base64 解"
+     · 也可写"失败教训"（哪条路走不通、为什么、下次直接换哪条）——失败教训往往比成功更有价值
+     · 最多 5 条，每条 ≤300 字；确无新收获写"无新增经验"
 ${skillsIndex}${wikiIndex}${state.experience ? `\n## 历史经验速查（此前解题沉淀，同类场景优先复用）\n${selectRelevantExperience(state.experience, state.findings)}\n` : ''}${(state.findings && ((state.findings.flags || []).length || (state.findings.algorithms || []).length)) ? `\n## 本题已收集的结论（勿重复劳动/勿推翻已验证项）\n${(state.findings.flags || []).map(f => `- Flag: ${f.flag}${f.verified ? '（✅已验证）' : '（⚠️未验证）'}`).join('\n')}\n${(state.findings.algorithms || []).length ? `- 已识别算法: ${state.findings.algorithms.map(a => (a && a.text) || a).join('; ')}` : ''}\n` : ''}
 
 ## 工具使用约定（Windows 环境，务必遵守）
@@ -6634,23 +6639,39 @@ async function runHypotheses(aiText, opts = {}) {
 }
 
 // 解题学习闭环：从 AI 回答中收割 [EXPERIENCE]...[/EXPERIENCE] 经验块，写入经验库供下次解题自动速查
+// 【D 升级】支持"多步攻击链"：一条经验若含 `→` 分隔的步骤（或子行以 ·/数字开头）→ 存为
+//   一条"链式"经验（特征▶步骤1▶步骤2▶…▶坑），而非拆成互不相关的单行；单行经验保持兼容。
 async function harvestExperience(aiText) {
   try {
     const text = String(aiText || '');
     const m = text.match(/\[(?:EXPERIENCE|经验)\]([\s\S]*?)\[\/(?:EXPERIENCE|经验)\]/i);
     if (!m || !state.appPaths) return;
-    const lines = m[1].split('\n')
-      .map(l => l.trim().replace(/^[-*•]+\s*/, '').replace(/^\d+[.、)]?\s*/, '').replace(/^[-*•]+\s*/, ''))
-      .filter(l => l && !/^(无|无新增经验|无新增|none)$/i.test(l) && l.length > 4);
-    if (!lines.length) return;
+    // 先按"顶层条目"分组：以 -/*/数字 开头的行是条目起点；其后续不带标记的行视为该条目的续行（步骤）
+    const groups = [];
+    for (const raw of m[1].split('\n')) {
+      const l = raw.replace(/\s+$/, '');
+      const isStart = /^\s*([-*•]+|\d+[.、)])\s+/.test(l) || (l.trim() && !/^\s/.test(l) && groups.length === 0);
+      if (isStart) groups.push([l.trim()]);
+      else if (l.trim() && groups.length) groups[groups.length - 1].push(l.trim());
+    }
+    const norm = (s) => s.replace(/^[-*•]+\s*/, '').replace(/^\d+[.、)]?\s*/, '').replace(/^[-*•]+\s*/, '').trim();
+    const entries = [];
+    for (const g of groups) {
+      // 把该条的续行合并（用 ▶ 连接），并把正文里已有的 '→' 统一成 '▶'，形成"攻击链"
+      let body = g.map(norm).filter(Boolean).join(' ▶ ');
+      body = body.replace(/\s*→\s*/g, ' ▶ ').replace(/\s*▶\s*(▶\s*)+/g, ' ▶ ').trim();
+      if (!body || /^(无|无新增经验|无新增|none)$/i.test(body) || body.length <= 4) continue;
+      entries.push(body.slice(0, 400));
+    }
+    if (!entries.length) return;
     // 解题成功不再自动入库：先暂存，用户发送「保存」才写入 experience.md
     if (!Array.isArray(state.pendingExperience)) state.pendingExperience = [];
     let n = 0;
-    for (const l of lines.slice(0, 5)) {
-      const line = `- [${new Date().toISOString().slice(0, 10)}] ${l.slice(0, 200)}`;
+    for (const body of entries.slice(0, 5)) {
+      const line = `- [${new Date().toISOString().slice(0, 10)}] ${body}`;
       if (state.pendingExperience.includes(line) || (state.experience || '').includes(line)) continue;
       state.pendingExperience.push(line);
-      addSolveNote('经验(待保存)', l.slice(0, 200));
+      addSolveNote('经验(待保存)', body.slice(0, 200));
       n++;
     }
     if (n) {

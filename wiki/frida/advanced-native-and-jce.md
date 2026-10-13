@@ -1,3 +1,13 @@
+---
+title: Frida 进阶：native 定位 / RegisterNatives / JCE 自吐 / 反检测 / 脱壳
+category: dynamic
+vuln_type: [reverse, android, native]
+tags: [frida, RegisterNatives, native四定位, JCE自吐, 反调试, SSL pinning, 脱壳]
+difficulty: hard
+one_liner: native 无 Java_ 导出时靠 RegisterNatives 拦截；JCE 层通杀自吐密钥明文；反检测/SSL/脱壳一页全
+keywords: [RegisterNatives, JNINativeMethod, 动态注册, Cipher, SecretKeySpec, 反frida, SSL pinning, dex dump, OLLVM]
+---
+
 # Frida 进阶：native 定位 / RegisterNatives / JCE 自吐 / 反检测 / 脱壳
 
 > 适用：native 校验题、加固/反调试题、需要"抓密钥/明文但不知从何下手"时。

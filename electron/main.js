@@ -4240,7 +4240,10 @@ function listWikiDirs() {
   return out;
 }
 
-// 关键词检索：按标题/文件名/正文计分，返回最相关的若干页（含摘要片段）
+// 关键词检索：按标题/文件名/正文计分，返回最相关的若干页（含摘要片段）。
+// 升级（借鉴 Des-CTF-KB）：解析 YAML front matter，让命中 tags/vuln_type/attack_chain/
+// reasoning_chain/key_observations 的条目**加权**（结构化 meta 命中远重于正文散命中）；
+// 并优先把带 meta 的"条目页"排前，方便 AI 直接拿到 attack_chain/思维链。
 function wikiSearch(query, max = 5) {
   const pages = listWikiDirs();
   const terms = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
@@ -4248,27 +4251,41 @@ function wikiSearch(query, max = 5) {
   for (const p of pages) {
     let content = '';
     try { content = fs.readFileSync(p.path, 'utf8'); } catch (e) { continue; }
-    const hay = (p.rel + '\n' + content).toLowerCase();
+    const low = content.toLowerCase();
+    const rel = p.rel.toLowerCase();
     const firstLine = (content.split('\n').find(l => /^#\s/.test(l)) || '').replace(/^#\s*/, '');
+    // 解析 YAML front matter 的加权字段
+    let tags = '', attack = '', reasoning = '', keys = '', one = '';
+    const fmM = content.match(/^---\n([\s\S]*?)\n---/);
+    if (fmM) {
+      const fm = fmM[1].toLowerCase();
+      const pick = (k) => { const m = fm.match(new RegExp('^' + k + ':[\\s\\S]*?(?=\\n[a-z_]+:|$)', 'm')); return m ? m[0] : ''; };
+      tags = pick('tags'); attack = pick('attack_chain'); reasoning = pick('reasoning_chain');
+      keys = pick('key_observations') + pick('key_payload'); one = pick('one_liner');
+    }
     let score = 0;
     for (const t of terms) {
       if (!t) continue;
-      const inName = p.rel.toLowerCase().includes(t) ? 3 : 0;
-      const inTitle = firstLine.toLowerCase().includes(t) ? 4 : 0;
-      const occ = hay.split(t).length - 1;
-      score += inName + inTitle + Math.min(occ, 8);
+      score += (rel.includes(t) ? 3 : 0);
+      score += (firstLine.toLowerCase().includes(t) ? 4 : 0);
+      score += Math.min(low.split(t).length - 1, 8);           // 正文命中
+      score += (tags.includes(t) ? 6 : 0);                     // 结构化加权
+      score += (one.includes(t) ? 5 : 0);
+      score += (attack.includes(t) ? 4 : 0);
+      score += (reasoning.includes(t) ? 4 : 0);
+      score += (keys.includes(t) ? 5 : 0);
     }
     if (!terms.length) score = 1;
-    if (score > 0) scored.push({ score, page: p, content, title: firstLine });
+    if (score > 0) scored.push({ score, page: p, content, title: firstLine, hasMeta: !!fmM });
   }
-  scored.sort((a, b) => b.score - a.score);
+  scored.sort((a, b) => (b.score - a.score) || (b.hasMeta - a.hasMeta));
   const top = scored.slice(0, Math.max(1, Math.min(Number(max) || 5, 20)));
   if (!top.length) return `未找到与「${query}」相关的知识页。可用页面：\n` + pages.map(p => `- ${p.rel}`).join('\n');
   return top.map(r => {
     const lines = r.content.split('\n');
     const idx = lines.findIndex(l => l.toLowerCase().includes(terms[0] || '\u0000'));
-    const snippet = lines.slice(Math.max(0, idx), Math.max(0, idx) + 4).join('\n').slice(0, 400);
-    return `### ${r.title || r.page.name}  [${r.page.rel}]\n${snippet}`;
+    const snippet = lines.slice(Math.max(0, idx), Math.max(0, idx) + 6).join('\n').slice(0, 600);
+    return `### ${r.title || r.page.name}  [${r.page.rel}]${r.hasMeta ? '  ★含结构化meta' : ''}\n${snippet}`;
   }).join('\n\n') + `\n\n（用 wiki_read(path=<rel>) 读取整页）`;
 }
 

@@ -1,3 +1,13 @@
+---
+title: Hook 进程内解密直接出 flag
+category: dynamic
+vuln_type: [reverse, android]
+tags: [frida, hook, 进程内解密, Cipher.doFinal, 密钥捕获]
+difficulty: medium
+one_liner: Hook 抓到 key/iv/密文后，在 App 进程内直接 decrypt 并 send('[FLAG]...')，不靠人肉复现
+keywords: [进程内解密, 出flag, Cipher, key捕获, 被动Hook不够]
+---
+
 # Hook 进程内解密直接出 flag
 
 > 适用：CTF 逆向题里，"抓得到密文但出不了 flag"——Hook 只被动打印日志，没人拿密钥去解密。

@@ -2,7 +2,21 @@
 
 > 本目录是工具的**可检索知识库**：AI 通过 `wiki_search`（按关键词找页）和 `wiki_read`（读整页）调用。
 > 与 `skills/` 的分工：`skills/` 是"方法论/工作流"，`wiki/` 是"具体手法 + 验证过的代码片段 + 踩坑"。
-> 新增页时，把条目补进本文件，AI 的索引会自动更新。
+> **入口**：先看 [AI-SEARCH-INDEX.md](AI-SEARCH-INDEX.md)（全局检索索引）；速查见 [PAYLOAD-CHEATSHEET.md](PAYLOAD-CHEATSHEET.md)。
+> 新增页时，把条目补进本文件与 AI-SEARCH-INDEX，AI 的索引会自动更新。
+
+## 顶层
+
+| 页面 | 一句话 |
+|---|---|
+| [AI-SEARCH-INDEX.md](AI-SEARCH-INDEX.md) | **全局检索索引**（AI 优先读，按技术标签定位资源） |
+| [PAYLOAD-CHEATSHEET.md](PAYLOAD-CHEATSHEET.md) | **逆向套路/Payload/脚本速查**（做题直接翻） |
+
+## reverse/（逆向题结构化条目库）
+
+| 页面 | 一句话 | 何时读 |
+|---|---|---|
+| [_INDEX.md](reverse/_INDEX.md) | 历年逆向题条目总索引（含 attack_chain/reasoning_chain/failed_attempts 思维链） | 找相似题、看别人怎么解这类题 |
 
 ## frida/（动态 Hook）
 

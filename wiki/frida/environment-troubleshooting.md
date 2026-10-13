@@ -1,3 +1,13 @@
+---
+title: 动态/工具链环境排障（Frida / IDA / JEB / adb）
+category: env
+vuln_type: [reverse]
+tags: [frida版本, adb互杀, APK安装失败, IDA窗口, JEB连接, 环境排障]
+difficulty: easy
+one_liner: 动态阶段"整段落空"、看不到 IDA/JEB 窗口、装 APK 失败、JEB 连不上 的一分钟自检+实测修复
+keywords: [frida-ps, queryIntentActivities, major versions match, service check package, Broken pipe, RegisterNatives, start]
+---
+
 # 动态/工具链环境排障（Frida / IDA / JEB / adb）
 
 > 适用：动态阶段"整段落空"、工具说"已启动"但看不到界面、装 APK 反复失败、JEB 连不上等

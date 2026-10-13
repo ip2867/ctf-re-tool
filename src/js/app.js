@@ -4262,6 +4262,51 @@ function hr(b){ try { var h=''; for (var i=0;i<b.length;i++){ var c=b[i]&0xff; h
 function ia(a){ try { var s=[]; for(var i=0;i<a.length;i++) s.push(a[i]); return '['+s.join(',')+']'; } catch(e){ return '<err>'; } }
 if (Java.available) {
   Java.perform(function () {
+    // 0) 【通用关键】主动 hook Java 层声明的 native 方法（含 RegisterNatives 动态注册的）。
+    //    很多题（如 com.cr.myapplication.NativeBridge 的 c/ab/cd/dc）核心校验是 native 方法，
+    //    但用 RegisterNatives 动态注册 → so 里没有 Java_ 导出 → "JNI 导出扫描"抓不到。
+    //    这里枚举目标 App 自身包下的类，找出所有 native 方法并 hook 入参/返回，兜住这类题。
+    //    注意：spawn 早期某些类尚未加载，故封装成可重入函数，多次调用直到 hook 到目标。
+    var __hooked = {};
+    function __scanNatives() {
+      try {
+        var __pkg = ${j(packageName)};
+        var __seenNative = 0;
+        Java.enumerateLoadedClassesSync().forEach(function (cn) {
+          if (__pkg && cn.indexOf(__pkg) !== 0) return;      // 只扫 App 自身类，避开系统海量类
+          if (cn.indexOf('$') >= 0) return;                   // 跳过内部类，降噪
+          var cls; try { cls = Java.use(cn); } catch (e) { return; }
+          var methods; try { methods = cls.class.getDeclaredMethods(); } catch (e) { return; }
+          methods.forEach(function (m) {
+            try {
+              var mods = m.getModifiers();
+              if ((mods & 0x0100) === 0) return;              // 0x0100 = native
+              var mn = m.getName();
+              var key = cn + '.' + mn;
+              if (__hooked[key]) return;                       // 已 hook 过，避免重复
+              send('[HIT] native method: ' + key + '  (' + m.toString() + ')');
+              cls[mn].overloads.forEach(function (ov) {
+                ov.implementation = function () {
+                  var a = Array.prototype.slice.call(arguments);
+                  var r;
+                  try { r = ov.apply(this, arguments); } catch (e) { send('[DATA] ' + mn + ' threw ' + e); throw e; }
+                  send('[DATA] native ' + key + '(' + a.map(function (x) { return x === null ? 'null' : (x.length !== undefined ? ia(x) : (x.toString ? x.toString() : String(x))); }).join(',') + ') = ' + (r === null || r === undefined ? String(r) : (r.length !== undefined ? ia(r) : String(r))));
+                  return r;
+                };
+              });
+              __hooked[key] = 1;
+              __seenNative++;
+            } catch (e) {}
+          });
+        });
+        if (__seenNative) send('[HIT] native-method scan: +' + __seenNative + ' (total ' + Object.keys(__hooked).length + ')');
+      } catch (e) { send('[!] native scan: ' + e); }
+    }
+    __scanNatives();
+    // 多次重扫：捕获启动后逐步加载的类（native 类常在 Activity onCreate 后才 load）
+    setTimeout(function () { Java.perform(__scanNatives); }, 2000);
+    setTimeout(function () { Java.perform(__scanNatives); }, 6000);
+    setTimeout(function () { Java.perform(__scanNatives); }, 12000);
     // 1) 自定义 JNI 方法（类名/方法名因题而异，见下方"通用扫描"）
     //    这里不写死具体类；靠 (2) 的 JNI 导出扫描 + (3) Cipher 钩子覆盖绝大多数情况。
     //    若已知目标类（AI 分析得出），把类名/方法名作为参数注入即可。
@@ -4484,20 +4529,21 @@ ${mcpCache.nativeIntel.decompiled && mcpCache.nativeIntel.decompiled.length ? '�
   // 报 "invalid regular expression flags" 而整脚本不加载（表现为零输出、白等 25s）。
   // 这里做静态语法预检，并尝试自动修复"正则中裸露的 /"这类高频错误。
   let vres = await validateAndRepairFridaScript(script);
-  // 截断类错误（Unexpected end of input，max_tokens 不够）：先用更精简的要求 +
-  // 更大 max_tokens 重新生成一次，仍然失败才落到内置模板。
-  if (!vres.ok && /end of input|unexpected/i.test(String(vres.error || ''))) {
-    addLog('info', 'AI 脚本被截断，用更紧凑的要求重新生成一次...');
+  // 校验失败：让 AI 带着"具体错误"重新生成一次（覆盖截断 Unexpected end of input、
+  // 以及 missing )/unexpected token 等语法笔误——AI 生成的长脚本常少个 '+' 或括号）。
+  // 仍失败才落到内置模板。
+  if (!vres.ok) {
+    addLog('info', `AI 脚本语法校验未通过（${String(vres.error || '').slice(0, 80)}），带错误信息重新生成一次...`);
     try {
       const retry = await window.electronAPI.claudeChat(
-        [{ role: 'user', content: genPrompt + '\n\n注意：上一次输出因长度被截断。请重新输出一个**更精简但完整可运行**的脚本（总长度压到一屏内，去掉非必要的 hook 点，绝不省略花括号）。' }],
+        [{ role: 'user', content: genPrompt + `\n\n注意：你上一次输出的脚本**无法通过语法校验**，错误是：\n  ${String(vres.error || '').slice(0, 200)}\n请重新输出一个**语法绝对正确、完整可运行**的脚本：仔细检查每一处字符串拼接（该有 '+' 的地方别漏）、括号/花括号配对完整、正则里的 '/' 已转义。总长度控制在一屏内。` }],
         '你是 Frida 动态插桩专家。只输出一个 [FRIDA_SCRIPT] 块。不要调用任何工具。',
         { model: String((state.config && state.config.claude && state.config.claude.fastModel) || '').trim() || undefined, maxTokens: 16384 });
       const sm2 = retry && retry.success ? String(retry.text || '').match(/\[FRIDA_SCRIPT\]([\s\S]+?)\[\/FRIDA_SCRIPT\]/) : null;
       if (sm2) {
         const cand = sm2[1].replace(/^```(?:javascript|js)?\s*/i, '').replace(/```\s*$/, '').trim();
         const v2 = await validateAndRepairFridaScript(cand);
-        if (v2.ok) { vres = v2; addLog('info', '截断脚本已重新生成并通过校验'); }
+        if (v2.ok) { vres = v2; addLog('info', '脚本已按错误信息重新生成并通过校验'); }
       }
     } catch (e) { /* 重试失败 → 走内置模板兜底 */ }
   }

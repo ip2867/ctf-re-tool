@@ -3705,7 +3705,7 @@ async function execFridaHook(script, target, opts) {
       // （实测 frida 17.x 于 Nox Android9：java.lang.NullPointerException
       //  queryIntentActivities）。此时 **自动回退 attach**：先用 adb 拉起 App，
       //  再 -n attach 到其进程，同样能挂上启动期钩子（多数场景等价可用）。
-      if (out && /Failed to spawn|queryIntentActivities|NullPointerException|unable to spawn/i.test(out) && !/\[DATA\]|\[HIT\]/.test(out)) {
+      if (out && /Failed to spawn|queryIntentActivities|NullPointerException|unable to spawn|permission denied|Unable to find process|unable to attach|process not found|not found/i.test(out) && !/\[DATA\]|\[HIT\]/.test(out)) {
         console.warn('[Frida] spawn 失败，回退 attach 模式: ' + String(out).slice(0, 200));
         const adbPort = config.emulator.adb_port;
         try {

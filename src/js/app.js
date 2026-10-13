@@ -5419,6 +5419,11 @@ ${mcpCache.nativeIntel.globals && mcpCache.nativeIntel.globals.length ? `\n## SO
 - 用 \`run_python\` 实现还原，**正反双向**验证（反推 key 后，正向加密要能对回目标密文常量）。
 - 需要爆破/约束/符号执行时用 Z3 / angr / Unicorn（见 ctf-reverse-tooling 技能）。
 - **脚本必须真跑**，把输出贴出来；不要只给"我认为应该是"。
+- ⚠️ **多候选密文（变种题陷阱）**：native so 里常有多组常量（如 C++ 静态初始化一个
+  \`std::array<std::string,N>\`，或 .rodata 里多条 hex）。**不要取第一条就下结论**——要先确认
+  **校验函数实际引用的是哪条**（看引用它的函数、或哪条与 key/nonce 同处一个初始化块）。
+  若多组都能解密出 flag 形态，说明题目有版本差异：以"被校验函数真正 set/compare 的那条"为准，
+  并把全部候选都列出交人工定案。工具会自动做交叉校验，但你要在证据里指明依据。
 
 **阶段④ 出结论**
 - 有把握才给 flag；证据不足就明确写"待人工验证 + 还缺什么"，**不要猜**。
@@ -6695,6 +6700,95 @@ async function runContractScript(attempts) {
   return { hits, output, path: scriptPath };
 }
 
+// ============ 多候选密文交叉校验 ============
+// 背景（实战教训）：native so 里常存在**多组**加密常量（如本题 sub_24C40 初始化的是
+// std::array<std::string,8> —— 8 条 hex 串）。若只取"第一条"就当密文，遇到"变种题"
+// （密文被换过、key/nonce 不变）会算出**自洽但版本不对**的 flag：
+//   encrypt(候选flag) == 该密文  ✔ 但那条密文根本不是 App 真正比对的那条。
+// 因此这里从 native intel 里抽全部 hex 常量作为候选，与 AI 给的密文并列，让本地求解
+// 逐个尝试并报告"哪些候选能出 flag"，由 AI/人工按"是否被校验函数引用"定案。
+function extractNativeCandidates(intel) {
+  intel = intel || {};
+  const blobs = [];
+  // 1) 全局数据表（get_bytes 的 data 字段是 "0x.. 0x.." 形式）
+  for (const g of (intel.globals || [])) {
+    const hex = String(g.data || '').replace(/0x|\s+/g, '');
+    if (hex) blobs.push({ src: `global:${g.name || g.addr}`, hex });
+  }
+  // 2) 数据段 dump
+  for (const s of (intel.segments || [])) {
+    const hex = String(s.data || '').replace(/0x|\s+/g, '');
+    if (hex) blobs.push({ src: `segment:${s.name || s.addr}`, hex });
+  }
+  // 3) 关键字符串里的 hex 长串
+  for (const line of String(intel.strings || '').split('\n')) {
+    const m = line.match(/([0-9a-fA-F]{32,})/);
+    if (m) blobs.push({ src: 'string', hex: m[1] });
+  }
+  // 4) 反编译代码里出现的"长 hex 字符串字面量"（C++ 静态初始化常见）
+  for (const d of (intel.decompiled || [])) {
+    const code = String(d.code || '');
+    for (const m of code.matchAll(/"([0-9a-fA-F]{32,})"/g)) blobs.push({ src: `code:${d.name}`, hex: m[1] });
+  }
+  // 归一化：只保留偶数长度、长度像"密文/常量"的十六进制串（16B~128B 最像密文/密钥），去重
+  const out = [];
+  const seen = new Set();
+  for (const b of blobs) {
+    const hex = b.hex.toLowerCase();
+    if (hex.length % 2 !== 0) continue;
+    const bytes = hex.length / 2;
+    // 只收 16~128 字节：太短不像密文，太长多半是整段 .rodata（当密文试没意义且拖慢）
+    if (bytes < 16 || bytes > 128) continue;
+    const key = hex.slice(0, 24) + ':' + hex.length;   // 去重键（前 12 字节 + 长度）
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ src: b.src, hex });
+    if (out.length >= 24) break;                       // 上限，防爆（24 组够覆盖"多常量"场景）
+  }
+  return out;
+}
+
+// 交叉校验：把"AI 给的密文"与"so 里抽到的候选密文"并列，用同一 key/iv/algo 逐个尝试，
+// 报告每个候选能否解出 flag 形态结果。返回 { aiHit, nativeHits:[{src,hex,flag}], tried }
+async function crossCheckCandidates(contract) {
+  const c = contract || {};
+  const flagRe = /^(?:flag|ctf|nctf|nssctf|sctf|dasctf|hgame|iscc|sictf|moectf|hnctf|bjdctf|gwht|picoctf|cyberpeace)\{/i;
+  const intel = (mcpCache && mcpCache.nativeIntel) || {};
+  const cands = extractNativeCandidates(intel);
+  if (!cands.length) return { tried: 0, nativeHits: [], aiHit: null };
+
+  const base = {
+    algo: c.algo, key: c.key, key_encoding: c.key_encoding,
+    encoding: c.encoding || 'hex', iv: c.iv, iv_encoding: c.iv_encoding, counter: c.counter,
+  };
+  // 构造 attempts：每个候选密文一份（AI 原密文也一起，便于对比）
+  const attempts = [];
+  const aiCt = String(c.ciphertext || '').replace(/0x|\s+/g, '').toLowerCase();
+  attempts.push(Object.assign({}, base, { ciphertext: c.ciphertext, _src: 'AI' }));
+  for (const k of cands) {
+    if (k.hex === aiCt) continue;
+    attempts.push(Object.assign({}, base, { ciphertext: k.hex, _src: k.src, _nativeHex: k.hex }));
+  }
+  if (attempts.length <= 1) return { tried: 0, nativeHits: [], aiHit: null };
+
+  addLog('info', `[交叉校验] 从 so 抽到 ${cands.length} 组候选常量，连同 AI 密文共 ${attempts.length} 组，逐一出解...`);
+  const r = await runContractScript(attempts);
+  // runContractScript 只回 hits；为归因到具体候选，这里再解析 [HIT] 行的 attempt 序号
+  const nativeHits = [];
+  let aiHit = null;
+  const re = /\[HIT\]\s*attempt=(\d+)[^\n]*?flag=([^\r\n]+)/gi;
+  let m;
+  while ((m = re.exec(r.output)) !== null) {
+    const idx = Number(m[1]);
+    const flag = m[2].trim();
+    const a = attempts[idx] || {};
+    if (a._src === 'AI') { aiHit = flag; continue; }
+    // 只认 flag 形态
+    if (flagRe.test(flag)) nativeHits.push({ src: a._src, hex: (a._nativeHex || '').slice(0, 32) + '…', flag });
+  }
+  return { tried: attempts.length, nativeHits, aiHit, output: r.output };
+}
+
 // 验证闭环：解析 [VERIFY] → 本地复现 → 标记 flag 验证状态
 async function runVerification(aiText) {
   const contracts = parseVerifyContracts(aiText);
@@ -6720,7 +6814,41 @@ async function runVerification(aiText) {
     : (verified ? `本地复现通过（命中中间值/密钥，非 flag）：${r.hits.join(', ')}` : `本地复现失败（${contracts.length} 个契约无命中）`);
   addSolveNote('验证', note);
   addLog(flagHits.length ? 'success' : (verified ? 'info' : 'warning'), `[验证闭环] ${note}`);
-  return { verified: flagHits.length > 0, intermediateVerified: verified, hits: r.hits, flagHits };
+
+  // ===== 多候选密文交叉校验（防"变种题"陷阱）=====
+  // 即使本地复现"通过"了，也要确认用的是 so 里**真正被校验**的那条密文，而不是随便一条。
+  // 条件：AI 用了密文 + native intel 里抽到 >=2 组候选常量。此时把候选都跑一遍看哪些能出 flag。
+  let cross = null;
+  try {
+    const hasNativeIntel = mcpCache && mcpCache.nativeIntel &&
+      ((mcpCache.nativeIntel.globals || []).length || (mcpCache.nativeIntel.segments || []).length ||
+       (mcpCache.nativeIntel.decompiled || []).length);
+    const c0 = contracts.find(c => c && c.ciphertext && c.key && (c.algo !== 'custom' && c.algo !== 'node_js'));
+    if (hasNativeIntel && c0) {
+      cross = await crossCheckCandidates(c0);
+      if (cross && cross.nativeHits && cross.nativeHits.length) {
+        // so 里存在**另一条**能解出 flag 的候选密文 → 说明 AI 用的可能不是真校验那条（变种题风险）
+        const aiFlag = (flagHits[0] || '').trim();
+        const others = cross.nativeHits.filter(h => (h.flag || '').trim() !== aiFlag);
+        if (others.length) {
+          const msg = `⚠️ 检测到 ${others.length} 条 so 候选密文也能解出 flag（与 AI 给的不同）：\n` +
+            others.map(h => `  • [${h.src}] ct=${h.hex} → ${h.flag}`).join('\n') +
+            `\nAI 用的是：${aiFlag || '(无)'}\n请核对「校验函数实际引用的是哪条密文」再定案（变种题常见陷阱）。`;
+          addLog('warning', '[交叉校验] ' + msg.replace(/\n/g, ' '));
+          addSolveNote('交叉校验告警', msg.replace(/\n/g, ' '));
+          addSystemMessage(`**⚠️ 多候选密文交叉校验**\n\n${msg}\n\n（工具已枚举 so 内全部候选常量，非仅第一条）`);
+          others.forEach(h => recordFlag(h.flag, 'native-candidate', false));
+        } else {
+          addLog('success', `[交叉校验] so 内 ${cross.tried} 组候选密文中，仅 AI 那条能出 flag（一致 ✓）`);
+        }
+      } else if (cross && cross.tried) {
+        // AI 那条能出但 native 候选都不出 → 正常（AI 可能用的是运行时/计算出的密文）
+        addLog('info', `[交叉校验] 已试 ${cross.tried} 组候选，仅 AI 密文出 flag（其余为噪声/密钥表）`);
+      }
+    }
+  } catch (e) { /* 交叉校验失败不阻断主流程 */ }
+
+  return { verified: flagHits.length > 0, intermediateVerified: verified, hits: r.hits, flagHits, cross };
 }
 
 // 本地枚举：解析 [HYPOTHESES] → 并行尝试全部组合 → 命中即记

@@ -1,10 +1,18 @@
-# CTF-RE-TOOL v1.3.4
+# CTF-RE-TOOL v1.3.5
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)]()
+[![Electron](https://img.shields.io/badge/Electron-35-47848F?logo=electron&logoColor=white)]()
 
-一个基于 Electron 的 CTF 逆向工程辅助工具，集成 **AI 分析引擎**、**一键调用逆向工具**、**Frida 自动 Hook**、**解密脚本生成**，内置 **11 个逆向方法论技能**（Skills）与**可检索知识库**（Wiki），并通过 MCP 实时接入 IDA / JEB / Burp。
+一个基于 Electron 的 **CTF 逆向 AI 解题工作台**（Windows 桌面应用）。把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成一条 AI 可自主驱动的流水线，并通过 MCP 实时接入 **IDA / JEB / Burp**，内置 **11 个逆向方法论技能**（Skills）与**可检索的结构化知识库**（Wiki）。
+
+核心是**解题成功率**，不是功能堆砌：
+
+- **AI 工具循环（Tool-Use）**：AI 自主调用 JEB/IDA/Frida/Python 等工具反复推进，而不是一次性问答；分阶段提示词（①收集 → ②定位算法 → ③写脚本本地验证 → ④结论）。
+- **本地验证闭环**：AI 给出的每个 flag 都附 `[VERIFY]` 契约，工具自动生成 Python 复现脚本本地跑一遍，标注 ✅已验证 / ⚠️未验证——**不靠"AI 说解出来了"就当解出来了**。
+- **结构化知识库**：54 页可检索手法/题解页（含 44 篇历年逆向题，带 `attack_chain` 解法链 / `reasoning_chain` 思维链 / `failed_attempts` 避坑），按关键词结构化加权检索，命中即注入 AI 上下文。
+- **经验自进化**：每次解题沉淀的多步攻击链写入经验库，下次同类题自动速查复用。
 
 **下载**：到 [Releases](https://github.com/ip2867/ctf-re-tool/releases) 下载 `CTF-RE-TOOL.exe`（便携单文件，双击即用）。
 
@@ -38,10 +46,13 @@
 - pycdas - Python 字节码反汇编
 
 ### 3. Frida 自动 Hook
-- 自动生成 Hook 脚本模板
-- 支持 Java 层 Hook（Cipher、String、MessageDigest、SharedPreferences、Base64）
-- 支持 Native 层 Hook
-- 实时显示 Hook 日志
+- 自动生成**针对题目情报**的 Hook 脚本（从静态分析提取类名/native 方法/算法特征注入模板，而非固定模板）
+- **Java 层**：Cipher、MessageDigest、String、SharedPreferences、Base64、`Arrays.equals` 等
+- **Native 层**：主动扫描 Java 声明的 native 方法 + **RegisterNatives 拦截**（动态注册、无 `Java_` 导出时的唯一入口）+ 符号级 `findFunc`
+- **JCE 通杀自吐**：Hook `Cipher.init`/`doFinal`，不追业务代码直接吐算法/密钥/明文
+- **进程内解密出 flag**：把已求得的 key/iv/密文注入 Hook，在 App 进程内直接 decrypt 并 `send('[FLAG]...')`，绕过关卡
+- **反检测**：Frida 文件/端口探测绕过、SSL pinning 绕过（Java 层 + native `SSL_read/write`）、反调试绕过
+- 实时显示 Hook 日志；滚动窗口抓取（每来数据续 60s，绝对上限 10min）；spawn 失败自动回退 attach
 
 ### 4. 解密脚本生成
 - 自动生成 Python 解密脚本
@@ -62,11 +73,14 @@
 - apktool 解包 → smali patch → 回编 → zipalign + jarsigner 签名 一键批处理
 
 ### 6. AI 分析引擎（流式输出）
-- 兼容 CCSwitch/GLM 的 Anthropic `/v1/messages` 接口
+- 兼容 CCSwitch / Claude Code 的 Anthropic `/v1/messages` 接口（Base URL 留空则由环境变量或设置页提供）
 - SSE 流式逐字渲染，发送按钮可随时停止 AI 任务
-- 429/5xx 自动退避重试；max_tokens 可配置
-- Tool Use 循环（工具结果自动截断，防止撑爆上下文）
-- AI 系统提示使用真实 MCP 连接状态，flag 用 `[FLAG]...[/FLAG]` 契约标记便于程序提取
+- 429/5xx 自动退避重试；`max_tokens` 可配置；连接 60s / 空闲 120s 超时
+- **Tool-Use 循环**（最多 25 轮，工具结果自动截断防止撑爆上下文）
+- **分阶段解题提示词**：APK/PE/ELF 深度求解按「①收集代码+数据 → ②定位算法 → ③写脚本本地验证 → ④出结论」四阶段推进，强制"先证据后结论"，禁止跳步臆测
+- **模型分级**（cascade）：先用快速模型初解，未出 flag 再升级思考模型，兼顾速度与成功率
+- AI 系统提示注入真实 MCP 连接状态、已收集结论（避免重复劳动/推翻已验证项）、知识库索引与经验速查；flag 用 `[FLAG]...[/FLAG]` 契约标记便于程序提取
+- **兜底模板针对性**：AI 生成的 Frida 脚本失败时，回退模板会注入题目情报（包名、类名、native 方法、算法特征）做**针对性 Hook**，而非固定模板
 
 ### 7. Agent Skills 知识库（v1.2 新增）
 - `skills/` 目录 + SKILL.md 格式，兼容 Anthropic Agent Skills / ljagiello·ctf-skills（MIT）
@@ -91,10 +105,17 @@
 - **node_js 验证契约**：AI 还原的 JS 加密函数经 `[VERIFY]{"algo":"node_js","code":"function decrypt(input){...}","input":"参数原文","expected":"密文"}` 交给本地 node 复现，与抓包密文比对
 - **全局经验库**（reverse-skill 进化层思路）：`经验 <一句话>` 回写，下次解题自动注入 AI 提示词速查；`查经验` 查看
 
-### 11. 知识库 Wiki（可检索手法页）
-- `wiki/` 目录存放可检索的手法/代码片段页（Markdown），AI 经 `wiki_search` 找页、`wiki_read` 读全文，系统提示只注入页面索引
-- 内置 Frida 专题（多阶段 hook、进程内解密、Native 密钥反演、参数编码还原）与固件专题（解包/仿真踩坑）
-- 用户可往 `%APPDATA%/ctf-reverse-tool/wiki/` 放自己的页面，重启即生效
+### 11. 结构化知识库 + 检索体系（v1.3.5 重构）
+- **三层结构**：`AI-SEARCH-INDEX.md`（全局检索索引，按技术标签定位资源）→ `PAYLOAD-CHEATSHEET.md`（逆向套路/Payload/脚本速查）→ 各专题页
+- **历年逆向题条目库（`wiki/reverse/`，44 篇）**：从公开题库筛选的纯逆向题，每题一个页面，带结构化 meta：
+  - `attack_chain` —— 完整解法链（特征 → 关键步骤 → 坑 → 出 flag）
+  - `reasoning_chain` —— 思维链（怎么想到这条路的）
+  - `failed_attempts` —— 走不通的路与原因（**往往比成功更有价值**）
+  - `key_observations` / `key_payload` / `one_liner` / `tags` / `difficulty`
+- **结构化加权检索**：`wiki_search` 解析 YAML meta，命中 `tags`/`attack_chain`/`reasoning_chain`/`key_observations`/`one_liner` 的条目**大幅加权**（远高于正文散命中），带 meta 的条目优先返回 `one_liner`+`attack_chain` 摘要，让 AI 一步拿到"这道题该怎么解"
+- **手法专题**：`wiki/frida/`（多阶段 Hook、进程内解密出 flag、Native 密钥反演、参数/IV 编码坑、环境排障、native 定位+RegisterNatives+反检测+脱壳）、`wiki/firmware/`（固件解包/QEMU 仿真踩坑）
+- **两处可放页**：应用内置 `wiki/`（随 exe 分发）+ `%APPDATA%/ctf-reverse-tool/wiki/`（用户自加，重启即生效）；系统提示只注入页面索引，不占固定上下文
+- 设计参考 Des-CTF-Knowledge 知识库的「结构化 meta + attack_chain + 分段索引」范式（**仅借鉴设计思路，纯文本条目，零样本落地**）
 
 ## 环境要求
 
@@ -158,21 +179,31 @@ npm start
 ctf-tool-v2/
 ├── package.json          # 项目配置 + electron-builder 打包配置
 ├── electron/
-│   ├── main.js           # Electron 主进程（IPC、工具调用、MCP、打包路径处理）
-│   └── preload.js        # 预加载脚本（contextBridge 暴露 API）
+│   ├── main.js           # Electron 主进程（IPC、工具调用、MCP 客户端、AI 传输、知识库检索、打包路径处理）
+│   └── preload.js        # 预加载脚本（contextBridge 暴露 API，sandbox 开启）
 ├── src/
-│   ├── index.html        # 主页面
+│   ├── index.html        # 主页面（CSP + SRI 加固）
 │   ├── css/style.css     # 样式（暖白简约主题）
-│   └── js/app.js         # 应用逻辑（AI 编排、Hook、验证闭环）
-├── skills/               # 11 个逆向方法论技能（SKILL.md）
-├── wiki/                 # 可检索知识库（手法页 + 踩坑）
+│   └── js/app.js         # 渲染层逻辑（AI 编排、Tool-Use 循环、Hook 生成、验证闭环、WP 生成）
+├── skills/               # 11 个逆向方法论技能（SKILL.md，AI 经 read_skill 按需加载）
+│   ├── ctf-dispatch/     #   总调度：分类 → 选方法 → 卡题换路
+│   ├── ctf-reverse-binary/ ctf-reverse-android/ ctf-reverse-langs/
+│   ├── ctf-reverse-tooling/   #   Z3/angr/Unicorn 自动化求解 + 迷宫题
+│   ├── ctf-frida-dynamic/ ctf-antidebug/ ctf-jsreverse/
+│   ├── ctf-iot-firmware/ ctf-crypto-identify/ ctf-writeup/
+├── wiki/                 # 可检索结构化知识库（54 页，AI 经 wiki_search/wiki_read 检索）
+│   ├── AI-SEARCH-INDEX.md      # 全局检索索引（优先读）
+│   ├── PAYLOAD-CHEATSHEET.md   # 逆向套路/Payload/脚本速查
+│   ├── reverse/                # 44 篇历年逆向题（YAML meta：attack_chain/reasoning_chain/failed_attempts）+ _INDEX.md
+│   ├── frida/                  # 6 篇动态 Hook 手法页
+│   └── firmware/               # 固件解包与仿真
 ├── assets/icons/         # 应用图标
 ├── LICENSE               # MIT
 ├── 启动.bat              # Windows 快速启动
 └── README.md
 ```
 
-> `dist/`（打包产物）、`cases/`（取证目录）、`scripts/`（生成脚本）为运行期产物，不入库。
+> `dist*/`（打包产物）、`cases/`（取证目录）、`scripts/`（生成脚本）为运行期产物，不入库。
 
 ## 使用说明
 
@@ -276,6 +307,17 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 
 ## 更新日志
+
+### v1.3.5 (2026-10-13) — 结构化知识库 + 解题成功率优化
+- **知识库重构为「结构化 + RAG 友好」**：新增全局检索索引 `AI-SEARCH-INDEX.md` 与速查表 `PAYLOAD-CHEATSHEET.md`
+- **历年逆向题条目库**：新增 `wiki/reverse/`，**44 篇**纯逆向题（从 132 候选筛选、剔除 PWN/杂项），每题带 `attack_chain`（解法链）/`reasoning_chain`（思维链）/`failed_attempts`（避坑）等 YAML meta
+- **修复结构化检索失效**：`wiki_search` 此前只解析 `---` front matter，而条目库把 meta 放在 ` ```yaml ` 围栏里，导致 tags/attack_chain 加权**完全失效**；现兼容两种写法，并新增 `vuln_type`/`contest`/`difficulty` 加权；命中片段优先展示 `one_liner`+`attack_chain` 且保留原文大小写（防止把大小写敏感的 flag 小写化）
+- **系统提示瘦身**：不再逐条列出 44 篇逆向条目路径（交给 `wiki_search` 检索），每次请求省约 1.5k tokens
+- **Frida 能力增强**：吸收两大开源 Frida Hook 项目精华——RegisterNatives 拦截、JCE 通杀自吐、SSL pinning 绕过（Java+native）、脱壳、反检测；兜底模板注入题目情报做针对性 Hook（不再是固定模板）
+- **AI 解题流程优化**：APK/PE/ELF 深度求解改为四阶段流水线提示词；AI 脚本语法错自动重新生成 2 轮
+- **环境自愈**：frida client/server 版本一致性自检、双 adb 互杀重连、装 APK 前 package 服务就绪轮询、GUI 窗口可见性修复（IDA/JEB/Nox）
+- **隐私与安全**：移除源码/文档中硬编码的私有 AI 中转地址（Base URL 默认留空，未配置时明确报错）；`git-filter-repo` 抹除历史中的私有域名与本机路径；清理构建残留与一次性调试脚本
+- **发现并修复**：`wikiSearch` 结构化 meta 解析失效（见上）；`baseUrl` 为空时由 `Invalid URL` 改为明确的中文配置提示
 
 ### v1.3.4 (2026-10-09) — 知识库扩充 + 固件逆向 + 开源发布
 - **知识库技能 8→11**：新增 `ctf-reverse-tooling`（Z3/angr/Unicorn 自动化求解 + 迷宫题）、`ctf-reverse-langs`（Python 字节码/Go/Rust/Lua 语言特定逆向）、`ctf-iot-firmware`（固件提取/解包/QEMU 仿真）

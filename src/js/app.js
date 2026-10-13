@@ -6752,25 +6752,67 @@ function extractNativeCandidates(intel) {
   return out;
 }
 
+// 按需反编译一个函数（不在预采集集合里时）；结果缓存 + 全局上限，失败静默。
+// budget：{ n } 可变计数器，防止候选多时触发过多 decompile 调用。
+async function probeFnCode(name, cache, budget) {
+  if (!name) return '';
+  if (cache.has(name)) return cache.get(name);
+  if (budget && budget.n <= 0) return '';
+  let code = '';
+  try {
+    if (budget) budget.n--;
+    const r = await window.electronAPI.idaMcpCall('decompile', { address: name });
+    if (r && r.success && r.result) code = typeof r.result === 'string' ? r.result : (r.result.code || JSON.stringify(r.result));
+  } catch (e) { /* 忽略 */ }
+  cache.set(name, code || '');
+  return code || '';
+}
+
+// 尝试用 IDA trace_data_flow 判断"常量地址是否流向某个比较点"（更强的判据，可用则加分）。
+// 该工具在部分 ida-pro-mcp 版本存在；不存在/参数不符时静默跳过返回 0。
+// 收紧策略：结果必须非空、且不是"未找到/无流"类回应，避免给所有候选都加同样分而失去区分度。
+async function probeDataFlow(addr, cmpFnNames) {
+  if (!addr) return { ok: false, score: 0, note: '' };
+  try {
+    const r = await window.electronAPI.idaMcpCall('trace_data_flow', { addr });
+    if (!r || !r.success || !r.result) return { ok: false, score: 0, note: '' };
+    const txt = (typeof r.result === 'string' ? r.result : JSON.stringify(r.result)).trim();
+    if (!txt || txt.length < 8) return { ok: false, score: 0, note: '' };
+    // "无流/未找到/空结果"类回应 → 不加分（否则每个候选都 +2，裁决退化）
+    if (/no\s*flow|not\s*found|no\s*path|empty|none\b|未找到|无数据|无流向|null/i.test(txt)) return { ok: false, score: 0, note: '' };
+    // 路径里出现"已知比较函数名" → 最强信号
+    if (cmpFnNames.some(n => n && txt.includes(n))) return { ok: true, score: 4, note: 'trace_data_flow→比较函数' };
+    // 命中比较/解密调用（且文本确实描述了路径，非泛化空话）
+    if (/memcmp|strcmp|compare|equals/i.test(txt) && /decrypt|cipher|chacha|tea|rc4|aes|expand|key/i.test(txt)) {
+      return { ok: true, score: 3, note: 'trace_data_flow→比较+解密' };
+    }
+    return { ok: true, score: 0, note: '' };
+  } catch (e) { return { ok: false, score: 0, note: '' }; }
+}
+
 // ============ 自动裁决"权威密文"（哪条被校验函数真正引用）============
 // 思路（在有 IDA MCP 时可用，纯静态启发式、失败即静默降级）：
 //   对每个带地址的候选常量，查 IDA xrefs_to → 找出"引用它的函数"；
-//   若该引用函数同时（在已反编译集合里，且）代码含比较语义（memcmp/strcmp/==/Arrays.equals/
-//   或对解密结果做逐字节比较），则该候选极可能是"真校验用的那条"。
-//   再叠加：候选符号名出现在"比较类函数"的反编译文本中 → 加分。
-// 返回按可信度降序的候选列表，每项附 { refFns:[], score, authoritative:bool }。
+//   若该引用函数（在预采集集合里，或**按需反编译**后）代码含比较语义
+//   （memcmp/strcmp/==/Arrays.equals，或对解密结果做逐字节比较），则该候选极可能是"真校验用的那条"。
+//   叠加两类加分：候选符号名出现在比较类函数文本中；trace_data_flow 显示常量流向比较点。
+// 返回按可信度降序的候选列表，每项附 { refFns:[], score, authoritative:bool, why:[] }。
 async function rankCandidatesByXref(cands, intel) {
   intel = intel || {};
   if (!Array.isArray(cands) || !cands.length) return cands || [];
   // 已反编译函数名集合 + 各函数代码（用于判断"引用它的函数是否做比较"）
   const decMap = new Map();
   for (const d of (intel.decompiled || [])) decMap.set(String(d.name || ''), String(d.code || ''));
+  const fnCache = new Map();  // 按需反编译缓存（含 decMap 命中）
+  for (const [n, c] of decMap) fnCache.set(n, c);
   const CMP_RE = /memcmp|strcmp|strncmp|Arrays\s*\.?\s*equals|\.equals\s*\(|==|!=/;
   const refCache = new Map();  // addr -> xrefs
+  const decBudget = { n: 16 };  // 按需 decompile 总上限（覆盖"引用函数不在预采集集合"的情形）
   let queried = 0;
   for (const k of cands) {
     let score = 0;
     const refFns = [];
+    const why = [];
     const addr = String(k.addr || '').trim();
     if (addr && queried < 12) {                 // 最多查 12 个，控成本
       try {
@@ -6794,13 +6836,14 @@ async function rankCandidatesByXref(cands, intel) {
             if (x && typeof x.fn === 'string') fnName = x.fn;
             else if (x && x.fn && x.fn.name) fnName = x.fn.name;
             else if (x && (x.name || x.func_name)) fnName = x.name || x.func_name;
-            if (fnName) {
-              refFns.push(fnName);
-              // 引用它的函数在反编译集合里 → 很可能是校验链上的函数
-              if (decMap.has(fnName)) score += 3;
-              // 该函数代码含比较语义 → 几乎可确定是"解密后比对"
-              const code = decMap.get(fnName) || '';
-              if (code && CMP_RE.test(code)) score += 3;
+            if (!fnName) continue;
+            refFns.push(fnName);
+            // 引用它的函数代码：优先预采集，其次**按需反编译**（更强覆盖，不再局限于 28 个）
+            let code = fnCache.get(fnName);
+            if (code === undefined) code = await probeFnCode(fnName, fnCache, decBudget);
+            if (code) {
+              score += 3;                                    // 引用函数可读到代码
+              if (CMP_RE.test(code)) { score += 3; why.push(`${fnName} 含比较语义`); }
             }
           }
         }
@@ -6808,13 +6851,25 @@ async function rankCandidatesByXref(cands, intel) {
       } catch (e) { /* xref 失败不影响主流程 */ }
     }
     k.refFns = [...new Set(refFns)];
+    k.why = why;
     k.score = score;
   }
   // 符号名出现在"比较类函数"文本里 → 加分（无 addr 的候选也能受益）
-  const cmpText = [...decMap.values()].filter(c => CMP_RE.test(String(c))).join('\n');
+  const cmpText = [...fnCache.values()].filter(c => CMP_RE.test(String(c))).join('\n');
   for (const k of cands) {
-    if (k.name && cmpText.includes(k.name)) k.score = (k.score || 0) + 2;
-    if (k.addr && cmpText.includes(String(k.addr).toLowerCase())) k.score = (k.score || 0) + 2;
+    if (k.name && cmpText.includes(k.name)) { k.score = (k.score || 0) + 2; (k.why = k.why || []).push('符号名出现在比较函数'); }
+    if (k.addr && cmpText.includes(String(k.addr).toLowerCase())) { k.score = (k.score || 0) + 2; (k.why = k.why || []).push('地址出现在比较函数'); }
+  }
+  // 最强判据：trace_data_flow（可用时）—— 常量地址是否流向比较点。
+  // 仅对"已有 xref 命中"的候选查（无引用的候选没必要查），且总量限 6 次，控成本。
+  const cmpFnNames = [...fnCache.keys()].filter(n => CMP_RE.test(String(fnCache.get(n) || '')));
+  let dfBudget = 6;
+  for (const k of cands) {
+    if (!k.addr || !(k.refFns && k.refFns.length)) continue;
+    if (dfBudget <= 0) break;
+    dfBudget--;
+    const df = await probeDataFlow(k.addr, cmpFnNames);
+    if (df.ok && df.score > 0) { k.score = (k.score || 0) + df.score; (k.why = k.why || []).push(df.note); k.dataFlow = true; }
   }
   cands.sort((a, b) => (b.score || 0) - (a.score || 0));
   // 只有"最高分明显领先"时才标 authoritative（避免误判）：
@@ -6852,7 +6907,7 @@ async function crossCheckCandidates(contract) {
   attempts.push(Object.assign({}, base, { ciphertext: c.ciphertext, _src: 'AI' }));
   for (const k of cands) {
     if (k.hex === aiCt) continue;
-    attempts.push(Object.assign({}, base, { ciphertext: k.hex, _src: k.src, _nativeHex: k.hex, _score: k.score || 0, _auth: !!k.authoritative, _refFns: k.refFns || [] }));
+    attempts.push(Object.assign({}, base, { ciphertext: k.hex, _src: k.src, _nativeHex: k.hex, _score: k.score || 0, _auth: !!k.authoritative, _refFns: k.refFns || [], _why: k.why || [] }));
   }
   if (attempts.length <= 1) return { tried: 0, nativeHits: [], aiHit: null };
 
@@ -6869,13 +6924,13 @@ async function crossCheckCandidates(contract) {
     const a = attempts[idx] || {};
     if (a._src === 'AI') { aiHit = flag; continue; }
     // 只认 flag 形态
-    if (flagRe.test(flag)) nativeHits.push({ src: a._src, hex: (a._nativeHex || '').slice(0, 32) + '…', flag, score: a._score || 0, authoritative: !!a._auth, refFns: a._refFns || [] });
+    if (flagRe.test(flag)) nativeHits.push({ src: a._src, hex: (a._nativeHex || '').slice(0, 32) + '…', flag, score: a._score || 0, authoritative: !!a._auth, refFns: a._refFns || [], why: a._why || [] });
   }
   // 每个候选（含未出 flag 的）带分排序，供裁决：authoritative 优先
   nativeHits.sort((a, b) => (b.authoritative - a.authoritative) || (b.score - a.score));
   // 若"被校验函数引用(authoritative)"的那条能出 flag，则它即权威答案
   const authHit = nativeHits.find(h => h.authoritative) || null;
-  return { tried: attempts.length, nativeHits, aiHit, authHit, ranked: cands.map(k => ({ src: k.src, score: k.score || 0, authoritative: !!k.authoritative, refFns: k.refFns || [] })) };
+  return { tried: attempts.length, nativeHits, aiHit, authHit, ranked: cands.map(k => ({ src: k.src, score: k.score || 0, authoritative: !!k.authoritative, refFns: k.refFns || [], why: k.why || [] })) };
 }
 
 // 验证闭环：解析 [VERIFY] → 本地复现 → 标记 flag 验证状态
@@ -6931,18 +6986,19 @@ async function runVerification(aiText) {
             }
             recordFlag(authFlag, 'native-authoritative', true);
             flagHits.length = 0; flagHits.push(authFlag);
+            const whyTxt = (authHit.why && authHit.why.length) ? '（依据：' + authHit.why.join('；') + '）' : '（依据 IDA xrefs：被引用函数含比较语义）';
             const msg = `✅ 自动裁决：以「被校验函数引用的密文」为权威\n` +
               `  • 权威候选 [${authHit.src}]${authHit.refFns && authHit.refFns.length ? ' 被 ' + authHit.refFns.join(', ') + ' 引用' : ''}\n` +
               `    ct=${authHit.hex} → ${authFlag}\n` +
               `  • AI 原答案（已降级为候选）：${aiFlag || '(无)'}\n` +
-              `（依据 IDA xrefs：该密文地址被校验函数引用，且引用它的函数含比较语义）`;
+              `${whyTxt}，score=${authHit.score}`;
             addLog('success', '[交叉校验] ' + msg.replace(/\n/g, ' '));
             addSolveNote('交叉校验裁决', msg.replace(/\n/g, ' '));
             addSystemMessage(`**🧭 多候选密文自动裁决**\n\n${msg}`);
-            verdict = { authoritative: authFlag, source: authHit.src, refFns: authHit.refFns || [], replacedAI: !!aiFlag };
+            verdict = { authoritative: authFlag, source: authHit.src, refFns: authHit.refFns || [], why: authHit.why || [], replacedAI: !!aiFlag };
           } else {
             addLog('success', `[交叉校验] AI 用的密文与「被校验函数引用的候选」一致 ✓（${authHit.src}）`);
-            verdict = { authoritative: authFlag || aiFlag, source: authHit.src, refFns: authHit.refFns || [], replacedAI: false };
+            verdict = { authoritative: authFlag || aiFlag, source: authHit.src, refFns: authHit.refFns || [], why: authHit.why || [], replacedAI: false };
           }
         } else if (others.length) {
           // 无法自动判定权威（xref 没查到明确引用）→ 保持告警，交人工/AI 复核

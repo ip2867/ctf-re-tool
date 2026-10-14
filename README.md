@@ -1,4 +1,4 @@
-# CTF-RE-TOOL v1.3.8
+# CTF-RE-TOOL v1.3.9
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -307,6 +307,14 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 
 ## 更新日志
+
+### v1.3.9 (2026-10-14) — 内部重构：验证闭环去重（无行为变更）
+
+- **消除 7 处复制粘贴的"验证闭环"块**：`analyzeAPK`/`analyzePE|ELF`/`analyzePYC`/`analyzeWebJS`/`autoSolveActive`/`toolUseDeepSolve`/`toolUseDeepSolveBinary` 里各写一遍
+  `runVerification → runHypotheses 兜底 → recordFlag → addSolveNote`，且**语义已漂移**（有的用 `if (!vr)` 门控 flag 登记、有的无条件；源码字符串也各不相同）——
+  这正是过去多次"同类 bug 修一处漏一处"的根源。现统一为 `verifyAndRecord(aiText, {source, noteSection})`，返回 `{ vr, flags, verifiedFlags }`。
+- 纯重构，**求解器与解题行为不变**；回归 11/11 通过。
+- 同步刷新 `PROJECT-FRAMEWORK.md`（SSOT）到 v1.3.9：补 PYC 多后端、`verifyAndRecord`、asarUnpack 等现状。
 
 ### v1.3.8 (2026-10-14) — PYC 逆向从"无解"到可用（多后端反汇编 + AI 求解）
 

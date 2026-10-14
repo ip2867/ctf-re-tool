@@ -2739,12 +2739,7 @@ ${strings ? `\n## 原始字节串扫描（含明文串/base64/hex/大整数）\n
       await harvestExperience(result.text);
       // 3. 验证闭环
       addLog('info', '[3/3] 本地复现验证...');
-      const vr = await runVerification(result.text);
-      if (vr && !vr.verified) await runHypotheses(result.text, { synthFrom: vr.contracts });
-      extractFlags(result.text).forEach(f => { recordFlag(f, 'pyc', false); addSolveNote('Flag', f); });
-
-      const vf = (state.findings ? state.findings.flags : []).filter(f => f.verified);
-      const flags = extractFlags(result.text);
+      const { verifiedFlags: vf, flags } = await verifyAndRecord(result.text, { source: 'pyc' });
       addSystemMessage(`**🐍 PYC 分析结果**（后端：${backendInfo || '未知'}）
 
 ${vf.length ? `**Flag（✅已验证）**: \`${vf[0].flag}\`` : (flags.length ? `**Flag（⚠️未验证）**: \`${flags[0]}\`` : '')}
@@ -2966,9 +2961,7 @@ ${String(historyText).substring(0, 5000)}
       state.lastAiText = result.text;
       const clean = String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000);
       addSolveNote('求解结果', clean);
-      const vr = await runVerification(result.text);
-      if (vr && !vr.verified) await runHypotheses(result.text, { synthFrom: vr.contracts });
-      extractFlags(result.text).forEach(f => { recordFlag(f, 'ai', false); addSolveNote('Flag', f); });
+      await verifyAndRecord(result.text, { source: 'ai' });
       addSystemMessage(`**🎯 Web/JS 逆向分析结果**\n\n${result.text}`);
     } else if (result.success) {
       endStreamMessage();
@@ -5160,11 +5153,7 @@ ${state.lastAiText ? `## 此前静态分析结论（节选）\n${String(state.la
     if (result.success && result.text) {
       state.lastAiText = result.text;
       await harvestExperience(result.text);
-      const vr = await runVerification(result.text);
-      if (vr && !vr.verified) await runHypotheses(result.text, { synthFrom: vr.contracts });
-      const flags = extractFlags(result.text);
-      if (!vr) flags.forEach(f => recordFlag(f, 'frida', false));
-      flags.forEach(f => addSolveNote('Flag(动态)', f));
+      await verifyAndRecord(result.text, { source: 'frida', noteSection: 'Flag(动态)' });
       addSystemMessage(`**🎯 动态调试结论**\n\n${result.text}`);
     } else {
       addLog('warning', '动态结论生成失败: ' + (result.error || '未知'));
@@ -5510,14 +5499,9 @@ ${otherClassesText}
       state.lastAiText = result.text;
       await harvestExperience(result.text);
 
-      // 验证闭环 + 失败时本地枚举兜底
-      const vr = await runVerification(result.text);
-      if (vr && !vr.verified) await runHypotheses(result.text, { synthFrom: vr.contracts });
-      const flags = extractFlags(result.text);
-      if (!vr) flags.forEach(f => recordFlag(f, 'ai', false));
-      flags.forEach(f => addSolveNote('Flag', f));
+      // 验证闭环 + 失败时本地枚举兜底（统一走 verifyAndRecord）
+      const { verifiedFlags } = await verifyAndRecord(result.text, { source: 'ai' });
 
-      const verifiedFlags = (state.findings ? state.findings.flags : []).filter(f => f.verified);
       const resultMsg = `**🎯 自动求解结果**
 
 **文件**: ${state.fileInfo.fileName}
@@ -5636,9 +5620,7 @@ ${mcpCache.nativeIntel.globals && mcpCache.nativeIntel.globals.length ? `\n## SO
       state.lastAiText = result.text;
       addSolveNote('求解结果(Tool-Use)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
       await harvestExperience(result.text);
-      const vr = await runVerification(result.text);
-      if (vr && !vr.verified) await runHypotheses(result.text, { synthFrom: vr.contracts });
-      extractFlags(result.text).forEach(f => { recordFlag(f, 'ai-deep', false); addSolveNote('Flag', f); });
+      await verifyAndRecord(result.text, { source: 'ai-deep' });
 
       const verifiedFlags = (state.findings ? state.findings.flags : []).filter(f => f.verified);
       const flags = extractFlags(result.text);
@@ -6032,14 +6014,9 @@ ${globalsText}
       state.lastAiText = result.text;
       await harvestExperience(result.text);
 
-      // 验证闭环 + 失败时本地枚举兜底
-      const vr = await runVerification(result.text);
-      if (vr && !vr.verified) await runHypotheses(result.text, { synthFrom: vr.contracts });
-      const flags = extractFlags(result.text);
-      if (!vr) flags.forEach(f => recordFlag(f, 'ai', false));
-      flags.forEach(f => addSolveNote('Flag', f));
+      // 验证闭环 + 失败时本地枚举兜底（统一走 verifyAndRecord）
+      const { verifiedFlags } = await verifyAndRecord(result.text, { source: 'ai' });
 
-      const verifiedFlags = (state.findings ? state.findings.flags : []).filter(f => f.verified);
       const resultMsg = `**🎯 自动求解结果**
 
 **文件**: ${state.fileInfo.fileName}
@@ -6129,9 +6106,7 @@ ${analysisData.strings ? `\n## 关键字符串\n${typeof analysisData.strings ==
       state.lastAiText = result.text;
       addSolveNote('求解结果(Tool-Use)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
       await harvestExperience(result.text);
-      const vr = await runVerification(result.text);
-      if (vr && !vr.verified) await runHypotheses(result.text, { synthFrom: vr.contracts });
-      extractFlags(result.text).forEach(f => { recordFlag(f, 'ai-deep', false); addSolveNote('Flag', f); });
+      await verifyAndRecord(result.text, { source: 'ai-deep' });
       const vf = (state.findings ? state.findings.flags : []).filter(f => f.verified);
       addSystemMessage(`**🎯 Tool-Use 深度求解结果**\n\n${vf.length ? `**Flag（✅已验证）**: \`${vf[0].flag}\`` : ''}\n\n${result.text}`);
       return vf.length > 0;
@@ -7289,6 +7264,24 @@ async function crossCheckCandidates(contract) {
   // 若"被校验函数引用(authoritative)"的那条能出 flag，则它即权威答案
   const authHit = nativeHits.find(h => h.authoritative) || null;
   return { tried: attempts.length, nativeHits, aiHit, authHit, ranked: cands.map(k => ({ src: k.src, score: k.score || 0, authoritative: !!k.authoritative, refFns: k.refFns || [], why: k.why || [] })) };
+}
+
+// 【统一入口】验证闭环 + 失败自动枚举 + flag 登记（此前 7 处复制粘贴，语义已漂移：
+// 有的用 `if (!vr)` 门控 recordFlag、有的无条件登记，源码字符串也各不相同）。
+// 统一语义：先按 source 登记 AI 抽到的 flag（未验证，去重），再跑本地复现；复现失败
+// 自动合成候选枚举；返回 { vr, flags, verifiedFlags } 供调用方拼结果消息。
+async function verifyAndRecord(aiText, opts = {}) {
+  const source = opts.source || 'ai';
+  const noteSection = opts.noteSection || 'Flag';
+  const flags = extractFlags(aiText);
+  // 先登记（未验证）。runVerification 内部也会登记，但那是"有契约时"才走的分支；
+  // 无契约时必须在此登记，否则 flag 会丢失。recordFlag 自带去重，重复登记无害。
+  flags.forEach(f => recordFlag(f, source, false));
+  const vr = await runVerification(aiText);
+  if (vr && !vr.verified) await runHypotheses(aiText, { synthFrom: vr.contracts });
+  flags.forEach(f => addSolveNote(noteSection, f));
+  const verifiedFlags = (state.findings ? state.findings.flags : []).filter(f => f.verified);
+  return { vr, flags, verifiedFlags };
 }
 
 // 验证闭环：解析 [VERIFY] → 本地复现 → 标记 flag 验证状态

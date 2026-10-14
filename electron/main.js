@@ -533,6 +533,88 @@ ipcMain.handle('extract-apk-so', async (event, apkPath) => {
   }
 });
 
+// PYC 反汇编/常量提取：多后端回退（pycdc 对高版本 pyc 常报 Bad MAGIC 直接失败）。
+// 后端链：配置的 pycdc → 内置 pyc_decompile.py（xdis/pydisasm → 原生 marshal+dis → 纯字节串扫描）。
+// 关键：**即使 pycdc 失败也返回可用结果**（反汇编/常量/字符串），交给上层 AI 分析。
+// 打包注意：asar=true 时助手在 app.asar 内，**外部 python 进程读不到 asar 路径**，
+// 故这里把它物化到临时文件再执行（开发态直接读原文件）。
+function materializePycHelper() {
+  const appDir = app.getAppPath();
+  const cands = [
+    path.join(__dirname, 'pyc_decompile.py'),                                         // 开发态（真实文件）
+    path.join(appDir, 'electron', 'pyc_decompile.py').replace('app.asar', 'app.asar.unpacked'), // 打包态·已解包（真实文件）
+    path.join(appDir, 'electron', 'pyc_decompile.py'),                                // 打包态·asar 内（需物化）
+  ];
+  for (const c of cands) {
+    try {
+      if (!fs.existsSync(c)) continue;
+      // asar 内路径：Electron 的 fs 补丁能读，但外部 python 进程不能 → 复制到 temp
+      if (/app\.asar([\\/]|$)/.test(c) && !/app\.asar\.unpacked/.test(c)) {
+        const tmp = path.join(app.getPath('temp'), 'ctf_pyc_decompile.py');
+        fs.writeFileSync(tmp, fs.readFileSync(c));
+        return tmp;
+      }
+      return c;
+    } catch (e) { /* 试下一个 */ }
+  }
+  return null;
+}
+
+ipcMain.handle('pyc-decompile', async (event, pycPath) => {
+  try {
+    if (!pycPath || !fs.existsSync(pycPath)) return { success: false, error: 'PYC 文件不存在: ' + pycPath };
+    const out = { success: false, backends: [], disasm: '', consts: '', strings: '', meta: '', raw: '', error: null };
+
+    // 1) 用户配置的 pycdc（若可用）
+    const pycdc = (config.tools && config.tools.pycdc) || '';
+    if (pycdc && fs.existsSync(pycdc) && /\.exe$/i.test(pycdc)) {
+      const r = await spawnArgv([pycdc, pycPath], { timeoutMs: 30000 });
+      if (r.success && r.stdout && !/Bad MAGIC/i.test(r.stdout + r.stderr)) {
+        out.backends.push('pycdc');
+        out.disasm = r.stdout;
+        out.success = true;
+        return out;
+      }
+      out.backends.push('pycdc:失败(' + ((r.stdout + r.stderr).match(/Bad MAGIC/i) ? 'Bad MAGIC' : (r.error || 'unknown')) + ')');
+    }
+
+    // 2) 内置多后端助手（含纯字节串扫描兜底，永不空手而归）
+    const helper = materializePycHelper();
+    if (!helper) {
+      out.error = '内置 pyc 助手缺失（pyc_decompile.py 未随应用打包）';
+      return out;
+    }
+    const r = await spawnArgv(['python', helper, pycPath], { timeoutMs: 90000 });
+    const text = ((r.stdout || '') + (r.stderr ? '\n' + r.stderr : '')).trim();
+    out.raw = text;
+    if (!r.success && !text) {
+      out.error = r.error || 'python 执行失败（请确认本机已安装 Python 并加入 PATH）';
+      return out;
+    }
+    // 按分区解析
+    const secSplit = (name, nextNames) => {
+      const start = text.indexOf('### ' + name + ' ###');
+      if (start < 0) return '';
+      let end = text.length;
+      for (const n of nextNames) {
+        const i = text.indexOf('### ' + n + ' ###', start + 1);
+        if (i >= 0 && i < end) end = i;
+      }
+      return text.slice(start + ('### ' + name + ' ###').length, end).trim();
+    };
+    const order = ['META', 'DISASM', 'CONSTS', 'STRINGS'];
+    out.meta = secSplit('META', order);
+    out.disasm = secSplit('DISASM', order);
+    out.consts = secSplit('CONSTS', order);
+    out.strings = secSplit('STRINGS', order);
+    out.backends.push(/backend: xdis/.test(text) ? 'xdis/pydisasm' : (/backend: marshal/.test(text) ? 'marshal+dis' : 'bytes-scan'));
+    out.success = !!(out.disasm || out.consts || out.strings);
+    return out;
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
 // ============ 安全执行原语 ============
 // 渲染层禁止再自行拼接 shell 命令（历史实现把文件路径/APK 内容插进 powershell/cmd 字符串，
 // 文件名或题目内容含引号/反引号/$(...) 即可逃逸注入）。统一改为主进程提供：

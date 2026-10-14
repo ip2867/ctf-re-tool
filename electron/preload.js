@@ -10,6 +10,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   detectFileType: (filePath) => ipcRenderer.invoke('detect-file-type', filePath),
   getFileInfo: (filePath) => ipcRenderer.invoke('get-file-info', filePath),
   extractApkSO: (apkPath) => ipcRenderer.invoke('extract-apk-so', apkPath),
+  // PYC 反汇编/常量提取（多后端回退，pycdc 失败也能出结果）
+  pycDecompile: (pycPath) => ipcRenderer.invoke('pyc-decompile', pycPath),
   selectFile: (filters) => ipcRenderer.invoke('select-file', filters),
   getFilePath: (file) => webUtils.getPathForFile(file),
 

@@ -3917,7 +3917,9 @@ function runFridaOnce(args, tempFile, opts) {
     const IDLE_WINDOW = Number(o.windowMs) > 0 ? Number(o.windowMs) : (Number(o.idleMs) > 0 ? Number(o.idleMs) : 60000);
     const HARD_CAP = Number(o.hardCapMs) > 0 ? Number(o.hardCapMs) : (Number(o.maxMs) > 0 ? Math.max(Number(o.maxMs), 120000) : 600000);
     let lastDataAt = Date.now();
-    let dataCount = 0;
+    let dataCount = 0;    // 关键数据条数（[DATA] + flag），用于收尾报告
+    let hitCount = 0;     // [HIT] 命中痕迹条数，用于收尾报告（噪音也提示"确实有输出"）
+    let chunkCount = 0;   // 收到的 stdout 数据块数
 
     const finish = (msg) => {
       if (settled) return;
@@ -3935,21 +3937,24 @@ function runFridaOnce(args, tempFile, opts) {
       lastDataAt = Date.now();
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
-        finish((stdout || stderr) + `\n[连续 ${Math.round(IDLE_WINDOW / 1000)}s 无新数据，抓取结束（共 ${dataCount} 条关键数据）]`);
+        finish((stdout || stderr) + `\n[连续 ${Math.round(IDLE_WINDOW / 1000)}s 无新数据，抓取结束（共 ${dataCount} 条关键数据、${hitCount} 条命中痕迹、${chunkCount} 个输出块）]`);
       }, IDLE_WINDOW);
     };
 
     child.stdout.on('data', (d) => {
       stdout += d.toString();
-      // 统计"关键数据"进度：脚本显式 [done] 仅在有数据后尊重
+      chunkCount++;
+      // 统计进度：[DATA]/flag 记为"关键数据"，[HIT] 记为"命中痕迹"，两者都进收尾报告
       const dataHits = (stdout.match(/\[DATA\]/g) || []).length;
       const hitHits = (stdout.match(/\[HIT\]/g) || []).length;
       const flagHit = /NCTF\{|flag\{|ctf\{/i.test(stdout);
-      const prev = dataCount;
       dataCount = dataHits + (flagHit ? 1 : 0);
-      // 有新的 [DATA]/flag → 重置滚动窗口（持续有数据就继续抓）
-      if (dataCount > prev || flagHit) bump();
-      // 脚本 [done]：仅在已经抓到过数据后才认，避免脚本过早收尾
+      hitCount = hitHits;
+      // 关键：滚动窗口按"任何新输出"续期（这才是"连续 N 秒无*任何*数据"的本意）。
+      // 旧逻辑只在 [DATA]/flag 出现时续期 —— 当输出全是 [HIT] 噪音或 send() 信息时，
+      // 窗口不续期，60s 后误报"共 0 条关键数据"直接收尾（实战踩坑）。
+      bump();
+      // 脚本 [done]：仅在已经抓到过"关键数据"后才认，避免脚本过早收尾
       if (/\[done\]/.test(stdout) && (dataHits > 0 || flagHit)) {
         finish(stdout + '\n[脚本主动收尾，frida 已停止]');
       }

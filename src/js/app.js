@@ -945,7 +945,7 @@ async function processUserMessage(message) {
 
   // 本地枚举假设（验证失败后的兜底也可手动触发）
   if (/^(枚举假设|跑假设|hypotheses)$/i.test(lowerMessage.trim())) {
-    await runHypotheses(state.lastAiText || '');
+    await runHypotheses(state.lastAiText || '', { synthFrom: state.lastVerifyContracts });
     return;
   }
 
@@ -2877,7 +2877,7 @@ ${String(historyText).substring(0, 5000)}
       const clean = String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000);
       addSolveNote('求解结果', clean);
       const vr = await runVerification(result.text);
-      if (vr && !vr.verified) await runHypotheses(result.text);
+      if (vr && !vr.verified) await runHypotheses(result.text, { synthFrom: vr.contracts });
       extractFlags(result.text).forEach(f => { recordFlag(f, 'ai', false); addSolveNote('Flag', f); });
       addSystemMessage(`**🎯 Web/JS 逆向分析结果**\n\n${result.text}`);
     } else if (result.success) {
@@ -2951,12 +2951,23 @@ Java.perform(function() {
     // ========== 2. Hook String.equals (字符串比较，必须降噪) ==========
     try {
         var String = Java.use("java.lang.String");
-        // 降噪：只保留"可能是校验"的比较，过滤 AndroidX/资源名等海量噪音
+        // 降噪：只保留"可能是校验"的比较。实测噪音：'Cipher'=='Cipher'、
+        // 'AES/CBC/PKCS5PADDING'==同串（算法名自比较）、以及各类框架串——必须排除。
+        // ⚠️ 顺序很关键：先判"明确有意义"（含 flag/key 语义或长 hex），再做噪音排除。
+        //    绝不能先按"自比较"一刀切 —— 否则 userInput.equals(正确flag) 这种
+        //    长度 ≤32 的**真实命中**会被误杀（那正是最该打印的一条）。
+        var NOISE = /^(Cipher|AES|DES|RSA|MD5|SHA[\\-0-9]*|Hmac[A-Za-z0-9]*)$/i;
+        function isAlgoName(s) { return /^[A-Za-z0-9]+\\/[A-Za-z0-9]+(\\/[A-Za-z0-9]+)?$/i.test(s) || NOISE.test(s); }
         function interesting(a, b) {
             a = a || ''; b = b || '';
-            if (/flag|ctf|key|secret|token|pass|stage|iv|\\{/i.test(a) || /flag|ctf|key|secret|token|pass|stage|iv|\\{/i.test(b)) return true;
+            var SEM = /flag|ctf|key|secret|token|pass|stage/i;
+            var meaningful = SEM.test(a) || SEM.test(b)
+                || /\\{/.test(a) || /\\{/.test(b)
+                || ((a.length >= 16 || b.length >= 16) && /^[0-9a-fA-F+/=]+$/.test(a || b));
+            if (meaningful) return true;                           // 有 flag/key 语义 → 一定打印
+            if (isAlgoName(a) && isAlgoName(b)) return false;      // 算法名之间的比较 → 噪音
+            if (a === b) return false;                             // 无语义的常量自比较 → 噪音
             if (a.length >= 6 && b.length >= 6 && Math.abs(a.length - b.length) <= 2) return true;
-            if ((a.length >= 16 || b.length >= 16) && /^[0-9a-fA-F+/=]+$/.test(a || b)) return true;
             return false;
         }
 
@@ -3644,7 +3655,9 @@ async function runHook() {
   const cryptoParams = pickCryptoParams();
   if (cryptoParams && cryptoParams.key && cryptoParams.ciphertext && !/__CTF_KNOWN/.test(scriptContent)) {
     scriptToRun = fridaSolvePreamble(cryptoParams) + '\n' + scriptContent;
-    addLog('info', '已向 Hook 注入进程内解密段（key/iv/密文来自已验证契约），将尝试直接解出 flag');
+    // 措辞如实：这些 key/iv/密文来自 AI 给出的 [VERIFY]/[HYPOTHESES] 契约，**未必已本地验证通过**
+    // （验证失败时也会注入，靠进程内多候选枚举碰运气）。不要谎称"已验证"。
+    addLog('info', '已向 Hook 注入进程内解密段（key/iv/密文来自 AI 契约，Hook 内会多候选尝试直接解出 flag）');
   }
 
   // 目标进程名解析：frida -n 匹配的是"进程名"（如 Hook My Secret），不是包名（com.x.y）。
@@ -3708,7 +3721,19 @@ async function runHook() {
   addLog('info', '正在执行Frida Hook（滚动窗口：每来数据续 60s，连续 60s 无数据才结束）...');
   // 手动 Hook 用滚动窗口：你在模拟器里操作 App 时，只要 Hook 有数据产出就持续续期，
   // 不会因为你操作慢而被硬停；连续 60s 无数据才收尾（绝对上限 10 分钟防挂死）。
-  const result = await window.electronAPI.runFridaHook(scriptToRun, target, { windowMs: 60000, hardCapMs: 600000 });
+  // 【关键】同时自动驱动界面：否则 App 停在首页，手势/输入触发的校验代码永不执行，
+  // 只能抓到启动噪音（本次实战教训：手动 Hook 只抓到 String.equals 噪音、0 条关键数据）。
+  const hookPkg = (state.fileType === 'APK') ? pkg : null;
+  const drivePromise = hookPkg ? (async () => {
+    try {
+      await sleepMs(5000);
+      addLog('info', '开始自动驱动界面（与 Hook 并行，触发真实校验路径）...');
+      const log = await driveAppIteratively(hookPkg, 45000);
+      addLog('success', `界面驱动完成：${log.length} 个动作 → ${log.join(' | ')}`);
+    } catch (e) { addLog('warning', '界面驱动失败（不影响 Hook 抓取）: ' + e.message); }
+  })() : Promise.resolve();
+  const hookPromise = window.electronAPI.runFridaHook(scriptToRun, target, { windowMs: 60000, hardCapMs: 600000 });
+  const [result] = await Promise.all([hookPromise, drivePromise]);
   if (result && result.success) {
     const output = result.output || '无输出';
     // 直接从输出收割脚本打印的 [FLAG]（进程内解密成功的最硬证据）
@@ -4321,6 +4346,11 @@ function normalizeCrypto(c) {
   if (keyArr) { out.key = keyArr.map(x => (x & 0xff).toString(16).padStart(2, '0')).join(''); out.key_encoding = 'hex'; }
   const ivArr = pick16(c.iv, c.iv_encoding);
   if (ivArr && ivArr.length === 16) { out.iv = ivArr.map(x => (x & 0xff).toString(16).padStart(2, '0')).join(''); out.iv_encoding = 'hex'; }
+  else if (c.iv) {
+    // 没能归一成 16B：不要丢！原样带上（preamble 会再枚举 IV 候选/回退 ECB），
+    // 否则 Hook 端拿不到 iv 会直接放弃（"cbc 需要 16 字节 IV，实际 0"）。
+    out.iv = String(c.iv); out.iv_encoding = c.iv_encoding || '';
+  }
   return out;
 }
 
@@ -4335,6 +4365,19 @@ function fridaSolvePreamble(crypto) {
   return `// ==== ctf-tool: in-process flag decryptor (auto-injected) ====
 var __CTF_KNOWN = { key: ${j(c.key)}, keyEnc: ${j(c.key_encoding || 'ascii')}, iv: ${j(c.iv)}, ct: ${j(c.ciphertext)}, enc: ${j(c.encoding || 'base64')}, ivEnc: ${j(c.iv_encoding || '')}, algo: ${j(c.algo || 'aes_cbc')} };
 var __CTF_DONE = false;
+var __CTF_TRIES = 0;
+function emitSafe(m){ try { send(m); } catch(e){} }
+function __ctfArr(bytes){ try { var a=[]; for (var i=0;i<bytes.length;i++) a.push(bytes[i]); return a; } catch(e){ return null; } }
+function __ctfSlice(arr, a, b){ try { var o=[]; for (var i=a;i<b && i<arr.length;i++) o.push(arr[i]); return o; } catch(e){ return null; } }
+function __ctfLooksText(s){
+  try {
+    if (!s || s.length < 3) return false;
+    s = String(s);
+    var ok = 0, tot = Math.min(s.length, 64);
+    for (var i=0;i<tot;i++){ var c = s.charCodeAt(i); if ((c>=32 && c<127) || c===9 || c===10 || c===13 || c>127) ok++; }
+    return (ok / tot) >= 0.8;
+  } catch(e){ return false; }
+}
 function __ctfToBytes(s, enc){
   try {
     if (s == null) return null;
@@ -4348,28 +4391,69 @@ function __ctfDecrypt(tag){
   if (__CTF_DONE) return;
   if (!__CTF_KNOWN.key || !__CTF_KNOWN.ct) return;
   try {
-    var keyB = __ctfToBytes(__CTF_KNOWN.key, __CTF_KNOWN.keyEnc || 'ascii');
     var ctB  = __ctfToBytes(__CTF_KNOWN.ct, __CTF_KNOWN.enc || 'base64');
-    if (!keyB || !ctB) return;
+    if (!ctB) return;
     var algo = String(__CTF_KNOWN.algo || 'aes_cbc').toLowerCase();
-    var mode = algo.indexOf('ecb') >= 0 ? 'AES/ECB/PKCS5Padding' : 'AES/CBC/PKCS5Padding';
-    var C = Java.use('javax.crypto.Cipher').getInstance(mode);
-    var kSpec = Java.use('javax.crypto.spec.SecretKeySpec').$new(Java.array('byte', keyB), 'AES');
-    var ivB = __ctfToBytes(__CTF_KNOWN.iv, __CTF_KNOWN.ivEnc || '');
-    if (mode.indexOf('CBC') >= 0) {
-      if (ivB && ivB.length === 16) C.init(2, kSpec, Java.use('javax.crypto.spec.IvParameterSpec').$new(Java.array('byte', ivB)));
-      else { send('[!] cbc 需要 16 字节 IV，实际 ' + (ivB ? ivB.length : 0)); return; }
-    } else { C.init(2, kSpec); }
-    var s = String(Java.use('java.lang.String').$new(C.doFinal(Java.array('byte', ctB))));
-    send('[DATA] (' + tag + ') DECRYPTED = ' + s);
-    if (/NCTF\\{|flag\\{|ctf\\{/i.test(s)) { __CTF_DONE = true; send('[FLAG]' + s + '[/FLAG]'); }
-  } catch(e) { send('[!] decrypt(' + tag + '): ' + e); }
+    // 密钥候选：主编码 + 原文 + 哈希派生（对齐 Python 侧 key_candidates），任一解出 flag 即止
+    var keyCands = [];
+    var k0 = __ctfToBytes(__CTF_KNOWN.key, __CTF_KNOWN.keyEnc || 'ascii');
+    if (k0) keyCands.push(k0);
+    var kRaw = __ctfToBytes(__CTF_KNOWN.key, 'ascii');
+    if (kRaw) keyCands.push(kRaw);
+    function __ctfHash(name, arr){ try { var MD = Java.use('java.security.MessageDigest').getInstance(name); return __ctfArr(MD.digest(Java.array('byte', arr))); } catch(e){ return null; } }
+    if (k0) { var m5 = __ctfHash('MD5', k0); if (m5) keyCands.push(m5); var s2 = __ctfHash('SHA-256', k0); if (s2) keyCands.push(s2); }
+    // IV 候选：给定(16B) → 全零 → 密文首块 → 前置IV(解 ct[16:]) → 无(ECB)
+    var ivCands = [];
+    var iv0 = __ctfToBytes(__CTF_KNOWN.iv, __CTF_KNOWN.ivEnc || '');
+    var Z16 = []; for (var z=0; z<16; z++) Z16.push(0);
+    var Z8 = []; for (var z8=0; z8<8; z8++) Z8.push(0);
+    var blk = (algo.indexOf('des') >= 0 && algo.indexOf('des3') < 0) ? 8 : 16;
+    var ZB = blk === 8 ? Z8 : Z16;
+    if (iv0 && iv0.length === blk) ivCands.push(iv0);
+    ivCands.push(null);                                   // ECB
+    ivCands.push(ZB);                                     // 零 IV
+    if (ctB.length > blk) { ivCands.push(__ctfSlice(ctB,0,blk)); }
+    var emitted = false;
+    for (var ci=0; ci<keyCands.length && !emitted; ci++) {
+      var keyB = keyCands[ci];
+      for (var vi=0; vi<ivCands.length && !emitted; vi++) {
+        var ivB = ivCands[vi];
+        var body = ctB;
+        var useMode = null;
+        try {
+          if (algo.indexOf('ecb') >= 0) { useMode = 'AES/ECB/PKCS5Padding'; }
+          else if (ivB) { useMode = (blk === 8 ? 'DES/CBC/PKCS5Padding' : 'AES/CBC/PKCS5Padding'); }
+          else { useMode = (blk === 8 ? 'DES/ECB/PKCS5Padding' : 'AES/ECB/PKCS5Padding'); }
+          var C = Java.use('javax.crypto.Cipher').getInstance(useMode);
+          var kAlg = (blk === 8 ? 'DES' : 'AES');
+          var kSpec = Java.use('javax.crypto.spec.SecretKeySpec').$new(Java.array('byte', keyB), kAlg);
+          if (useMode.indexOf('CBC') >= 0) C.init(2, kSpec, Java.use('javax.crypto.spec.IvParameterSpec').$new(Java.array('byte', ivB)));
+          else C.init(2, kSpec);
+          var s = String(Java.use('java.lang.String').$new(C.doFinal(Java.array('byte', body))));
+          // 过滤乱码：至少含可打印 ASCII 比例，避免把"错误IV"的乱码当结果刷屏
+          if (__ctfLooksText(s)) {
+            emitSafe('[DATA] (' + tag + ') DECRYPTED = ' + s);
+            emitted = true;
+            if (/NCTF\\{|flag\\{|ctf\\{/i.test(s)) { __CTF_DONE = true; emitSafe('[FLAG]' + s + '[/FLAG]'); }
+          }
+        } catch(e) { /* 该组合不可用，继续下一个候选 */ }
+      }
+    }
+    if (!emitted && __CTF_TRIES <= 1) emitSafe('[!] 进程内解密未命中（key/iv/模式候选均失败）；将靠被动 hook 抓取');
+  } catch(e) { emitSafe('[!] decrypt(' + tag + '): ' + e); }
 }
 if (typeof Java !== 'undefined' && Java.available) {
   Java.perform(function () {
     __ctfDecrypt('bootstrap');
-    // 周期性重试：脚本可能稍后才拿到运行时参数（Hook 捕获）或注入的已知参数
-    if (!__CTF_DONE) setInterval(function () { try { __ctfDecrypt('tick'); } catch(e){} }, 3000);
+    // 周期性重试：脚本可能稍后才拿到运行时参数（Hook 捕获）或注入的已知参数。
+    // 但**不无脑刷屏**：最多重试 4 次（约 12s），且同样的 key/iv/模式不会重复打印错误。
+    if (!__CTF_DONE) {
+      var __ctfTick = setInterval(function () {
+        __CTF_TRIES++;
+        try { __ctfDecrypt('tick'); } catch(e){}
+        if (__CTF_DONE || __CTF_TRIES >= 4) clearInterval(__ctfTick);
+      }, 3000);
+    }
   });
 }
 // ==== end auto-injected decryptor ====
@@ -4896,9 +4980,20 @@ ${mcpCache.nativeIntel.decompiled && mcpCache.nativeIntel.decompiled.length ? '�
   }
   await caseAddEvidence('frida', 'Frida Hook 脚本（自动生成）', script, 'js');
 
-  // 4. spawn 拉起 APP 并注入 Hook，同时**并行驱动界面**（关键：否则 App 停在首页，
+  // 4. 拉起 APP 并注入 Hook，同时**并行驱动界面**（关键：否则 App 停在首页，
   //    手势/输入框触发的校验代码永不执行，Hook 抓到的全是启动噪音）。
-  addLog('info', `以 spawn 模式拉起 ${packageName} 并注入 Hook，同时自动驱动界面（抓取约 25s）...`);
+  //    枚举可用 → 用 spawn -f（能在启动期就挂上 hook）；
+  //    枚举不可用（NPE）→ -f 必然失败，直接用 adb 拉起 + 按 PID attach（省掉一次注定失败的往返）。
+  let hookTarget = 'spawn:' + packageName;
+  if (!fridaCompat) {
+    addLog('info', `枚举不可用：改用「adb 拉起 + 按 PID attach」模式执行 Hook（目标 ${packageName}）`);
+    try {
+      await window.electronAPI.adbCommand(`shell monkey -p ${packageName} -c android.intent.category.LAUNCHER 1`);
+      await sleepMs(2500);
+    } catch (e) { /* 拉起失败仍可让主进程再兜底 */ }
+    hookTarget = packageName;
+  }
+  addLog('info', `注入 Hook 到 ${hookTarget}，同时自动驱动界面（抓取约 25s）...`);
 
   // 4a. 迭代式驱动界面（每轮 dump→操作→再dump），与 Hook 并行；
   //     让界面触发的校验代码真正执行（否则 App 停在首页，Hook 只抓到启动噪音）。
@@ -4916,7 +5011,7 @@ ${mcpCache.nativeIntel.decompiled && mcpCache.nativeIntel.decompiled.length ? '�
   // 4b. 同时执行 Frida Hook（阻塞至命中/超时）
   // 抓取窗口必须长于 UI 驱动（5s 启动 + 30s 驱动），否则等校验真正发生时窗口已关闭。
   // 用滚动窗口：每来一条数据就续 60s，持续有数据就一直抓；连续 60s 无数据才收尾。
-  const hookPromise = window.electronAPI.runFridaHook(script, 'spawn:' + packageName, { windowMs: 60000, hardCapMs: 600000 });
+  const hookPromise = window.electronAPI.runFridaHook(script, hookTarget, { windowMs: 60000, hardCapMs: 600000 });
 
   const [run] = await Promise.all([hookPromise, drivePromise]);
   if (!run || !run.success) {
@@ -4976,7 +5071,7 @@ ${state.lastAiText ? `## 此前静态分析结论（节选）\n${String(state.la
       state.lastAiText = result.text;
       await harvestExperience(result.text);
       const vr = await runVerification(result.text);
-      if (vr && !vr.verified) await runHypotheses(result.text);
+      if (vr && !vr.verified) await runHypotheses(result.text, { synthFrom: vr.contracts });
       const flags = extractFlags(result.text);
       if (!vr) flags.forEach(f => recordFlag(f, 'frida', false));
       flags.forEach(f => addSolveNote('Flag(动态)', f));
@@ -5327,7 +5422,7 @@ ${otherClassesText}
 
       // 验证闭环 + 失败时本地枚举兜底
       const vr = await runVerification(result.text);
-      if (vr && !vr.verified) await runHypotheses(result.text);
+      if (vr && !vr.verified) await runHypotheses(result.text, { synthFrom: vr.contracts });
       const flags = extractFlags(result.text);
       if (!vr) flags.forEach(f => recordFlag(f, 'ai', false));
       flags.forEach(f => addSolveNote('Flag', f));
@@ -5452,7 +5547,7 @@ ${mcpCache.nativeIntel.globals && mcpCache.nativeIntel.globals.length ? `\n## SO
       addSolveNote('求解结果(Tool-Use)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
       await harvestExperience(result.text);
       const vr = await runVerification(result.text);
-      if (vr && !vr.verified) await runHypotheses(result.text);
+      if (vr && !vr.verified) await runHypotheses(result.text, { synthFrom: vr.contracts });
       extractFlags(result.text).forEach(f => { recordFlag(f, 'ai-deep', false); addSolveNote('Flag', f); });
 
       const verifiedFlags = (state.findings ? state.findings.flags : []).filter(f => f.verified);
@@ -5849,7 +5944,7 @@ ${globalsText}
 
       // 验证闭环 + 失败时本地枚举兜底
       const vr = await runVerification(result.text);
-      if (vr && !vr.verified) await runHypotheses(result.text);
+      if (vr && !vr.verified) await runHypotheses(result.text, { synthFrom: vr.contracts });
       const flags = extractFlags(result.text);
       if (!vr) flags.forEach(f => recordFlag(f, 'ai', false));
       flags.forEach(f => addSolveNote('Flag', f));
@@ -5945,7 +6040,7 @@ ${analysisData.strings ? `\n## 关键字符串\n${typeof analysisData.strings ==
       addSolveNote('求解结果(Tool-Use)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
       await harvestExperience(result.text);
       const vr = await runVerification(result.text);
-      if (vr && !vr.verified) await runHypotheses(result.text);
+      if (vr && !vr.verified) await runHypotheses(result.text, { synthFrom: vr.contracts });
       extractFlags(result.text).forEach(f => { recordFlag(f, 'ai-deep', false); addSolveNote('Flag', f); });
       const vf = (state.findings ? state.findings.flags : []).filter(f => f.verified);
       addSystemMessage(`**🎯 Tool-Use 深度求解结果**\n\n${vf.length ? `**Flag（✅已验证）**: \`${vf[0].flag}\`` : ''}\n\n${result.text}`);
@@ -6596,6 +6691,122 @@ def printable(b):
         pass
     return b.hex()
 
+def _unpad(b):
+    """剥掉 PKCS#5/#7 尾部填充（1~16 且末 n 字节都等于 n），让"带填充的正确明文"
+    在打分时不被误判为不可打印（否则 ECB 候选会因尾部 0x05 得 0 分而输给错误候选）。"""
+    if not b:
+        return b
+    n = b[-1]
+    if 1 <= n <= 16 and len(b) >= n and b[-n:] == bytes([n]) * n:
+        return b[:-n]
+    return b
+
+def _pt_score(b):
+    """给一个解密结果打分，用于在"多候选"里挑最像 flag 的那个（4=flag 形态，0=不可打印）。
+    注意：CBC 用错 IV 时**只有第 1 块被打乱**，第 2 块起仍是正确明文（flag 常跨块出现），
+    因此不能要求"整段全可打印"，否则会把"错 IV 但含 flag"的候选误判为 0 分丢弃。
+    故：先在原始字节上找 flag 形态（最高优先），再用"可打印比例"给一般结果打分。"""
+    if not b:
+        return 0
+    ub = _unpad(b)
+    if FLAG_RE.search(ub):
+        return 4
+    try:
+        t = ub.decode("utf-8", "replace")
+    except Exception:
+        return 0
+    tot = len(t)
+    if tot == 0:
+        return 0
+    ok = sum(1 for ch in t if ch.isprintable() or ch in "\\r\\n\\t")
+    if (ok / tot) < 0.85:
+        return 0
+    if "{" in t and "}" in t:
+        return 3
+    if any(x in t.lower() for x in ("flag", "ctf", "key=", "secret")):
+        return 2
+    return 1
+
+def key_candidates(spec, ke):
+    """密钥候选：显式编码解出的字节 + 原文 lating-1 + AES 长度兜底(md5/sha256/零填充)。
+    解决"AI 给的 key 不是 16/24/32 字节（如口令）"导致 AES 直接抛错的情况。"""
+    import hashlib
+    out = []
+    try:
+        base = to_bytes(spec or "", ke)
+    except Exception:
+        base = b""
+    if base:
+        out.append(base)
+    try:
+        raw = str(spec).encode("latin-1", "replace")
+    except Exception:
+        raw = b""
+    if raw and raw not in out:
+        out.append(raw)
+    src = base or raw
+    if src:
+        try:
+            out.append(hashlib.md5(src).digest())
+        except Exception:
+            pass
+        try:
+            out.append(hashlib.sha256(src).digest()[:32])
+        except Exception:
+            pass
+        if len(src) < 16:
+            out.append(src + b"\\x00" * (16 - len(src)))
+    seen = set()
+    uniq = []
+    for b in out:
+        if b and b not in seen:
+            seen.add(b)
+            uniq.append(b)
+    return uniq
+
+def dec_cbc_multi(d, k, ivb, decfn, block, ecbfn=None):
+    """CBC 多候选解密：IV 缺失/给错时枚举 全零IV / 密文首块当IV / 前置IV(解 d[block:] 用 d[:block])；
+    CBC 全失败再回退 ECB。返回得分最高的明文（flag 形态优先），全失败返回 b""。
+    解决"契约没给 iv（或给了非块长）→ 单个契约必然无命中"的通用坑。"""
+    best = None
+    bestsc = -1
+    cands = []
+    if ivb and len(ivb) == block:
+        cands.append((ivb, d))
+    cands.append((b"\\x00" * block, d))
+    if len(d) > block:
+        cands.append((d[:block], d))
+        cands.append((d[:block], d[block:]))       # 前置IV 模式：密文 = IV || body
+    if len(d) >= 2 * block:
+        cands.append((d[-block:], d))
+    for iv, dd in cands:
+        try:
+            out = decfn(dd, k, "cbc", iv)
+        except Exception:
+            continue
+        sc = _pt_score(out)
+        if sc > bestsc:
+            bestsc = sc
+            best = out
+        if sc >= 4:
+            return out
+    if ecbfn:
+        try:
+            out = ecbfn(d, k, "ecb")
+            sc = _pt_score(out)
+            if sc > bestsc:
+                bestsc = sc
+                best = out
+        except Exception:
+            pass
+    return best if best is not None else b""
+
+def dec_aes_cbc_multi(d, k, ivb):
+    return dec_cbc_multi(d, k, ivb, dec_aes, 16, ecbfn=dec_aes)
+
+def dec_des_cbc_multi(d, k, ivb):
+    return dec_cbc_multi(d, k, ivb, dec_des, 8, ecbfn=dec_des)
+
 def run_one(i, a):
     algo = str(a.get("algo", "custom")).lower()
     ct = to_bytes(a.get("ciphertext", ""), a.get("encoding", "hex"))
@@ -6609,69 +6820,69 @@ def run_one(i, a):
         keyencs = ["ascii"]
     outs = []
     for ke in keyencs:
-        try:
-            k = to_bytes(keyspec or "", ke)
-            if algo == "custom":
-                ns = {}
-                exec(a["code"], ns)
-                # 契约语义歧义兜底：AI 写的 decrypt(data,key) 通常期望"原始字符串"
-                # （自己在函数内 base64.b64decode），而工具曾按已解码 bytes 传入 ->
-                # 双重解码/str.encode 报错。这里先传原始字符串，失败再回退 bytes。
-                raw_ct = a.get("ciphertext", "")
-                raw_key = "" if keyspec is None else str(keyspec)
-                try:
-                    out = ns["decrypt"](raw_ct, raw_key)
-                except Exception:
-                    out = ns["decrypt"](ct, k)
-            elif algo == "xor":
-                out = dec_xor(ct, k)
-            elif algo == "rc4":
-                out = dec_rc4(ct, k)
-            elif algo == "tea":
-                out = dec_tea(ct, k, a.get("variant") == "be32")
-            elif algo == "xtea":
-                out = dec_xtea(ct, k, a.get("variant") == "be32")
-            elif algo == "xxtea":
-                out = dec_xxtea(ct, k, a.get("variant") == "be32")
-            elif algo == "aes_ecb":
-                out = dec_aes(ct, k, "ecb")
-            elif algo == "aes_cbc":
-                # IV 用独立编码（iv_encoding），默认自适应：显式 hex 或"看起来是hex"按 hex，否则按原文。
-                # 注意：不能借用 key 的编码 ke —— 契约里 iv 可能是明文（如 ExampleVector123），
-                # 若 ciphertext 是 base64 会导致 iv 被误当 base64 解出错误长度而报 Incorrect IV length。
-                out = dec_aes(ct, k, "cbc", iv_bytes(a))
-            elif algo == "des_ecb":
-                out = dec_des(ct, k, "ecb")
-            elif algo == "des_cbc":
-                out = dec_des(ct, k, "cbc", iv_bytes(a))
-            elif algo == "des3_ecb":
-                out = dec_des3(ct, k)
-            elif algo == "sm4_ecb":
-                out = dec_sm4(ct, k)
-            elif algo in ("chacha20", "chacha20_ietf", "chacha20_original", "salsa20"):
-                # ChaCha20：key 32B，nonce 12B(IETF)/8B(original)。
-                # iv 字段可能给 12B nonce，或 16B「nonce(12B)+counter(4B)」（本项目约定）。
-                # counter 初值常非 0（本题=1）且大小端易错 → 交给 dec_chacha20_try 枚举候选。
-                ivb = iv_bytes(a)
-                ctr = a.get("counter")
-                out = dec_chacha20_try(ct, k, ivb, ctr)
-            elif algo == "base64":
-                out = dec_b64(ct)
-            elif algo == "base64_custom":
-                out = dec_b64(ct, a.get("table"))
-            elif algo == "node_js":
-                out = dec_node_js(a.get("code", ""), a.get("input", a.get("ciphertext", "")))
-            else:
-                outs.append((ke, "unknown algo " + algo)); continue
-        except Exception as e:
-            outs.append((ke, "ERR: " + str(e)[:120])); continue
-        pt = printable(out)
-        outs.append((ke, pt))
-        m = FLAG_RE.search(out)
-        hit = (exp and exp in pt.lower()) or bool(m)
-        if hit:
-            fl = m.group(0).decode("utf-8", "ignore") if m else exp
-            print("[HIT] attempt=%d keyenc=%s algo=%s flag=%s" % (i, ke, algo, fl))
+        kcands = key_candidates(keyspec, ke) or [b""]
+        for k in kcands:
+            try:
+                if algo == "custom":
+                    ns = {}
+                    exec(a["code"], ns)
+                    # 契约语义歧义兜底：AI 写的 decrypt(data,key) 通常期望"原始字符串"
+                    # （自己在函数内 base64.b64decode），而工具曾按已解码 bytes 传入 ->
+                    # 双重解码/str.encode 报错。这里先传原始字符串，失败再回退 bytes。
+                    raw_ct = a.get("ciphertext", "")
+                    raw_key = "" if keyspec is None else str(keyspec)
+                    try:
+                        out = ns["decrypt"](raw_ct, raw_key)
+                    except Exception:
+                        out = ns["decrypt"](ct, k)
+                elif algo == "xor":
+                    out = dec_xor(ct, k)
+                elif algo == "rc4":
+                    out = dec_rc4(ct, k)
+                elif algo == "tea":
+                    out = dec_tea(ct, k, a.get("variant") == "be32")
+                elif algo == "xtea":
+                    out = dec_xtea(ct, k, a.get("variant") == "be32")
+                elif algo == "xxtea":
+                    out = dec_xxtea(ct, k, a.get("variant") == "be32")
+                elif algo == "aes_ecb":
+                    out = dec_aes(ct, k, "ecb")
+                elif algo == "aes_cbc":
+                    # IV 用独立编码（iv_encoding），默认自适应；关键：**IV 缺失/给错时不直接失败**，
+                    # 而是枚举 IV 候选（全零/密文首块/前置IV）并回退 ECB —— 否则"单契约缺 iv"必然无命中。
+                    out = dec_aes_cbc_multi(ct, k, iv_bytes(a))
+                elif algo == "des_ecb":
+                    out = dec_des(ct, k, "ecb")
+                elif algo == "des_cbc":
+                    out = dec_des_cbc_multi(ct, k, iv_bytes(a))
+                elif algo == "des3_ecb":
+                    out = dec_des3(ct, k)
+                elif algo == "sm4_ecb":
+                    out = dec_sm4(ct, k)
+                elif algo in ("chacha20", "chacha20_ietf", "chacha20_original", "salsa20"):
+                    # ChaCha20：key 32B，nonce 12B(IETF)/8B(original)。
+                    # iv 字段可能给 12B nonce，或 16B「nonce(12B)+counter(4B)」（本项目约定）。
+                    # counter 初值常非 0（本题=1）且大小端易错 → 交给 dec_chacha20_try 枚举候选。
+                    ivb = iv_bytes(a)
+                    ctr = a.get("counter")
+                    out = dec_chacha20_try(ct, k, ivb, ctr)
+                elif algo == "base64":
+                    out = dec_b64(ct)
+                elif algo == "base64_custom":
+                    out = dec_b64(ct, a.get("table"))
+                elif algo == "node_js":
+                    out = dec_node_js(a.get("code", ""), a.get("input", a.get("ciphertext", "")))
+                else:
+                    outs.append((ke, "unknown algo " + algo)); break
+            except Exception as e:
+                outs.append((ke, "ERR: " + str(e)[:120])); continue
+            pt = printable(out)
+            outs.append((ke, pt))
+            m = FLAG_RE.search(out)
+            hit = (exp and exp in pt.lower()) or bool(m) or _pt_score(out) >= 4
+            if hit:
+                fl = m.group(0).decode("utf-8", "ignore") if m else exp
+                print("[HIT] attempt=%d keyenc=%s algo=%s flag=%s" % (i, ke, algo, fl))
     for ke, pt in outs:
         print("[OUT] attempt=%d keyenc=%s: %s" % (i, ke, pt[:400]))
 
@@ -7015,17 +7226,75 @@ async function runVerification(aiText) {
     }
   } catch (e) { /* 交叉校验失败不阻断主流程 */ }
 
-  return { verified: flagHits.length > 0, intermediateVerified: verified, hits: r.hits, flagHits, cross, verdict };
+  return { verified: flagHits.length > 0, intermediateVerified: verified, hits: r.hits, flagHits, cross, verdict, contracts };
+}
+
+// 【举一反三】AI 没给 [HYPOTHESES] 契约时，工具**自己合成**候选矩阵，而不是只打一句
+// "未找到 [HYPOTHESES] 契约"就放弃（正是"单契约复现失败后原地卡死"的根因）。
+// 依据已解析的 [VERIFY] 契约（key/iv/ciphertext/algo），枚举 CTF 中最常见的歧义维度：
+//   · 密钥编码：ascii / hex / base64
+//   · 模式：CBC / ECB
+//   · IV：给的 / 全零 / 密文首块 / 前置IV（CBC 侧在 Python solver 内自动枚举）
+//   · 算法族兜底：algo 给了 aes_cbc 时一并试 aes_ecb / des_cbc / rc4 / xor 等
+//   · 附加：RSA 小指数、base64 直接解等"零 key"尝试
+// 全部交给同一份本地求解器跑，命中即记为已验证 flag。
+function synthesizeHypotheses(contracts) {
+  const base = (Array.isArray(contracts) ? contracts : []).filter(c => c && c.ciphertext);
+  if (!base.length) return [];
+  const hexLike = (s) => /^[0-9a-fA-F]+$/.test(String(s || '')) && String(s).length % 2 === 0;
+  const b64Like = (s) => /^[A-Za-z0-9+/]+={0,2}$/.test(String(s || '')) && String(s).length % 4 === 0;
+  const dims = [];
+  for (const c of base.slice(0, 6)) {
+    const algo = String(c.algo || '').toLowerCase();
+    const variants = [algo];
+    // 算法族扩展：同一份 key/密文常能换个模式/同族算法解出
+    if (/aes_cbc/.test(algo)) variants.push('aes_ecb');
+    if (/aes_ecb/.test(algo)) variants.push('aes_cbc');
+    if (/des_cbc/.test(algo)) variants.push('des_ecb');
+    if (/des_ecb/.test(algo)) variants.push('des_cbc');
+    if (/chacha/.test(algo)) variants.push('chacha20_ietf', 'chacha20_original');
+    if (/^[a-z0-9_]*_cbc$/.test(algo)) variants.push(algo.replace('_cbc', '_ecb'));
+    if (/^[a-z0-9_]*_ecb$/.test(algo)) variants.push(algo.replace('_ecb', '_cbc'));
+    // 密钥编码候选：AI 声明的优先，但**不盲信**——密钥形态像 hex/base64 时一并试，
+    // 因为 AI 常把 hex 密钥标成 ascii（反之亦然），这是"单契约必然失败"的高频根因。
+    const declared = c.key_encoding ? [c.key_encoding] : [];
+    const guessed = [];
+    if (hexLike(c.key)) guessed.push('hex');
+    if (b64Like(c.key)) guessed.push('base64');
+    guessed.push('ascii', 'hex', 'base64');
+    const keyEncs = [...new Set(declared.concat(guessed))];
+    for (const ke of keyEncs) {
+      for (const a of variants) {
+        dims.push(Object.assign({}, c, { algo: a, key_encoding: ke }));
+      }
+    }
+  }
+  // 去重（algo+key_encoding+key+密文前缀 相同视为同一尝试）
+  const seen = new Set();
+  const out = [];
+  for (const d of dims) {
+    const k = [d.algo, d.key_encoding, String(d.key || ''), String(d.ciphertext || '').slice(0, 40)].join('|');
+    if (seen.has(k)) continue;
+    seen.add(k); out.push(d);
+    if (out.length >= 24) break;
+  }
+  return out;
 }
 
 // 本地枚举：解析 [HYPOTHESES] → 并行尝试全部组合 → 命中即记
 async function runHypotheses(aiText, opts = {}) {
   let attempts = Array.isArray(aiText) ? aiText : parseHypotheses(aiText);
+  if (!attempts.length && Array.isArray(opts.synthFrom)) {
+    // 无 [HYPOTHESES] 契约 → 工具自行合成候选矩阵（举一反三，避免原地卡死）
+    attempts = synthesizeHypotheses(opts.synthFrom);
+    if (attempts.length) addLog('info', `[本地枚举] AI 未给 [HYPOTHESES]，工具自动合成 ${attempts.length} 组候选（算法/编码/模式变体）...`);
+  }
   if (!attempts.length) {
-    addLog('warning', '[本地枚举] 未找到 [HYPOTHESES] 契约（AI 需按输出契约给出候选组合）');
+    addLog('warning', '[本地枚举] 无可枚举候选（AI 未给 [HYPOTHESES]，且缺少可合成的密文契约）');
     return null;
   }
-  if (attempts.length > 16) attempts = attempts.slice(0, 16);
+  const cap = opts.synthFrom ? 24 : 16;
+  if (attempts.length > cap) attempts = attempts.slice(0, cap);
   addLog('info', `[本地枚举] ${attempts.length} 个候选组合（算法/密钥/字节序）...`);
   const r = await runContractScript(attempts);
   if (r.output) caseAddEvidence('hypotheses', '假设枚举输出', r.output, 'log');

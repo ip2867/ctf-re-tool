@@ -1,4 +1,4 @@
-# CTF-RE-TOOL v1.3.6
+# CTF-RE-TOOL v1.3.7
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -307,6 +307,21 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 
 ## 更新日志
+
+### v1.3.7 (2026-10-14) — 验证闭环与 Hook 出 flag 的通用性修复
+本次用运行中的模拟器 + 真实 CrackMe 题复现，修掉一批"单契约失败即卡死 / Frida 抓到噪音却报 0 条"的通用缺陷：
+
+- **验证闭环：本地枚举不再"没契约就放弃"**（举一反三）。过去 AI 只给 1 个 `[VERIFY]` 契约、没给 `[HYPOTHESES]` 时，复现失败就打一句"未找到 [HYPOTHESES] 契约"原地卡死。现新增 `synthesizeHypotheses()`：工具**自己合成候选矩阵**（算法族 CBC↔ECB、密钥编码 ascii/hex/base64 **不盲信 AI 声明**、chacha 变体），最多 24 组本地并行跑，命中即记为已验证 flag。
+- **AES/DES-CBC 缺 IV 不再必然失败**。求解器新增 `dec_cbc_multi()`：IV 缺失/给错时枚举 **全零 IV / 密文首块当 IV / 前置 IV（密文 = IV∥body）**，CBC 全试完再**回退 ECB**；并按"flag 形态优先"给候选打分（新增 `_pt_score`/`_unpad`，剥掉 PKCS#5 填充后再判定可打印性，避免"带填充的正确明文"输给错误候选）。
+- **密钥长度不合法不再直接抛错**。新增 `key_candidates()`：AI 给的 key 不是 16/24/32 字节（如口令）时，额外尝试 **MD5 / SHA-256 派生 / 零填充**候选（Electron 注入段同步实现）。
+- **Hook 进程内解密段（`fridaSolvePreamble`）同步升级**：同样枚举 **key 候选 × IV 候选 × 模式**，IV 不合法时不再打印"cbc 需要 16 字节 IV"后永久放弃，而是继续试零 IV / ECB；且**最多重试 4 次**（约 12s）后停止，不再每 3s 刷同一条错误（此前刷了 25 行噪音）。
+- **修复"抓到一堆输出却报『共 0 条关键数据』"（关键）**：滚动窗口旧逻辑只在出现 `[DATA]`/flag 时才续期；当 Hook 输出全是 `[HIT]` 命中痕迹或 `send()` 信息时窗口不续期，60s 后误报"0 条关键数据"直接收尾，且把真实输出判成"无数据"。现改为**任何新输出都续期**，收尾报告同时给出"关键数据 / 命中痕迹 / 输出块"三个计数。
+- **枚举不可用时不再走注定失败的 spawn**：`frida-ps` 报 `queryIntentActivities` NPE 时，`spawn -f` 必然失败；现 `autoFridaStage` 直接改为 **adb 拉起 + 按 PID attach**，省掉一次注定失败的往返。
+- **手动「运行Hook」也自动驱动界面**：此前手动 Hook 只 attach 不驱动 UI，App 停在首页 → 校验代码永不执行 → 只能抓到启动噪音（与自动阶段的差距）。现与自动阶段一致，并行 `driveAppIteratively` 触发真实校验路径。
+- **String.equals 降噪增强**：过滤 `'Cipher'=='Cipher'`、`'AES/CBC/PKCS5PADDING'==同串` 这类**算法名自比较**噪音。
+  - ⚠️ 复审修正：降噪判定顺序必须"先判有意义、再排噪音"——否则 `userInput.equals(正确flag)` 这种**长度 ≤32 的真实命中**会被自比较规则误杀（那正是最该打印的一条）。已修正并加回归测试。
+- **复审额外修正**：`_pt_score` 由"整段必须全可打印"改为**按可打印比例** + 原始字节上优先找 flag 形态——因为 CBC 用错 IV 时**只有第 1 块被打乱，第 2 块起仍是正确明文**（flag 常在第 2 块），严格模式会把这种"错 IV 但含 flag"的候选误判 0 分丢弃。
+- **验证回归**：新增 10 组 Python 求解器测试（AES/DES-CBC 有/无/错 IV、口令派生 key、chacha20 counter、负例不误报）+ 16 组 JS 测试（候选合成/注入段/noise 过滤），全部通过。
 
 ### v1.3.6 (2026-10-14) — 实战阻塞修复（安装 / IDA 采集 / 验证器）
 本次用运行中的 IDA MCP + 真实 CrackMe 题逐项复现定位，修掉三个会直接导致解题失败的问题：

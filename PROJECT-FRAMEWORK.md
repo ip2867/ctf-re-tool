@@ -1,7 +1,7 @@
 # CTF-RE-TOOL 项目框架总览
 
 > **用途**：本文件是项目的**单一事实来源（SSOT）速查文档**。上下文压缩后，先读本文件即可恢复对项目全貌的理解，再按需深入具体文件。
-> **版本**：v1.3.6 ｜ **形态**：Electron 桌面应用（Windows）｜ **定位**：CTF 逆向 AI 解题工作台
+> **版本**：v1.3.7 ｜ **形态**：Electron 桌面应用（Windows）｜ **定位**：CTF 逆向 AI 解题工作台
 > **一句话**：把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成 AI 可自主驱动的流水线，通过 MCP 接入 IDA/JEB/Burp，内置 11 个方法论技能 + 54 页结构化知识库。
 
 ---
@@ -189,6 +189,12 @@ runVerification() 复现通过后:
 | GUI 窗口不可见 | `windowsHide:true` / `spawn(detached)` | GUI 走 `cmd /c start` |
 | 打包卡死 | 旧 exe 被运行占用输出文件 | `_build.cmd` 检测并自动关闭旧实例 |
 | 打包压缩停滞 | `-mx=9` 在本机卡死 | `_build.cmd store` 跳过压缩 |
+| Hook 有输出却报"共 0 条关键数据" | 滚动窗口只在 `[DATA]`/flag 时续期，纯 `[HIT]` 噪音不续期 | 改为**任何新输出都续期**；收尾报告给 3 个计数 |
+| 单契约复现失败即卡死 | AI 未给 `[HYPOTHESES]` → 只打警告不枚举 | `synthesizeHypotheses()` 自合成候选矩阵（≤24 组） |
+| AES-CBC 缺 IV 必然无命中 | 求解器缺 IV 直接抛 `Incorrect IV length` | `dec_cbc_multi()` 枚举 IV + 回退 ECB |
+| 进程内解密段刷 25 行同错 | IV 不合法即 `return`，3s tick 无限重刷 | 枚举 IV/key/模式 + 最多重试 4 次 |
+| 枚举 NPE 时仍试 `-f` spawn | `-f` 与 `-n`/`-F` 同走 NPE 路径，注定失败 | `autoFridaStage` 直接 adb 拉起 + PID attach |
+| 手动 Hook 只抓启动噪音 | `runHook` 只 attach 不驱动 UI，App 停首页 | 与自动阶段一致：并行 `driveAppIteratively` |
 
 ---
 

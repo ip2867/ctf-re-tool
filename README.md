@@ -11,7 +11,7 @@
 
 - **AI 工具循环（Tool-Use）**：AI 自主调用 JEB/IDA/Frida/Python 等工具反复推进，而不是一次性问答；分阶段提示词（①收集 → ②定位算法 → ③写脚本本地验证 → ④结论）。
 - **本地验证闭环**：AI 给出的每个 flag 都附 `[VERIFY]` 契约，工具自动生成 Python 复现脚本本地跑一遍，标注 ✅已验证 / ⚠️未验证——**不靠"AI 说解出来了"就当解出来了**。
-- **结构化知识库**：54 页可检索手法/题解页（含 44 篇历年逆向题，带 `attack_chain` 解法链 / `reasoning_chain` 思维链 / `failed_attempts` 避坑），按关键词结构化加权检索，命中即注入 AI 上下文。
+- **结构化知识库**：54 页可检索手法/题解页（含 43 篇历年逆向题，带 `attack_chain` 解法链 / `reasoning_chain` 思维链 / `failed_attempts` 避坑），按关键词结构化加权检索，命中即注入 AI 上下文。
 - **经验自进化**：每次解题沉淀的多步攻击链写入经验库，下次同类题自动速查复用。
 
 **下载**：到 [Releases](https://github.com/ip2867/ctf-re-tool/releases) 下载 `CTF-RE-TOOL.exe`（便携单文件，双击即用）。
@@ -107,7 +107,7 @@
 
 ### 11. 结构化知识库 + 检索体系（v1.3.5 重构）
 - **三层结构**：`AI-SEARCH-INDEX.md`（全局检索索引，按技术标签定位资源）→ `PAYLOAD-CHEATSHEET.md`（逆向套路/Payload/脚本速查）→ 各专题页
-- **历年逆向题条目库（`wiki/reverse/`，44 篇）**：从公开题库筛选的纯逆向题，每题一个页面，带结构化 meta：
+- **历年逆向题条目库（`wiki/reverse/`，43 篇）**：从公开题库筛选的纯逆向题，每题一个页面，带结构化 meta：
   - `attack_chain` —— 完整解法链（特征 → 关键步骤 → 坑 → 出 flag）
   - `reasoning_chain` —— 思维链（怎么想到这条路的）
   - `failed_attempts` —— 走不通的路与原因（**往往比成功更有价值**）
@@ -194,7 +194,7 @@ ctf-tool-v2/
 ├── wiki/                 # 可检索结构化知识库（54 页，AI 经 wiki_search/wiki_read 检索）
 │   ├── AI-SEARCH-INDEX.md      # 全局检索索引（优先读）
 │   ├── PAYLOAD-CHEATSHEET.md   # 逆向套路/Payload/脚本速查
-│   ├── reverse/                # 44 篇历年逆向题（YAML meta：attack_chain/reasoning_chain/failed_attempts）+ _INDEX.md
+│   ├── reverse/                # 43 篇历年逆向题（YAML meta：attack_chain/reasoning_chain/failed_attempts）+ _INDEX.md
 │   ├── frida/                  # 6 篇动态 Hook 手法页
 │   └── firmware/               # 固件解包与仿真
 ├── assets/icons/         # 应用图标
@@ -321,9 +321,9 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 ### v1.3.5 (2026-10-13) — 结构化知识库 + 解题成功率优化
 - **知识库重构为「结构化 + RAG 友好」**：新增全局检索索引 `AI-SEARCH-INDEX.md` 与速查表 `PAYLOAD-CHEATSHEET.md`
-- **历年逆向题条目库**：新增 `wiki/reverse/`，**44 篇**纯逆向题（从 132 候选筛选、剔除 PWN/杂项），每题带 `attack_chain`（解法链）/`reasoning_chain`（思维链）/`failed_attempts`（避坑）等 YAML meta
+- **历年逆向题条目库**：新增 `wiki/reverse/`，**43 篇**纯逆向题（从 132 候选筛选、剔除 PWN/杂项），每题带 `attack_chain`（解法链）/`reasoning_chain`（思维链）/`failed_attempts`（避坑）等 YAML meta
 - **修复结构化检索失效**：`wiki_search` 此前只解析 `---` front matter，而条目库把 meta 放在 ` ```yaml ` 围栏里，导致 tags/attack_chain 加权**完全失效**；现兼容两种写法，并新增 `vuln_type`/`contest`/`difficulty` 加权；命中片段优先展示 `one_liner`+`attack_chain` 且保留原文大小写（防止把大小写敏感的 flag 小写化）
-- **系统提示瘦身**：不再逐条列出 44 篇逆向条目路径（交给 `wiki_search` 检索），每次请求省约 1.5k tokens
+- **系统提示瘦身**：不再逐条列出 43 篇逆向条目路径（交给 `wiki_search` 检索），每次请求省约 1.5k tokens
 - **Frida 能力增强**：吸收两大开源 Frida Hook 项目精华——RegisterNatives 拦截、JCE 通杀自吐、SSL pinning 绕过（Java+native）、脱壳、反检测；兜底模板注入题目情报做针对性 Hook（不再是固定模板）
 - **AI 解题流程优化**：APK/PE/ELF 深度求解改为四阶段流水线提示词；AI 脚本语法错自动重新生成 2 轮
 - **环境自愈**：frida client/server 版本一致性自检、双 adb 互杀重连、装 APK 前 package 服务就绪轮询、GUI 窗口可见性修复（IDA/JEB/Nox）

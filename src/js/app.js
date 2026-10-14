@@ -2651,28 +2651,118 @@ async function analyzeDEX() {
 - 分析加密逻辑`);
 }
 
-// PYC分析
+// PYC分析（多后端 + AI 求解闭环）
+// 背景：CTF 的 .pyc 版本很杂（3.8~3.13），用户配置的单个 pycdc 对高版本常直接报
+// "Bad MAGIC!" 失败（实测 Python 3.12）；旧实现只跑 pycdc、失败就打一行 error 就结束，
+// 既不回退也不交给 AI —— 等于 PYC 题目完全无解。现改为：
+//   1) 主进程多后端回退（pycdc → xdis/pydisasm → 原生 marshal+dis → 纯字节串扫描）
+//   2) 把反汇编/常量/字符串**喂给 AI** 做算法还原（对齐 PE/ELF 的求解流程）
+//   3) 走验证闭环：AI 给 [VERIFY] 契约 → 本地 Python 复现 → 命中标 ✅已验证
 async function analyzePYC() {
-  addLog('info', '执行PYC分析流程...');
+  addLog('info', '执行PYC分析流程（多后端反汇编 + AI 求解）...');
+  addLog('info', '========================================');
 
-  // 使用pycdc反编译
-  addLog('info', '[1/1] 使用pycdc反编译...');
-  const result = await window.electronAPI.runToolArgs([state.config.tools.pycdc, state.currentFile]);
+  // 1. 多后端反汇编/常量提取（pycdc 失败自动回退，不再"一次失败就结束"）
+  addLog('info', '[1/3] 反汇编与常量提取（pycdc → xdis → marshal → 字节串扫描）...');
+  let dec = null;
+  try {
+    dec = await window.electronAPI.pycDecompile(state.currentFile);
+  } catch (e) {
+    addLog('warning', 'pyc 反汇编调用异常: ' + e.message);
+  }
 
-  if (result.success) {
-    addLog('success', 'pycdc反编译成功');
-    addSystemMessage(`PYC反编译结果:
+  if (!dec || !dec.success) {
+    addLog('error', 'PYC 反汇编失败: ' + ((dec && dec.error) || '未知原因'));
+    addSystemMessage(`**PYC 反汇编失败**\n\n${(dec && dec.error) || '未知原因'}\n\n` +
+      `可尝试：在设置中配置 **pycdc** 路径；或确认本机已装 Python（内置助手会回退到 marshal 反汇编/字节串扫描）。`);
+    return;
+  }
 
-\`\`\`python
-${result.stdout}
+  const backendInfo = (dec.backends || []).join(' | ');
+  addLog('success', `PYC 反汇编成功（后端：${backendInfo || '未知'}）`);
+  const meta = dec.meta || '';
+  const disasm = dec.disasm || '';
+  const consts = dec.consts || '';
+  const strings = dec.strings || '';
+  addLog('info', `反汇编 ${disasm.split('\n').length} 行，常量 ${consts.split('\n').filter(Boolean).length} 条，字符串 ${strings.split('\n').filter(Boolean).length} 条`);
+
+  // 落盘证据（供 WP 引用与复盘）
+  await caseAddEvidence('pyc_disasm', 'PYC 反汇编', `# META\n${meta}\n\n# DISASM\n${disasm}`, 'txt');
+  if (consts) await caseAddEvidence('pyc_consts', 'PYC 常量', consts, 'txt');
+  if (strings) await caseAddEvidence('pyc_strings', 'PYC 字符串', strings, 'txt');
+
+  // 2. 交给 AI 做算法还原（PYC 的关键信息都在反汇编/常量里，不需要外部工具）
+  addLog('info', '[2/3] 调用 AI 还原算法并求 flag...');
+  const pyVersion = (meta.match(/PYVER\s+(\S+)/) || [])[1] || '未知';
+  const prompt = `我在解一道 CTF Python 字节码（.pyc）逆向题。已用反汇编工具提取出**反汇编 + 全部常量 + 字符串**，请据此还原算法并求出 flag。
+
+文件：${state.fileInfo ? state.fileInfo.fileName : state.currentFile}
+字节码版本：Python ${pyVersion}
+
+## 反汇编（co_code，含各子函数）
 \`\`\`
+${disasm.slice(0, 12000)}
+\`\`\`
+${consts ? `\n## 常量表（co_consts，**密钥/密文/数值常量都在这里，务必逐条检查**）\n\`\`\`\n${consts.slice(0, 4000)}\n\`\`\`` : ''}
+${strings ? `\n## 原始字节串扫描（含明文串/base64/hex/大整数）\n\`\`\`\n${strings.slice(0, 3000)}\n\`\`\`` : ''}
 
-下一步:
-- 分析Python代码逻辑
-- 识别加密算法
-- 编写解密脚本`);
-  } else {
-    addLog('error', 'pycdc反编译失败: ' + result.error);
+## 解题要点
+- Python 字节码常只需**读常量 + 读逻辑**即可还原，不需要动态运行：
+  - 常见套路：base64 解密 → 单字节 XOR / RC4 / 自定义查表 / 逐字节变换 → 与目标常量比较。
+  - 看 \`decrypt_flag\` 之类子函数的 \`LOAD_CONST\`/\`BINARY_OP\`/\`LOAD_ATTR\`：还原出算法与密钥（如 \`xor_key=199\`、\`base64.b64decode\`）。
+  - 密文通常就是常量表里那条长 base64/hex 串。
+- 需要时用 \`run_python\` **实际跑一遍**验证（不要只靠脑算）。
+- 打印函数名/常量名提示：\`co_names\`、\`co_consts\` 已在上方给出。
+
+**输出契约（务必遵守）：**
+1. 得出 flag：单独一行 \`[FLAG]flag内容[/FLAG]\`
+2. 附验证契约：${VERIFY_CONTRACT}
+   - 例：{"algo":"xor","key":"199","key_encoding":"ascii","ciphertext":"<base64或hex>","encoding":"base64","expected":"flag"}（若先 base64 再 xor，可用自定义 code 字段）
+3. 多个候选：[HYPOTHESES][{...},{...}][/HYPOTHESES]
+4. 末尾 [EXPERIENCE]每条一行,最多5条[/EXPERIENCE]
+不要臆造；拿不准就写"待人工验证"。`;
+
+  try {
+    state.aiBusy = true;
+    beginStreamMessage();
+    const startTime = Date.now();
+    const result = await window.electronAPI.claudeChat(
+      [{ role: 'user', content: prompt }],
+      buildSystemPrompt()
+    );
+    endStreamMessage();
+    addLog('info', `AI 求解完成，耗时 ${((Date.now() - startTime) / 1000).toFixed(1)} 秒`);
+
+    if (result.success && result.text) {
+      state.lastAiText = result.text;
+      addSolveNote('求解结果(PYC)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
+      await harvestExperience(result.text);
+      // 3. 验证闭环
+      addLog('info', '[3/3] 本地复现验证...');
+      const vr = await runVerification(result.text);
+      if (vr && !vr.verified) await runHypotheses(result.text, { synthFrom: vr.contracts });
+      extractFlags(result.text).forEach(f => { recordFlag(f, 'pyc', false); addSolveNote('Flag', f); });
+
+      const vf = (state.findings ? state.findings.flags : []).filter(f => f.verified);
+      const flags = extractFlags(result.text);
+      addSystemMessage(`**🐍 PYC 分析结果**（后端：${backendInfo || '未知'}）
+
+${vf.length ? `**Flag（✅已验证）**: \`${vf[0].flag}\`` : (flags.length ? `**Flag（⚠️未验证）**: \`${flags[0]}\`` : '')}
+
+${result.text}`);
+      return;
+    }
+    if (result.aborted || /已取消/.test(result.error || '')) {
+      addLog('info', 'PYC AI 求解已停止');
+      return;
+    }
+    addLog('warning', 'AI 求解未返回内容: ' + (result.error || '未知'));
+    addSystemMessage('**PYC 反汇编已完成**，但 AI 求解未返回内容。反汇编/常量已存入证据目录，可手动分析或重试。');
+  } catch (err) {
+    try { endStreamMessage(); } catch (e) {}
+    addLog('error', 'PYC AI 求解异常: ' + err.message);
+  } finally {
+    state.aiBusy = false;
   }
 }
 
@@ -6471,6 +6561,7 @@ function buildSolvePython(attempts) {
 import base64, json, re, struct, sys
 
 ATTEMPTS = json.loads(base64.b64decode("${payload}").decode("utf-8"))
+_hit_seen = set()   # 全局 [HIT] 去重（多 key 候选中同一 flag 只报一次）
 
 M = 0xFFFFFFFF
 
@@ -6524,7 +6615,24 @@ def iv_bytes(a):
     return cands[0] if cands else None
 
 def dec_xor(d, k):
-    return bytes(b ^ k[i % len(k)] for i, b in enumerate(d))
+    # k 既可能是字节串（循环异或），也可能是"单字节密钥"的整数（pyc 题里 xor_key=199 极常见，
+    # 且 AI 常把 199 写成字符串）。
+    try:
+        if isinstance(k, (bytes, bytearray)):
+            kb = bytes(k)
+        else:
+            s = str(k).strip()
+            if re.fullmatch(r"\\d+", s):          # 十进制整数 → 单字节
+                kb = bytes([int(s) & 0xff])
+            elif re.fullmatch(r"0x[0-9a-fA-F]+", s):
+                kb = bytes([int(s, 16) & 0xff])
+            else:
+                kb = s.encode("latin-1", "replace")
+    except Exception:
+        kb = b""
+    if not kb:
+        return d
+    return bytes(b ^ kb[i % len(kb)] for i, b in enumerate(d))
 
 def dec_rc4(d, k):
     S = list(range(256)); j = 0
@@ -6691,6 +6799,23 @@ def printable(b):
         pass
     return b.hex()
 
+def _to_bytes_out(x):
+    """把解密函数返回值统一成 bytes。AI 的 custom decrypt 常返回 str / list[int] / bytearray。"""
+    if x is None:
+        return None
+    if isinstance(x, bytes):
+        return x
+    if isinstance(x, bytearray):
+        return bytes(x)
+    if isinstance(x, str):
+        return x.encode("latin-1", "replace")
+    if isinstance(x, (list, tuple)):
+        try:
+            return bytes([int(v) & 0xff for v in x])
+        except Exception:
+            return None
+    return str(x).encode("latin-1", "replace")
+
 def _unpad(b):
     """剥掉 PKCS#5/#7 尾部填充（1~16 且末 n 字节都等于 n），让"带填充的正确明文"
     在打分时不被误判为不可打印（否则 ECB 候选会因尾部 0x05 得 0 分而输给错误候选）。"""
@@ -6744,6 +6869,20 @@ def key_candidates(spec, ke):
         raw = b""
     if raw and raw not in out:
         out.append(raw)
+    # 单字节整数密钥：pyc/简单题里 xor_key=199 很常见，AI 常直接写成 "199"。
+    # 此时真正参与异或的是**一个字节 0xC7**，而非 b"199" —— 必须补上这个候选。
+    try:
+        sv = str(spec).strip()
+        if re.fullmatch(r"\\d+", sv) and 0 <= int(sv) <= 255:
+            b1 = bytes([int(sv)])
+            if b1 not in out:
+                out.append(b1)
+        elif re.fullmatch(r"0x[0-9a-fA-F]{1,2}", sv):
+            b1 = bytes([int(sv, 16)])
+            if b1 not in out:
+                out.append(b1)
+    except Exception:
+        pass
     src = base or raw
     if src:
         try:
@@ -6876,13 +7015,22 @@ def run_one(i, a):
                     outs.append((ke, "unknown algo " + algo)); break
             except Exception as e:
                 outs.append((ke, "ERR: " + str(e)[:120])); continue
+            # 归一化：AI 的 custom decrypt 常返回 str（甚至 list[int]/None），
+            # 而下游 printable/FLAG_RE 都按 bytes 处理 —— 必须先转 bytes，否则直接崩。
+            out = _to_bytes_out(out)
+            if out is None:
+                outs.append((ke, "ERR: decrypt 返回不可用类型")); continue
             pt = printable(out)
             outs.append((ke, pt))
             m = FLAG_RE.search(out)
             hit = (exp and exp in pt.lower()) or bool(m) or _pt_score(out) >= 4
             if hit:
                 fl = m.group(0).decode("utf-8", "ignore") if m else exp
-                print("[HIT] attempt=%d keyenc=%s algo=%s flag=%s" % (i, ke, algo, fl))
+                # 去重：同一 attempt 内多个 key 候选常解出**同一个** flag（如 key "199" 的
+                # ascii/int 两个候选），只打印一次，避免下游把重复 [HIT] 当多个候选。
+                if fl not in _hit_seen:
+                    _hit_seen.add(fl)
+                    print("[HIT] attempt=%d keyenc=%s algo=%s flag=%s" % (i, ke, algo, fl))
     for ke, pt in outs:
         print("[OUT] attempt=%d keyenc=%s: %s" % (i, ke, pt[:400]))
 

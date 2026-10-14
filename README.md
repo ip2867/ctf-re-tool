@@ -1,4 +1,4 @@
-# CTF-RE-TOOL v1.3.7
+# CTF-RE-TOOL v1.3.8
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -307,6 +307,22 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 
 ## 更新日志
+
+### v1.3.8 (2026-10-14) — PYC 逆向从"无解"到可用（多后端反汇编 + AI 求解）
+
+**问题**：拖入 `.pyc` 后仅执行一次 `pycdc`，遇到高版本字节码直接报 `Bad MAGIC!` 失败，且**失败即结束**——既无回退、也不交给 AI，PYC 题目等于完全无解（实测 Python 3.12 的题目）。且 PYC 走的是"单工具 stub"流程，与 PE/ELF 的 AI 求解 + 验证闭环完全不对等。
+
+- **新增 PYC 多后端反汇编（永不空手而归）**：主进程新增 `pyc-decompile`，后端链自动回退 ——
+  **配置的 pycdc → `xdis/pydisasm`（跨版本）→ 原生 `marshal.loads` + `dis`（含递归常量表）→ 纯字节串扫描（ASCII/GBK 中文/长 hex/base64/大整数）**。
+  即使前几层全失败，最底层字节串扫描也能给出关键线索（如 base64 密文 + XOR 密钥）。
+- **`analyzePYC` 重写为 AI 求解闭环**（对齐 PE/ELF）：反汇编 + **结构化常量表** + 字符串 → 喂给 AI 做算法还原 → `[VERIFY]` 契约本地 Python 复现 → 命中标 ✅已验证。反汇编/常量/字符串同时落盘为 CASE 证据。
+- **新增内置助手 `electron/pyc_decompile.py`**（零第三方依赖也能工作；`xdis` 存在时用其跨版本反汇编）：解析 pyc magic 判定 Python 版本（3.4~3.13），递归 dump 每个代码对象的反汇编与常量，并额外单列 `CONSTS` 表让 AI 一眼扫到密钥/密文。
+  打包注意：`asarUnpack` 已把该助手解包（外部 python 进程读不到 asar 内路径），运行时还有"复制到 temp"兜底。
+- **求解器兼容 PYC 高频写法**：
+  - `xor` 支持**单字节整数密钥**（`xor_key = 199` 是 PYC 题最常见套路，AI 常写成字符串 `"199"`；此前会把它当 `b"199"` 三字节密钥，永远解不出）。
+  - `custom` 解密函数返回 **`str`/`list[int]`/`bytearray`** 时先归一化为 bytes（此前 `printable`/`FLAG_RE` 按 bytes 处理会直接崩）。
+  - `[HIT]` 全局去重（同一 flag 被多个 key 候选命中时只报一次）。
+- **回归**：求解器 11/11（AES/DES-CBC、口令派生 key、ChaCha20、RC4、XOR 多字节/单字节整数、custom 返回 str、负例不误报）+ PYC 实战题 4/4 全部通过；实测 `py_obf_04.pyc`（Python 3.12，base64 + XOR 199）可解出 flag。
 
 ### v1.3.7 (2026-10-14) — 验证闭环与 Hook 出 flag 的通用性修复
 本次用运行中的模拟器 + 真实 CrackMe 题复现，修掉一批"单契约失败即卡死 / Frida 抓到噪音却报 0 条"的通用缺陷：

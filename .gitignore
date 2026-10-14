@@ -45,3 +45,7 @@ _build*.cmd
 _build*.txt
 _*.js
 _*.log
+
+# Python 缓存（内置 pyc 助手运行/编译产物）
+__pycache__/
+*.pyc

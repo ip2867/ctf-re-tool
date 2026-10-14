@@ -4495,6 +4495,36 @@ function listWikiDirs() {
 // 升级（借鉴 Des-CTF-KB）：解析 YAML front matter，让命中 tags/vuln_type/attack_chain/
 // reasoning_chain/key_observations 的条目**加权**（结构化 meta 命中远重于正文散命中）；
 // 并优先把带 meta 的"条目页"排前，方便 AI 直接拿到 attack_chain/思维链。
+// 解析 YAML meta 的单个字段值，兼容三种真实写法：
+//   ① 行内：`key: value`
+//   ② 列表：`key:` 换行 + `- 步骤`（43 篇逆向条目大量使用这种！）
+//   ③ 块标量：`key: |` 或 `> ` + 后续缩进行
+// 修复史：旧实现用 `^key:[\s\S]*?(?=\n\w+:|$)` + 'm' 标志，因 `$` 在 m 下匹配"行尾"，
+// 当 `key:` 后面紧跟换行时非贪婪立即坍缩为空 → 列表写法的 attack_chain/failed_attempts
+// 全部解析为空，结构化攻略"存了却传不到 AI"。改为逐行解析，按缩进/列表标记续读。
+function pickMetaValue(src, key) {
+  const lines = String(src || '').split('\n');
+  const parts = [];
+  let collecting = false;
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, '');
+    const top = line.match(/^([A-Za-z_][A-Za-z0-9_]*):(.*)$/);
+    if (collecting) {
+      if (/^\s*[-*]\s+/.test(line)) { parts.push(line.replace(/^\s*[-*]\s+/, '').trim()); continue; } // 列表项（可零缩进）
+      if (/^\s+\S/.test(line)) { parts.push(line.trim()); continue; }                              // 块标量续行（缩进）
+      if (top) break;                                                                              // 下一个顶层键
+      if (!line.trim()) continue;
+      break;
+    }
+    if (top && top[1].toLowerCase() === String(key).toLowerCase()) {
+      const inline = top[2].trim().replace(/^['"]|['"]$/g, '');
+      if (inline && inline !== '|' && inline !== '>') parts.push(inline);
+      collecting = true;
+    }
+  }
+  return parts.join(' → ');
+}
+
 function wikiSearch(query, max = 5) {
   const pages = listWikiDirs();
   const terms = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
@@ -4518,15 +4548,21 @@ function wikiSearch(query, max = 5) {
     }
     const hasMeta = !!metaText;
     // 命中打分用小写；展示片段（one_liner/attack_chain 含 flag、密钥，大小写敏感）保留原文。
-    let tags = '', attack = '', reasoning = '', keys = '', one = '', vtype = '';
-    let oneRaw = '', attackRaw = '';
+    let tags = '', attack = '', reasoning = '', keys = '', one = '', vtype = '', fails = '';
+    let oneRaw = '', attackRaw = '', failsRaw = '';
     if (metaText) {
       const fm = metaText.toLowerCase();
-      const pick = (src, k) => { const m = src.match(new RegExp('^' + k + ':[\\s\\S]*?(?=\\n[a-zA-Z_]+:|$)', 'm')); return m ? m[0] : ''; };
-      tags = pick(fm, 'tags'); attack = pick(fm, 'attack_chain'); reasoning = pick(fm, 'reasoning_chain');
-      keys = pick(fm, 'key_observations') + pick(fm, 'key_payload') + pick(fm, 'failed_attempts'); one = pick(fm, 'one_liner');
-      vtype = pick(fm, 'vuln_type') + pick(fm, 'contest') + pick(fm, 'difficulty');
-      oneRaw = pick(metaText, 'one_liner'); attackRaw = pick(metaText, 'attack_chain');
+      // 打分用小写、展示用原文（attack_chain 含 flag/密钥，必须大小写敏感）
+      tags = pickMetaValue(fm, 'tags'); attack = pickMetaValue(fm, 'attack_chain'); reasoning = pickMetaValue(fm, 'reasoning_chain');
+      keys = pickMetaValue(fm, 'key_observations') + pickMetaValue(fm, 'key_payload') + pickMetaValue(fm, 'failed_attempts') + pickMetaValue(fm, 'lesson');
+      // 手法页（wiki/frida、firmware）用 keywords 声明检索词，旧实现未纳入 → 命中率低，补上
+      keys += pickMetaValue(fm, 'keywords');
+      one = pickMetaValue(fm, 'one_liner');
+      vtype = pickMetaValue(fm, 'vuln_type') + pickMetaValue(fm, 'contest') + pickMetaValue(fm, 'difficulty');
+      oneRaw = pickMetaValue(metaText, 'one_liner'); attackRaw = pickMetaValue(metaText, 'attack_chain');
+      // 失败教训往往比成功更有价值（少走弯路）→ 单列并单独展示
+      fails = pickMetaValue(fm, 'failed_attempts') + pickMetaValue(fm, 'lesson');
+      failsRaw = pickMetaValue(metaText, 'failed_attempts') + (pickMetaValue(metaText, 'lesson') || '');
     }
     let score = 0;
     for (const t of terms) {
@@ -4539,21 +4575,26 @@ function wikiSearch(query, max = 5) {
       score += (attack.includes(t) ? 4 : 0);
       score += (reasoning.includes(t) ? 4 : 0);
       score += (keys.includes(t) ? 5 : 0);
+      score += (fails.includes(t) ? 4 : 0);                    // 失败教训同为加权项
       score += (vtype.includes(t) ? 3 : 0);
     }
     if (!terms.length) score = 1;
-    if (score > 0) scored.push({ score, page: p, content, title: firstLine, hasMeta, oneRaw, attackRaw });
+    if (score > 0) scored.push({ score, page: p, content, title: firstLine, hasMeta, oneRaw, attackRaw, failsRaw });
   }
   scored.sort((a, b) => (b.score - a.score) || (b.hasMeta - a.hasMeta));
   const top = scored.slice(0, Math.max(1, Math.min(Number(max) || 5, 20)));
   if (!top.length) return `未找到与「${query}」相关的知识页。可用页面：\n` + pages.map(p => `- ${p.rel}`).join('\n');
   return top.map(r => {
-    // 带结构化 meta 的条目：优先给 one_liner / attack_chain（决策最有用），
-    // 而不是从正文里随便凑 6 行；无 meta 的页面仍按关键词行取上下文。
+    // 带结构化 meta 的条目：给"要点 + 解法链 + 避坑"（决策最有用），而不是从正文随便凑 6 行；
+    // 无 meta 的页面仍按关键词行取上下文。
     let snippet = '';
-    if (r.hasMeta && (r.oneRaw || r.attackRaw)) {
-      const fmt = (s) => s.replace(/^[a-z_]+:\s*/i, '').replace(/\s+/g, ' ').trim().slice(0, 300);
-      snippet = [r.oneRaw && `要点：${fmt(r.oneRaw)}`, r.attackRaw && `解法链：${fmt(r.attackRaw)}`].filter(Boolean).join('\n');
+    if (r.hasMeta && (r.oneRaw || r.attackRaw || r.failsRaw)) {
+      const fmt = (s) => s.replace(/^[a-z_]+:\s*/i, '').replace(/\s+/g, ' ').trim().slice(0, 320);
+      snippet = [
+        r.oneRaw && `要点：${fmt(r.oneRaw)}`,
+        r.attackRaw && `解法链：${fmt(r.attackRaw)}`,
+        r.failsRaw && `避坑（失败教训）：${fmt(r.failsRaw)}`,
+      ].filter(Boolean).join('\n');
     }
     if (!snippet) {
       const lines = r.content.split('\n');

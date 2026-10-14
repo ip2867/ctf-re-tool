@@ -308,150 +308,35 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 ## 更新日志
 
-### v1.3.14 (2026-10-14) — 复审 v1.3.13 新代码：修复跨文件 MCP 缓存泄漏
+### v1.3.14 (2026-10-14) — 当日汇总
 
-对 v1.3.13 新增的求解路径做深度复审时，发现两处跨文件状态泄漏（只影响"连续分析多道题"的场景，单题无感）：
+> 本条目汇总 **2026-10-14 当天**的全部更新（原按里程碑分为 v1.3.6 ~ v1.3.14 多次提交，现合并为一个版本）。
 
-- **`analyzeJavaLike` 未清 MCP 缓存**：新写的 DEX/JAR 求解器一进函数直接往 `mcpCache.otherClasses` 里塞反编译结果，但**没有先清空** —— 于是分析第 2 个文件时，第 1 个文件的关键类代码会混进本次的 AI 提示词。现改为函数入口先 `clearMcpCache()`。
-- **`state._keyClassesByContent` 从不重置**：这是 APK 内容命中筛查的产物（记录"哪几个类含关键常量"），被 `selectKeyClasses` 用来把高价值类**强制置顶**。但它只在 APK 路径写入、**从不清理** —— 分析下一题（尤其 DEX/JAR）时会把上一题的类强行排到最前，挤掉本题真正的关键类。现并入 `clearMcpCache()` 一起重置。
+**解题结构根治**
+- **"三件套"收口**：把"验证闭环 + 经验沉淀"从散落 9 处的两步复制粘贴，收口为单一入口 `finalizeSolve(text, {source})` —— 内含「验证闭环 → 失败自动枚举 → 登记 flag → 解题成功则经验自动入库」，从结构上杜绝"修一处漏一处"。
+- **5 类"只指路"入口改为真正解题**：`.dex` / `.jar` / `.class` / Mach-O / `.luac` 此前只启动外部工具或打印指引（AI 不参与），现全部接入 AI 求解闭环 —— DEX/JAR 走 **JEB 优先**（不可用降级 jadx）、Mach-O 走 IDA、`.luac` 走字节/常量抽取。分流表 12/12 均路由到真实求解器。
+- **修复跨文件 MCP 缓存泄漏**：`analyzeJavaLike` 未清缓存、`state._keyClassesByContent` 从不重置 → 连解多题时上一题数据会串进本题提示词/类选择；现随 `clearMcpCache()` 一并清理。
 
-两处都是"连续用同一进程解多道题"才会触发；修复后每题状态干净。回归：经验流 6/6、相似度 5/5、`finalizeSolve` 契约 2/2、语法全过。
+**经验与知识库"真正帮到解题"**
+- **经验自动入库 + 真去重**：解题成功即写入（无需手动「保存」）；去重从"按整行含日期比对（换日必重复）"改为**与日期无关的内容级去重**（精确 + 二元组相似度≥0.78 + 子串判定）。经验注入补全到所有求解路径。
+- **修复题库 meta 解析 bug**：`wiki_search` 解析 YAML 的 `m` 标志令 `$` 匹配行尾，导致**列表写法**的 `attack_chain`/`failed_attempts` 被解析为空 —— 43 篇题库仅 13 篇解法链可用。修复后 **13 → 38 篇**，检索摘要升级为 **要点 + 解法链 + 避坑**。
+- **主路径自动预取**：新增 `prefetchKnowledge()`，调用 AI 前按题面特征词检索题库并把攻略内联进提示词（已覆盖 APK/PE/ELF、PYC、Web/JS、DEX/JAR、Lua）。
 
-### v1.3.13 (2026-10-14) — 解题结构根治：三件套收口 + 5 类"只指路"入口真正解题
+**PYC 逆向从"无解"到可用**
+- 多后端自动回退：**pycdc → xdis/pydisasm → 原生 marshal+dis → 纯字节串扫描**（永不空手）；内置零依赖助手 `electron/pyc_decompile.py`。
+- 求解器兼容 `xor` **单字节整数密钥**（`xor_key=199`）、`custom` 返回 `str`/`list[int]` 归一化。
 
-前两轮（v1.3.11/v1.3.12）反复出现"某条求解路径漏接验证闭环 / 漏接经验沉淀"——根治办法不是继续补漏，而是**从结构上让遗漏不可能发生**。本轮做两件事：
+**验证闭环与动态 Hook 通用性**
+- **修复 IDA 采集 0 反编译（最严重）**：`window.electronApi` 拼写错被空 catch 吞掉，实测反编译 **0 → 19 个**。
+- 验证闭环不再"没契约就放弃"：`synthesizeHypotheses()` 自合成候选矩阵（≤24 组）。
+- AES/DES-CBC **缺 IV/错 IV** 不再必然失败（枚举全零/首块/前置 IV + 回退 ECB）；口令 key 自动派生（MD5/SHA-256/零填充）。
+- 多候选密文**交叉校验 + 自动裁决**（IDA `xrefs_to` 判"哪条被校验函数引用"），防"变种题"陷阱。
+- 动态 Hook：修复"抓到输出却报 0 条关键数据"、手动 Hook 自动驱动界面、枚举失败改按 PID attach、`String.equals` 降噪。
 
-**一、把"三件套"收口为单一入口 `finalizeSolve()`**
+**重构引入问题的修复**
+- v1.3.9：验证闭环 7 处复制粘贴收敛为 `verifyAndRecord()`（纯重构）。
+- v1.3.10：修复该重构遗漏 —— `autoSolveFlag`/`autoSolveBinaryFlag` 只解构 `verifiedFlags` 却引用裸 `flags`，导致 `ReferenceError: flags is not defined`。
 
-此前 9 个求解流程里，每处都各写一遍"`verifyAndRecord`（验证）→ `harvestExperience`（经验自动入库）"两步。这次全部替换为一行：
-
-```js
-const { verifiedFlags, flags } = await finalizeSolve(result.text, { source: 'xxx' });
-```
-
-`finalizeSolve` 内部固定完成「验证闭环 → 失败自动枚举 → 登记 flag → 解题成功则经验自动入库」，并返回 `{ vr, flags, verifiedFlags }`。**新增任何求解流程只调它一处即可**，从结构上杜绝再漏（已写入 SSOT §9）。
-
-**二、让 5 类"只会指路"的入口真正走 AI 求解**
-
-审计分流表发现：`.dex` / `.jar` / `.class` / Mach-O / `.luac` 这 5 类的 handler 只有 15~24 行 —— **只启动外部工具或打印一段指引文字，AI 完全不参与**（无验证、无经验、无题库预取）。已全部改造为真正的求解路径：
-
-| 类型 | 旧行为 | 新行为 |
-|---|---|---|
-| **DEX** | 只启动 jadx | **JEB MCP 采集类列表 + 关键类反编译 → AI 求解 → 验证闭环** |
-| **JAR / .class** | 只启动 jadx | 同上（JEB 优先；不可用时降级 jadx 并明确告知，不假装已解）|
-| **Mach-O** | 只打印一段文字 | **IDA MCP 采集 → `autoSolveBinaryFlag` 二进制求解闭环** |
-| **.luac** | 只打印一段文字 | **Python 扫描明文串/长hex/base64/常量 → AI 求解 → 验证闭环** |
-
-> 顺带纠正：`.dex`/`.jar` 此前固定启动 jadx，现按你的实际工作流改为 **JEB 优先**（JEB MCP 的 `get_all_classes`/`get_class_decompiled_code` 已全套接好）。
-
-**三、题库预取扩展到新类型**
-
-`prefetchKnowledge()` 特征词池补上 Java/Android 类（jadx/dex2jar/smali/il2cpp/unity…）与 Lua 类（luac/unluac/luaopcode），分流分支也按 DEX/JAR/LUAC 分别注入对应检索词——让新路径同样能拿到题库攻略。
-
-> 回归：语法检查全过 ｜ 求解路径审计 **10/10** 三件套全覆盖 ｜ 分流表 **12/12** 均路由到真实求解器（ZIP 除外，其本就非题目文件）｜ 经验流 6/6、相似度 5/5、手动去重 3/3 ｜ `finalizeSolve` 契约与 Lua 扫描片段均实测通过。
-
-### v1.3.12 (2026-10-14) — 补齐 v1.3.11 遗漏的求解路径（经验覆盖 100%）+ 预取扩展到 PYC/WebJS
-
-v1.3.11 建立了"解题成功自动入库 + 注入所有求解路径 + 主路径预取题库"的机制，本轮**逐函数审计**后发现三处遗漏并补齐，另把预取扩展到其余文件类型。
-
-- **补齐经验沉淀与注入的遗漏路径**（此前这些路径解题成功也不会沉淀经验）：
-  - `analyzeWebJSCore`（Web/JS 逆向）：只做了验证闭环，**没有收割经验** → 现补 `harvestExperience(autoSave)`。
-  - `detailedAnalysis`（APK 用户主动"详细分析"）/ `detailedBinaryAnalysis`（PE/ELF 同）：**既没验证也没收割经验** → 现补上完整验证闭环 + 经验自动入库。
-  - 至此 **9 条求解路径全部** `verify✓ harvest✓ 经验注入✓`（审计脚本逐函数核对）。
-- **手动 `经验 <内容>` 也走去重**：此前该命令直接追加写盘、绕过 v1.3.11 的内容级去重 → 现改走 `experienceKey`/`experienceSimilar` 判定 + 统一写入器，重复回写会被拦下并提示"已存在"。
-- **预取扩展到 PYC / WebJS**：`analyzePYC`（从反汇编/常量/字符串探测特征词）与 `analyzeWebJSCore`（从代理历史探测 sign/token/CryptoJS/瑞数等）也会在调用 AI 前主动检索题库并把攻略内联进提示词。
-- **特征词池扩充**：新增 Python/字节码类（pickle/renpy/rpyc/cython/pyinstaller…）与 Web/JS 类（JSEncrypt/CryptoJS/X-Bogus/sm2/wasm/jsvmp/瑞数…）。
-
-> 回归：经验流 6/6、相似度判别 5/5、手动回写去重 3/3；逐函数审计 9/9 求解路径全覆盖；`node --check` 三个 JS 全过。
-
-### v1.3.11 (2026-10-14) — 经验库"自动沉淀、真去重、真复用"；修复题库攻略 70% 丢失
-
-本次围绕**"存下来的东西必须真正帮到解题"**做了一轮整改，修掉两处长期存在的真实缺陷。
-
-**一、经验机制：从"暂存等指令"改为"解题成功自动入库 + 内容级去重"**
-
-- **自动入库**：过去 AI 提炼的经验只在内存暂存，必须手动发送「保存」才写盘 —— 结果是"存了但库里一直是空的、下次解题没东西可复用"。
-  现在**只要解题成功（本地验证出已验证 flag）就自动入库**；只有未确认成功的经验才暂存、等「保存」。
-- **真去重**：旧实现按"整行字符串（含 `[日期]` 前缀）"判重 —— 同一条经验换一天就是"新行"，**必然重复**。
-  现在改为**与日期无关的内容级去重**：剥离前缀与标点后精确比对，再叠加二元组相似度（阈值 0.78）+ 子串判定，
-  吃掉"措辞微调 / 补半句 / 顺序调换"的重复，同时不误合并"套路相同但确是不同题"的条目（阈值经真实样本双向校准）。
-
-**二、知识库：修复结构化 meta 解析 bug（攻略"存了却传不到 AI"）**
-
-- **根因**：`wiki_search` 解析 YAML meta 的正则带 `m` 标志，`$` 匹配行尾，导致 `key:` 后紧跟换行的**列表写法**值被解析为空——
-  而 43 篇逆向条目里大量 `attack_chain`（解法链）、`failed_attempts`（避坑）正是这种写法。
-  实测受影响条目：**解法链可用的仅 13/43**，其余 30 篇的攻略等于没传给 AI。
-- **修复**：改为逐行解析，兼容行内值 / 列表 / 块标量三种写法 → 解法链可用条目 **13 → 38**（其余 5 篇源数据本就是占位符）。
-- **摘要升级**：条目摘要从"要点"扩展为 **要点 + 解法链 + 避坑（失败教训）**；打分纳入 `failed_attempts`/`lesson`/`keywords`
-  （手法页 frida/、firmware/ 用 `keywords` 声明检索词，此前完全没参与加权）。
-
-**三、让攻略真正被用到**
-
-- **两条主路径自动预取**：`autoSolveFlag`(APK) / `autoSolveBinaryFlag`(PE/ELF) 用的是"固定清单 + 禁止调工具"的提示词，
-  AI 既看不到题库也无权检索 → 题库形同虚设。现新增 `prefetchKnowledge()`：从已采集的代码/字符串里探测算法·工具·混淆特征词，
-  **调用前主动检索知识库并把最相关的攻略摘要内联进提示词**。
-- **经验注入补全**：审计全部 AI 调用点，把"历史经验速查"注入到所有**求解**路径（含此前遗漏的两处 Tool-Use 详细分析、
-  以及三条写死的 system prompt），模板统一走 `experienceSection()`。
-
-> 回归：经验流 6/6（自动入库、同日重复=0、**仅日期不同=0**、全新=1、未成功仅暂存、近似重复=0）；
-> 相似度判别 5/5（3 组"不同题"正确区分 + 2 组"实为同一条"正确去重）；`node --check` 三个 JS 全过。
-
-### v1.3.10 (2026-10-14) — 修复 v1.3.9 重构引入的 `flags is not defined`
-
-- **修复 PE/ELF 与 APK 求解流程崩溃**：v1.3.9 把各流程统一改为 `verifyAndRecord()`（返回 `{ vr, flags, verifiedFlags }`）时，
-  `autoSolveBinaryFlag`（PE/ELF）与 `autoSolveFlag`（APK）两处调用点**只解构了 `verifiedFlags`，随后仍引用已被删除的裸变量 `flags`**，
-  在拼接"自动求解结果"消息时抛 `ReferenceError: flags is not defined`，导致 AI 已成功分析却报"AI分析异常"。现补回 `flags` 解构。
-- 纯 bugfix，求解器与解题行为不变；`node --check` 通过。
-
-### v1.3.9 (2026-10-14) — 内部重构：验证闭环去重（无行为变更）
-
-- **消除 7 处复制粘贴的"验证闭环"块**：`analyzeAPK`/`analyzePE|ELF`/`analyzePYC`/`analyzeWebJS`/`autoSolveActive`/`toolUseDeepSolve`/`toolUseDeepSolveBinary` 里各写一遍
-  `runVerification → runHypotheses 兜底 → recordFlag → addSolveNote`，且**语义已漂移**（有的用 `if (!vr)` 门控 flag 登记、有的无条件；源码字符串也各不相同）——
-  这正是过去多次"同类 bug 修一处漏一处"的根源。现统一为 `verifyAndRecord(aiText, {source, noteSection})`，返回 `{ vr, flags, verifiedFlags }`。
-- 纯重构，**求解器与解题行为不变**；回归 11/11 通过。
-- 同步刷新 `PROJECT-FRAMEWORK.md`（SSOT）到 v1.3.9：补 PYC 多后端、`verifyAndRecord`、asarUnpack 等现状。
-
-### v1.3.8 (2026-10-14) — PYC 逆向从"无解"到可用（多后端反汇编 + AI 求解）
-
-**问题**：拖入 `.pyc` 后仅执行一次 `pycdc`，遇到高版本字节码直接报 `Bad MAGIC!` 失败，且**失败即结束**——既无回退、也不交给 AI，PYC 题目等于完全无解（实测 Python 3.12 的题目）。且 PYC 走的是"单工具 stub"流程，与 PE/ELF 的 AI 求解 + 验证闭环完全不对等。
-
-- **新增 PYC 多后端反汇编（永不空手而归）**：主进程新增 `pyc-decompile`，后端链自动回退 ——
-  **配置的 pycdc → `xdis/pydisasm`（跨版本）→ 原生 `marshal.loads` + `dis`（含递归常量表）→ 纯字节串扫描（ASCII/GBK 中文/长 hex/base64/大整数）**。
-  即使前几层全失败，最底层字节串扫描也能给出关键线索（如 base64 密文 + XOR 密钥）。
-- **`analyzePYC` 重写为 AI 求解闭环**（对齐 PE/ELF）：反汇编 + **结构化常量表** + 字符串 → 喂给 AI 做算法还原 → `[VERIFY]` 契约本地 Python 复现 → 命中标 ✅已验证。反汇编/常量/字符串同时落盘为 CASE 证据。
-- **新增内置助手 `electron/pyc_decompile.py`**（零第三方依赖也能工作；`xdis` 存在时用其跨版本反汇编）：解析 pyc magic 判定 Python 版本（3.4~3.13），递归 dump 每个代码对象的反汇编与常量，并额外单列 `CONSTS` 表让 AI 一眼扫到密钥/密文。
-  打包注意：`asarUnpack` 已把该助手解包（外部 python 进程读不到 asar 内路径），运行时还有"复制到 temp"兜底。
-- **求解器兼容 PYC 高频写法**：
-  - `xor` 支持**单字节整数密钥**（`xor_key = 199` 是 PYC 题最常见套路，AI 常写成字符串 `"199"`；此前会把它当 `b"199"` 三字节密钥，永远解不出）。
-  - `custom` 解密函数返回 **`str`/`list[int]`/`bytearray`** 时先归一化为 bytes（此前 `printable`/`FLAG_RE` 按 bytes 处理会直接崩）。
-  - `[HIT]` 全局去重（同一 flag 被多个 key 候选命中时只报一次）。
-- **回归**：求解器 11/11（AES/DES-CBC、口令派生 key、ChaCha20、RC4、XOR 多字节/单字节整数、custom 返回 str、负例不误报）+ PYC 实战题 4/4 全部通过；实测 `py_obf_04.pyc`（Python 3.12，base64 + XOR 199）可解出 flag。
-
-### v1.3.7 (2026-10-14) — 验证闭环与 Hook 出 flag 的通用性修复
-本次用运行中的模拟器 + 真实 CrackMe 题复现，修掉一批"单契约失败即卡死 / Frida 抓到噪音却报 0 条"的通用缺陷：
-
-- **验证闭环：本地枚举不再"没契约就放弃"**（举一反三）。过去 AI 只给 1 个 `[VERIFY]` 契约、没给 `[HYPOTHESES]` 时，复现失败就打一句"未找到 [HYPOTHESES] 契约"原地卡死。现新增 `synthesizeHypotheses()`：工具**自己合成候选矩阵**（算法族 CBC↔ECB、密钥编码 ascii/hex/base64 **不盲信 AI 声明**、chacha 变体），最多 24 组本地并行跑，命中即记为已验证 flag。
-- **AES/DES-CBC 缺 IV 不再必然失败**。求解器新增 `dec_cbc_multi()`：IV 缺失/给错时枚举 **全零 IV / 密文首块当 IV / 前置 IV（密文 = IV∥body）**，CBC 全试完再**回退 ECB**；并按"flag 形态优先"给候选打分（新增 `_pt_score`/`_unpad`，剥掉 PKCS#5 填充后再判定可打印性，避免"带填充的正确明文"输给错误候选）。
-- **密钥长度不合法不再直接抛错**。新增 `key_candidates()`：AI 给的 key 不是 16/24/32 字节（如口令）时，额外尝试 **MD5 / SHA-256 派生 / 零填充**候选（Electron 注入段同步实现）。
-- **Hook 进程内解密段（`fridaSolvePreamble`）同步升级**：同样枚举 **key 候选 × IV 候选 × 模式**，IV 不合法时不再打印"cbc 需要 16 字节 IV"后永久放弃，而是继续试零 IV / ECB；且**最多重试 4 次**（约 12s）后停止，不再每 3s 刷同一条错误（此前刷了 25 行噪音）。
-- **修复"抓到一堆输出却报『共 0 条关键数据』"（关键）**：滚动窗口旧逻辑只在出现 `[DATA]`/flag 时才续期；当 Hook 输出全是 `[HIT]` 命中痕迹或 `send()` 信息时窗口不续期，60s 后误报"0 条关键数据"直接收尾，且把真实输出判成"无数据"。现改为**任何新输出都续期**，收尾报告同时给出"关键数据 / 命中痕迹 / 输出块"三个计数。
-- **枚举不可用时不再走注定失败的 spawn**：`frida-ps` 报 `queryIntentActivities` NPE 时，`spawn -f` 必然失败；现 `autoFridaStage` 直接改为 **adb 拉起 + 按 PID attach**，省掉一次注定失败的往返。
-- **手动「运行Hook」也自动驱动界面**：此前手动 Hook 只 attach 不驱动 UI，App 停在首页 → 校验代码永不执行 → 只能抓到启动噪音（与自动阶段的差距）。现与自动阶段一致，并行 `driveAppIteratively` 触发真实校验路径。
-- **String.equals 降噪增强**：过滤 `'Cipher'=='Cipher'`、`'AES/CBC/PKCS5PADDING'==同串` 这类**算法名自比较**噪音。
-  - ⚠️ 复审修正：降噪判定顺序必须"先判有意义、再排噪音"——否则 `userInput.equals(正确flag)` 这种**长度 ≤32 的真实命中**会被自比较规则误杀（那正是最该打印的一条）。已修正并加回归测试。
-- **复审额外修正**：`_pt_score` 由"整段必须全可打印"改为**按可打印比例** + 原始字节上优先找 flag 形态——因为 CBC 用错 IV 时**只有第 1 块被打乱，第 2 块起仍是正确明文**（flag 常在第 2 块），严格模式会把这种"错 IV 但含 flag"的候选误判 0 分丢弃。
-- **验证回归**：新增 10 组 Python 求解器测试（AES/DES-CBC 有/无/错 IV、口令派生 key、chacha20 counter、负例不误报）+ 16 组 JS 测试（候选合成/注入段/noise 过滤），全部通过。
-
-### v1.3.6 (2026-10-14) — 实战阻塞修复（安装 / IDA 采集 / 验证器）
-本次用运行中的 IDA MCP + 真实 CrackMe 题逐项复现定位，修掉三个会直接导致解题失败的问题：
-- **多候选密文交叉校验 + 自动裁决（防"变种题"陷阱）**：native so 里常有多组加密常量（如 C++ 静态 `std::array<std::string,8>`）。若只取第一条当密文，遇到"密文被换过、key/nonce 不变"的变种题，会算出**自洽但版本不对**的 flag（`encrypt(flag)==该密文` 成立，但那条密文并非 App 真正比对的那条）。现从 native intel 抽**全部** hex 常量（globals/segments/strings/反编译代码，16~128B 去重）与 AI 密文并列枚举；并用 **IDA `xrefs_to` 自动裁决**"哪条被校验函数引用"——引用函数**按需反编译**（不限于预采集的 28 个）+ 含比较语义（memcmp/strcmp/==/Arrays.equals）优先，可用时再叠加 **`trace_data_flow`**（常量地址是否流向比较点）强判据；若权威候选与 AI 答案不同则**自动以权威为准**（AI 原答案标 superseded），无法判定时回落为告警交人工复核。裁决消息附依据（why）与 score 便于核对
-- **修复 `xrefs_to` 参数漂移**：旧代码返回 `{address:..}` 被真实 ida-pro-mcp 判"缺 addrs" → 改为 `{addrs:[..]}`（同类工具名/参数漂移，与 IDA 采集那次同源）
-- **统一 `[VERIFY]` 契约为单一权威常量**：此前 5 处提示词各写一份 algo 清单且内容漂移（3 处漏 `chacha20`/`node_js`）——正是 chacha20 漏实现的同类隐患。现集中为 `VERIFY_ALGOS`/`VERIFY_CONTRACT`，5 处统一插值；新增 `salsa20`
-
-- **修复 IDA 采集 0 反编译（最严重）**：`src/js/app.js` 误写 `window.electronApi`（小写 `pi`）→ 每次 `decompile` 都抛 `TypeError` 且被空 `catch` 静默吞掉 → **一个 native 函数都拿不到**，AI 只能回一句"请人工打开 IDA 分析"，解题直接卡死。改为 `electronAPI`；同时函数枚举改用真实工具名 `list_funcs`（旧的 `export_funcs{}`/`list_functions` 全部失败），反编译失败不再静默（打日志 + 0 个时明确告警）。实测：反编译 **0 → 19 个**（含 `JNI_OnLoad`、`RegisterNatives`、真正做 ChaCha20 校验的 `sub_257A0`）
-- **验证器补齐 ChaCha20**：提示词早已承诺 `algo:"chacha20"`，但求解器 Python 里**没有该分支**，导致"本地复现失败 → unknown algo chacha20"。新增 `chacha20`/`chacha20_ietf`/`salsa20` 分支，并处理 CTF 里最常见的坑——**counter 初值非 0 且大小端易错**（枚举候选自动命中）。实测 `[HIT]` 复现出 flag
-- **APK 安装冷启动失败**：日志错误是 `Failed to install <path>:`（原因为空），属模拟器刚开机 `installd` 未就绪的瞬时错误，但不在原重试正则内 → 不重试直接失败。现纳入可重试（增至 4 次 + 递增等待）；`INSTALL_FAILED_TEST_ONLY`/签名等确定性错误仍不重试
-- **Frida 附加"未找到进程"**：`resolveFridaProcessName` 只用 `frida-ps`（只列进程名），而包名在 `frida-ps -a` 的 Identifier 列；改用 `-a` 解析"包名 → 进程名"；且 App 未运行时**自动 monkey 拉起再 attach**。实测：包名 `com.cr.myapplication` → 进程名 `My Application` 解析成功
 
 ### v1.3.5 (2026-10-13) — 结构化知识库 + 解题成功率优化
 - **知识库重构为「结构化 + RAG 友好」**：新增全局检索索引 `AI-SEARCH-INDEX.md` 与速查表 `PAYLOAD-CHEATSHEET.md`

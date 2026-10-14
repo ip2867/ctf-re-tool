@@ -1,7 +1,7 @@
 # CTF-RE-TOOL 项目框架总览（SSOT）
 
 > **用途**：本文件是项目的**单一事实来源（SSOT）**。新开对话时**先读本文件**即可掌握项目全貌，再按需深入具体文件。
-> **版本**：v1.3.13 ｜ **形态**：Electron 桌面应用（Windows）｜ **定位**：CTF 逆向 AI 解题工作台
+> **版本**：v1.3.14 ｜ **形态**：Electron 桌面应用（Windows）｜ **定位**：CTF 逆向 AI 解题工作台
 > **一句话**：把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成 AI 可自主驱动的流水线；通过 MCP 接入 IDA/JEB/Burp，内置 11 个方法论技能 + 54 页结构化知识库。
 
 ---
@@ -13,7 +13,7 @@
 技术栈     → Electron 35 + 原生 JS（无框架、无打包器）；主进程 Node，渲染层浏览器
 代码中心   → electron/main.js（主进程/全部外部能力） + src/js/app.js（渲染层/解题编排）
 两个仓库   → ctf-tool-v2（源码，本地无远程） → ctf-re-tool-publish（镜像） → GitHub ip2867/ctf-re-tool
-当前版本   → v1.3.13（已发 GitHub Release，exe 73.3MB normal 压缩）
+当前版本   → v1.3.14（已发 GitHub Release，exe 73.3MB normal 压缩）
 ```
 
 **新对话要做的第一件事**：确认改动落在哪个仓库。**源码仓 `ctf-tool-v2` 是唯一编辑点**；`ctf-re-tool-publish` 只是复制品，改完源码后同步过去再 push。
@@ -269,6 +269,7 @@ runVerification() 复现通过后:
 | **经验沉淀有死角** | 有的求解路径只做 `verifyAndRecord` 不 `harvestExperience`（JS/详细分析），有的连验证都没有；手动 `经验` 命令绕过去重 | v1.3.12 补齐 9/9 求解路径；手动回写同一去重器 |
 | **结构性漏接根治** | "验证"与"收割经验"是两步、散落 9 处 → 每轮都在补漏 | v1.3.13 收口为 `finalizeSolve()` 单一入口（一步内含四件）；**新增流程只调它**（§9） |
 | **5 类入口是空壳** | `.dex`/`.jar`/`.class`/Mach-O/`.luac` 的 handler 只有 15~24 行，只启动工具/打指引，AI 不参与 | v1.3.13 全部改造为真求解（JEB/IDA/字节抽取 → AI → finalizeSolve）；分流 12/12 均接真实求解器 |
+| **跨文件 MCP 缓存泄漏** | 新求解器往 `mcpCache.otherClasses` 塞结果不清空；`state._keyClassesByContent` 从不重置 → 连解多题时上一题数据串进本题提示词/类选择 | v1.3.14：`analyzeJavaLike` 入口 `clearMcpCache()`；`_keyClassesByContent` 并入 `clearMcpCache()` 重置 |
 
 ---
 

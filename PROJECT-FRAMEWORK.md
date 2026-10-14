@@ -316,7 +316,7 @@ _build.cmd normal
 | 求解器回归测试 | 见下方"测试基线" |
 
 ### 测试基线（每次改求解器/验证闭环后跑）
-在 `C:\Users\Administrator\_revhelp\` 放临时脚本（**勿入库**）：
+在项目外的临时目录（如 `%TEMP%` 下自建 `_revhelp\`）放临时脚本（**勿入库**）：
 - **求解器回归 11 项**：AES/DES-CBC（有/无/错 IV）、口令派生 key、ChaCha20、RC4、XOR（多字节+单字节整数）、custom 返回 str、负例不误报
 - **PYC 实战 4 项**：`py_obf_04.pyc`（Python 3.12，base64+XOR 199）各种契约写法
 - 做法：用 `new Function` 抽出 `buildSolvePython` → 写 template → 用 python 替换 `ATTEMPTS` 跑

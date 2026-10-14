@@ -1,7 +1,7 @@
 # CTF-RE-TOOL 项目框架总览（SSOT）
 
 > **用途**：本文件是项目的**单一事实来源（SSOT）**。新开对话时**先读本文件**即可掌握项目全貌，再按需深入具体文件。
-> **版本**：v1.3.11 ｜ **形态**：Electron 桌面应用（Windows）｜ **定位**：CTF 逆向 AI 解题工作台
+> **版本**：v1.3.12 ｜ **形态**：Electron 桌面应用（Windows）｜ **定位**：CTF 逆向 AI 解题工作台
 > **一句话**：把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成 AI 可自主驱动的流水线；通过 MCP 接入 IDA/JEB/Burp，内置 11 个方法论技能 + 54 页结构化知识库。
 
 ---
@@ -13,7 +13,7 @@
 技术栈     → Electron 35 + 原生 JS（无框架、无打包器）；主进程 Node，渲染层浏览器
 代码中心   → electron/main.js（主进程/全部外部能力） + src/js/app.js（渲染层/解题编排）
 两个仓库   → ctf-tool-v2（源码，本地无远程） → ctf-re-tool-publish（镜像） → GitHub ip2867/ctf-re-tool
-当前版本   → v1.3.11（已发 GitHub Release，exe 73.3MB normal 压缩）
+当前版本   → v1.3.12（已发 GitHub Release，exe 73.3MB normal 压缩）
 ```
 
 **新对话要做的第一件事**：确认改动落在哪个仓库。**源码仓 `ctf-tool-v2` 是唯一编辑点**；`ctf-re-tool-publish` 只是复制品，改完源码后同步过去再 push。
@@ -203,7 +203,7 @@ runVerification() 复现通过后:
 - `harvestExperience(aiText, {autoSave})` 收割 AI 输出的 `[EXPERIENCE]...[/EXPERIENCE]`（支持 `→` 多步攻击链）。
 - **解题成功（本地验证出已验证 flag）→ 自动入库**（`autoSave:true`）；未确认成功才暂存，等用户发「保存」（`flushPendingExperience()`）。
 - **去重是内容级、与日期无关**：`experienceKey()` 剥离 `[日期]` 前缀与标点后精确比对 + `experienceSimilar()` 二元组 Jaccard≥0.78 / 子串判定（吃掉"措辞微调/补半句"，不误合并"不同题"）。
-- 入库写入器统一为 `writeExperienceEntries()`（首建表头 → 追加 → 修剪），自动/手动两条路径共用。
+- 入库写入器统一为 `writeExperienceEntries()`（首建表头 → 追加 → 修剪），自动/手动两条路径共用；**手动 `经验 <内容>` 命令也走 `experienceKey`/`experienceSimilar` 去重**（v1.3.12，此前直接追加绕过去重）。
 - 下次解题 `selectRelevantExperience()` 按关键词注入；**注入模板统一走 `experienceSection()`**（所有求解路径都调它，含写死 system prompt 的 APK/PE/Frida）。
 
 ### 4.8 系统提示 buildSystemPrompt()
@@ -260,7 +260,8 @@ runVerification() 复现通过后:
 | **`flags is not defined` 崩溃** | v1.3.9 重构后 `autoSolveBinaryFlag`/`autoSolveFlag` 只解构 `verifiedFlags` 却仍引用裸 `flags`（旧声明已删） | v1.3.10 补 `const { verifiedFlags, flags } = ...`；**改 verifyAndRecord 调用点必须同时解构两个变量** |
 | **经验"存了没用"** | ① 只暂存不自动入库 → 库里长期为空；② 注入只在 `buildSystemPrompt()`，而 APK/PE 主路径用**写死 prompt**（禁止调工具、无经验段）；③ 去重按"整行含日期"→ 换日必重复 | v1.3.11：解题成功自动入库 + 内容级去重（`experienceKey`/`experienceSimilar`）；`experienceSection()` 注入**所有求解路径** |
 | **题库攻略 70% 丢失** | `wikiSearch` 解析 meta 的正则带 `m`，`$` 匹配行尾 → **列表写法** `attack_chain:`+`- 步骤` 被解析为空（43 篇仅 13 篇可用） | v1.3.11 `pickMetaValue()` 逐行解析（行内/列表/块标量）→ 38/43；摘要加"避坑" |
-| 主路径拿不到题库 | APK/PE 固定清单提示词"禁止调工具"，AI 无法 `wiki_search` | v1.3.11 `prefetchKnowledge()` 调用前主动检索并把攻略摘要**内联进提示词** |
+| 主路径拿不到题库 | APK/PE 固定清单提示词"禁止调工具"，AI 无法 `wiki_search` | v1.3.11 `prefetchKnowledge()` 调用前主动检索并把攻略摘要**内联进提示词**；v1.3.12 扩展到 PYC/WebJS |
+| **经验沉淀有死角** | 有的求解路径只做 `verifyAndRecord` 不 `harvestExperience`（JS/详细分析），有的连验证都没有；手动 `经验` 命令绕过去重 | v1.3.12 补齐 9/9 求解路径；**新增流程必须三件套**（见 §9）；手动回写同一去重器 |
 
 ---
 
@@ -297,6 +298,7 @@ _build.cmd normal
 | 新增/修复 AI 工具 | `main.js` `getToolDefinitions()` + `executeToolCall()` + preload 暴露 |
 | 新增 IDA 工具 | `main.js` candidates + `normalizeIdaArgs`；`app.js` 调用点 |
 | 新增验证算法 | `app.js` `VERIFY_ALGOS` 常量 + `buildSolvePython` 求解器分支（**两处同改**） |
+| **新增求解流程** | **三个必做**：① `verifyAndRecord()`（验证闭环）② `harvestExperience(text,{autoSave:已验证flag>0})`（解题成功自动沉淀经验）③ 经验注入（`buildSystemPrompt()` 或 `experienceSection()`）+ 视情况 `prefetchKnowledge()`（禁止调工具的路径必须预取） |
 | 改解题提示词 | `app.js` `toolUseDeepSolve` / `autoSolveFlag` / `analyzePYC` 的 prompt |
 | 改 PYC 反汇编 | `electron/pyc_decompile.py`（后端链）+ `main.js` `pyc-decompile` 分区解析 |
 | 改知识库 | `wiki/` 页面 + 更新 `AI-SEARCH-INDEX.md` / `README.md` 登记 |

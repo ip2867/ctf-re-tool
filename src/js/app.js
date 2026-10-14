@@ -2736,10 +2736,11 @@ ${strings ? `\n## 原始字节串扫描（含明文串/base64/hex/大整数）\n
     if (result.success && result.text) {
       state.lastAiText = result.text;
       addSolveNote('求解结果(PYC)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
-      await harvestExperience(result.text);
       // 3. 验证闭环
       addLog('info', '[3/3] 本地复现验证...');
       const { verifiedFlags: vf, flags } = await verifyAndRecord(result.text, { source: 'pyc' });
+      // 解题成功（有已验证 flag）→ 经验自动入库；否则仅暂存（内容级去重）
+      await harvestExperience(result.text, { autoSave: vf.length > 0 });
       addSystemMessage(`**🐍 PYC 分析结果**（后端：${backendInfo || '未知'}）
 
 ${vf.length ? `**Flag（✅已验证）**: \`${vf[0].flag}\`` : (flags.length ? `**Flag（⚠️未验证）**: \`${flags[0]}\`` : '')}
@@ -5147,13 +5148,14 @@ ${state.lastAiText ? `## 此前静态分析结论（节选）\n${String(state.la
     beginStreamMessage();
     const result = await window.electronAPI.claudeChat(
       [{ role: 'user', content: concludePrompt }],
-      '你是CTF逆向解题专家。结合动态抓取数据给出 flag。不要调用任何工具。'
+      '你是CTF逆向解题专家。结合动态抓取数据给出 flag。不要调用任何工具。' + experienceSection()
     );
     endStreamMessage();
     if (result.success && result.text) {
       state.lastAiText = result.text;
-      await harvestExperience(result.text);
-      await verifyAndRecord(result.text, { source: 'frida', noteSection: 'Flag(动态)' });
+      const { verifiedFlags: vf } = await verifyAndRecord(result.text, { source: 'frida', noteSection: 'Flag(动态)' });
+      // 解题成功（有已验证 flag）→ 经验自动入库；否则仅暂存（内容级去重）
+      await harvestExperience(result.text, { autoSave: vf.length > 0 });
       addSystemMessage(`**🎯 动态调试结论**\n\n${result.text}`);
     } else {
       addLog('warning', '动态结论生成失败: ' + (result.error || '未知'));
@@ -5421,6 +5423,12 @@ async function autoSolveFlag() {
     }
   }
 
+  // 自动预取：本题固定清单禁止调工具，故先按已采集代码/包名检索知识库并内联攻略
+  const knowledge = await prefetchKnowledge(
+    [analysisData.manifest, analysisData.packageName, mainClass, analysisData.mainActivityCode,
+     (analysisData.otherClassesCode || []).map(c => c.code).join('\n')].join('\n'),
+    state.fileType || 'APK', [analysisData.packageName].filter(Boolean));
+
   const analysisPrompt = `我正在分析一个CTF APK题目。
 
 文件路径：${state.currentFile}
@@ -5435,6 +5443,7 @@ ${analysisData.manifest ? analysisData.manifest.substring(0, 1500) : '暂无'}
 ## 主Activity反编译代码
 ${analysisData.mainActivityCode ? analysisData.mainActivityCode.substring(0, 4000) : '暂无'}
 ${otherClassesText}
+${knowledge}
 
 请直接分析上面的代码，找出：
 1. 加密算法是什么
@@ -5473,7 +5482,7 @@ ${otherClassesText}
     const startTime = Date.now();
     const result = await claudeChatCascade(
       [{ role: 'user', content: analysisPrompt }],
-      `你是CTF逆向解题专家。请直接分析代码并给出flag。直接基于提供的代码分析，不要调用任何工具。\n解题学习闭环（强制）：回答最后必须输出 [EXPERIENCE]每条一行，格式"题型特征→关键套路/踩过的坑→下次怎么做"，最多5条、每条200字内[/EXPERIENCE]（确无新收获则写"无新增经验"），工具会自动写入经验库，下次同类题优先复用、避免重复踩坑。`
+      `你是CTF逆向解题专家。请直接分析代码并给出flag。直接基于提供的代码分析，不要调用任何工具。\n解题学习闭环（强制）：回答最后必须输出 [EXPERIENCE]每条一行，格式"题型特征→关键套路/踩过的坑→下次怎么做"，最多5条、每条200字内[/EXPERIENCE]（确无新收获则写"无新增经验"），工具会自动写入经验库，下次同类题优先复用、避免重复踩坑。` + experienceSection()
     );
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -5497,10 +5506,11 @@ ${otherClassesText}
       const clean = String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000);
       addSolveNote('求解结果', clean);
       state.lastAiText = result.text;
-      await harvestExperience(result.text);
 
       // 验证闭环 + 失败时本地枚举兜底（统一走 verifyAndRecord）
       const { verifiedFlags, flags } = await verifyAndRecord(result.text, { source: 'ai' });
+      // 解题成功（有已验证 flag）→ 经验自动入库；否则仅暂存（内容级去重）
+      await harvestExperience(result.text, { autoSave: verifiedFlags.length > 0 });
 
       const resultMsg = `**🎯 自动求解结果**
 
@@ -5619,10 +5629,11 @@ ${mcpCache.nativeIntel.globals && mcpCache.nativeIntel.globals.length ? `\n## SO
     if (result.success && result.text) {
       state.lastAiText = result.text;
       addSolveNote('求解结果(Tool-Use)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
-      await harvestExperience(result.text);
       await verifyAndRecord(result.text, { source: 'ai-deep' });
 
       const verifiedFlags = (state.findings ? state.findings.flags : []).filter(f => f.verified);
+      // 解题成功（有已验证 flag）→ 经验自动入库；否则仅暂存（内容级去重）
+      await harvestExperience(result.text, { autoSave: verifiedFlags.length > 0 });
       const flags = extractFlags(result.text);
       addSystemMessage(`**🎯 Tool-Use 深度求解结果**
 
@@ -5687,7 +5698,7 @@ ${analysisData.mainActivityCode ? analysisData.mainActivityCode.substring(0, 200
   try {
     const result = await window.electronAPI.claudeChat(
       [{ role: 'user', content: detailedPrompt }],
-      `你是CTF逆向解题专家。请使用工具分析代码并找出flag。最多调用5次工具，找到flag后立即停止。当前文件: ${state.fileInfo.fileName}`
+      `你是CTF逆向解题专家。请使用工具分析代码并找出flag。最多调用5次工具，找到flag后立即停止。当前文件: ${state.fileInfo.fileName}` + experienceSection()
     );
 
     if (result.success && result.text) {
@@ -5932,6 +5943,11 @@ async function autoSolveBinaryFlag(fileType) {
       mainCodeText = 'main函数代码解析失败';
     }
 
+    // 自动预取：本题固定清单禁止调工具，故先按已采集代码/字符串检索知识库并内联攻略
+    const knowledge = await prefetchKnowledge(
+      [functionsText, stringsText, mainCodeText, otherFuncsText, globalsText].join('\n'),
+      fileType);
+
     const analysisPrompt = `我正在分析一个CTF ${fileType}题目。
 
 文件路径：${state.currentFile}
@@ -5948,6 +5964,7 @@ ${stringsText}
 ${mainCodeText}
 ${otherFuncsText}
 ${globalsText}
+${knowledge}
 
 请直接分析上面的代码，找出：
 1. 加密算法是什么
@@ -5987,7 +6004,7 @@ ${globalsText}
     const startTime = Date.now();
     const result = await claudeChatCascade(
       [{ role: 'user', content: analysisPrompt }],
-      `你是CTF逆向解题专家。请直接分析代码并给出flag。不要调用任何工具，直接基于提供的代码分析。\n解题学习闭环（强制）：回答最后必须输出 [EXPERIENCE]每条一行，格式"题型特征→关键套路/踩过的坑→下次怎么做"，最多5条、每条200字内[/EXPERIENCE]（确无新收获则写"无新增经验"），工具会自动写入经验库，下次同类题优先复用、避免重复踩坑。`
+      `你是CTF逆向解题专家。请直接分析代码并给出flag。不要调用任何工具，直接基于提供的代码分析。\n解题学习闭环（强制）：回答最后必须输出 [EXPERIENCE]每条一行，格式"题型特征→关键套路/踩过的坑→下次怎么做"，最多5条、每条200字内[/EXPERIENCE]（确无新收获则写"无新增经验"），工具会自动写入经验库，下次同类题优先复用、避免重复踩坑。` + experienceSection()
     );
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -6012,10 +6029,11 @@ ${globalsText}
       const clean = String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000);
       addSolveNote('求解结果', clean);
       state.lastAiText = result.text;
-      await harvestExperience(result.text);
 
       // 验证闭环 + 失败时本地枚举兜底（统一走 verifyAndRecord）
       const { verifiedFlags, flags } = await verifyAndRecord(result.text, { source: 'ai' });
+      // 解题成功（有已验证 flag）→ 经验自动入库；否则仅暂存（内容级去重）
+      await harvestExperience(result.text, { autoSave: verifiedFlags.length > 0 });
 
       const resultMsg = `**🎯 自动求解结果**
 
@@ -6105,9 +6123,10 @@ ${analysisData.strings ? `\n## 关键字符串\n${typeof analysisData.strings ==
     if (result.success && result.text) {
       state.lastAiText = result.text;
       addSolveNote('求解结果(Tool-Use)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
-      await harvestExperience(result.text);
       await verifyAndRecord(result.text, { source: 'ai-deep' });
       const vf = (state.findings ? state.findings.flags : []).filter(f => f.verified);
+      // 解题成功（有已验证 flag）→ 经验自动入库；否则仅暂存（内容级去重）
+      await harvestExperience(result.text, { autoSave: vf.length > 0 });
       addSystemMessage(`**🎯 Tool-Use 深度求解结果**\n\n${vf.length ? `**Flag（✅已验证）**: \`${vf[0].flag}\`` : ''}\n\n${result.text}`);
       return vf.length > 0;
     }
@@ -6162,7 +6181,7 @@ ${analysisData.mainCode ? analysisData.mainCode.substring(0, 2000) : '暂无'}
   try {
     const result = await window.electronAPI.claudeChat(
       [{ role: 'user', content: detailedPrompt }],
-      `你是CTF逆向解题专家。请使用工具分析代码并找出flag。最多调用5次工具，找到flag后立即停止。当前文件: ${state.fileInfo.fileName}`
+      `你是CTF逆向解题专家。请使用工具分析代码并找出flag。最多调用5次工具，找到flag后立即停止。当前文件: ${state.fileInfo.fileName}` + experienceSection()
     );
 
     if (result.success && result.text) {
@@ -6278,7 +6297,7 @@ function buildSystemPrompt() {
        "APK多阶段题→反查常量串定位校验类→native 反演 key→AES 解 flag→坑:IV 单独按 base64 解"
      · 也可写"失败教训"（哪条路走不通、为什么、下次直接换哪条）——失败教训往往比成功更有价值
      · 最多 5 条，每条 ≤300 字；确无新收获写"无新增经验"
-${skillsIndex}${wikiIndex}${state.experience ? `\n## 历史经验速查（此前解题沉淀，同类场景优先复用）\n${selectRelevantExperience(state.experience, state.findings)}\n` : ''}${(state.findings && ((state.findings.flags || []).length || (state.findings.algorithms || []).length)) ? `\n## 本题已收集的结论（勿重复劳动/勿推翻已验证项）\n${(state.findings.flags || []).map(f => `- Flag: ${f.flag}${f.verified ? '（✅已验证）' : '（⚠️未验证）'}`).join('\n')}\n${(state.findings.algorithms || []).length ? `- 已识别算法: ${state.findings.algorithms.map(a => (a && a.text) || a).join('; ')}` : ''}\n` : ''}
+${skillsIndex}${wikiIndex}${experienceSection()}${(state.findings && ((state.findings.flags || []).length || (state.findings.algorithms || []).length)) ? `\n## 本题已收集的结论（勿重复劳动/勿推翻已验证项）\n${(state.findings.flags || []).map(f => `- Flag: ${f.flag}${f.verified ? '（✅已验证）' : '（⚠️未验证）'}`).join('\n')}\n${(state.findings.algorithms || []).length ? `- 已识别算法: ${state.findings.algorithms.map(a => (a && a.text) || a).join('; ')}` : ''}\n` : ''}
 
 ## 工具使用约定（Windows 环境，务必遵守）
 - 本机是 Windows。shell 工具（bash/run_command）由 cmd.exe 执行，默认工作目录已是当前题目所在文件夹：
@@ -7450,14 +7469,63 @@ async function runHypotheses(aiText, opts = {}) {
   return { verified: false, hits: [] };
 }
 
-// 解题学习闭环：从 AI 回答中收割 [EXPERIENCE]...[/EXPERIENCE] 经验块，写入经验库供下次解题自动速查
-// 【D 升级】支持"多步攻击链"：一条经验若含 `→` 分隔的步骤（或子行以 ·/数字开头）→ 存为
+// 经验去重键：剥离「- [日期] 」前缀与全部标点/空白后比对。
+// 关键修复：旧实现按"整行字符串"比对，同一条经验换个日期就成了"新行"→ 必然重复入库。
+function experienceKey(s) {
+  return String(s || '')
+    .replace(/^-?\s*\[\d{4}-\d{2}-\d{2}\]\s*/, '')
+    .toLowerCase()
+    .replace(/[\s\-_*•·▶→,，。;；:：、|/\\()（）\[\]【】"'“”‘’`]+/g, '')
+    .trim();
+}
+
+// 判两条经验是否"实为同一条"（措辞微调 / 补半句 / 顺序调换）：
+//   · Jaccard 相似度 ≥0.78（措辞级微调、顺序调换）
+//   · 或短的那条是长的那条的**完整子串**（只是补了半句，且短条足够长以免误判）
+// 阈值经真实样本校准：真重复 jac 落在 0.815~0.944 或为完整子串；而"套路相同但确是不同的题"
+// 最高 jac=0.744 且不构成子串 → 以 0.78 居中切分，两侧各留 ~0.035 余量，不误合并不同题。
+function experienceSimilar(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const short = a.length <= b.length ? a : b;
+  const long = a.length <= b.length ? b : a;
+  if (short.length >= 12 && long.includes(short)) return true;   // 完整子串 = 补了半句
+  const bigrams = (s) => { const out = new Set(); for (let i = 0; i < s.length - 1; i++) out.add(s.slice(i, i + 2)); return out; };
+  const A = bigrams(a), B = bigrams(b);
+  if (!A.size || !B.size) return false;
+  let inter = 0; for (const x of A) if (B.has(x)) inter++;
+  const union = A.size + B.size - inter;
+  return union > 0 && (inter / union) >= 0.78;
+}
+
+// 把经验条目写入 experience.md（首建补表头 → 逐条追加 → 更新内存 → 按上限修剪）。
+// 抽成单一入口，供"解题成功自动入库"与「保存」手动入库共用，避免两处各写一遍。
+async function writeExperienceEntries(lines) {
+  if (!state.appPaths || !Array.isArray(lines) || !lines.length) return 0;
+  const expPath = `${state.appPaths.userData}/experience.md`;
+  const rf = await window.electronAPI.readFile(expPath);
+  if (!rf || !rf.success) {
+    await window.electronAPI.writeFile(expPath, '# 解题经验库（reverse-skill 进化层：AI 解题前自动速查）\n\n');
+  }
+  let n = 0;
+  for (const line of lines) {
+    const r = await window.electronAPI.appendFile(expPath, line + '\n');
+    if (r && r.success) { state.experience += line + '\n'; n++; }
+  }
+  if (n) await pruneExperience();
+  return n;
+}
+
+// 解题学习闭环：从 AI 回答中收割 [EXPERIENCE]...[/EXPERIENCE] 经验块，供下次解题自动速查。
+// 支持"多步攻击链"：一条经验若含 `→` 分隔的步骤（或子行以 ·/数字开头）→ 存为
 //   一条"链式"经验（特征▶步骤1▶步骤2▶…▶坑），而非拆成互不相关的单行；单行经验保持兼容。
-async function harvestExperience(aiText) {
+// 入库策略：解题成功（opts.autoSave=true，调用方已确认有已验证 flag）→ **自动入库**；
+//   否则仅暂存，等用户发送「保存」再入库。两条路径都做内容级去重（与日期无关）。
+async function harvestExperience(aiText, opts = {}) {
   try {
     const text = String(aiText || '');
     const m = text.match(/\[(?:EXPERIENCE|经验)\]([\s\S]*?)\[\/(?:EXPERIENCE|经验)\]/i);
-    if (!m || !state.appPaths) return;
+    if (!m || !state.appPaths) return 0;
     // 先按"顶层条目"分组：以 -/*/数字 开头的行是条目起点；其后续不带标记的行视为该条目的续行（步骤）
     const groups = [];
     for (const raw of m[1].split('\n')) {
@@ -7475,53 +7543,106 @@ async function harvestExperience(aiText) {
       if (!body || /^(无|无新增经验|无新增|none)$/i.test(body) || body.length <= 4) continue;
       entries.push(body.slice(0, 400));
     }
-    if (!entries.length) return;
-    // 解题成功不再自动入库：先暂存，用户发送「保存」才写入 experience.md
+    if (!entries.length) return 0;
+
+    // 内容级去重：把"已入库"与"已暂存"的经验都归一成键，逐条比对（精确匹配 + 近似匹配）
     if (!Array.isArray(state.pendingExperience)) state.pendingExperience = [];
-    let n = 0;
+    const existing = [];
+    for (const l of String(state.experience || '').split('\n')) { const k = experienceKey(l); if (k) existing.push(k); }
+    for (const l of state.pendingExperience) { const k = experienceKey(l); if (k) existing.push(k); }
+    const fresh = [];
     for (const body of entries.slice(0, 5)) {
-      const line = `- [${new Date().toISOString().slice(0, 10)}] ${body}`;
-      if (state.pendingExperience.includes(line) || (state.experience || '').includes(line)) continue;
+      const key = experienceKey(body);
+      if (!key) continue;
+      if (existing.some(k => k === key || experienceSimilar(k, key))) continue;
+      existing.push(key);
+      fresh.push(`- [${new Date().toISOString().slice(0, 10)}] ${body}`);
+    }
+    if (!fresh.length) {
+      addLog('info', '本题经验与经验库/暂存区重复，未新增（去重：与日期无关的内容比对）');
+      return 0;
+    }
+
+    if (opts.autoSave) {
+      // 解题成功 → 直接入库（无需人工发「保存」）
+      const n = await writeExperienceEntries(fresh);
+      if (n) {
+        fresh.forEach(l => addSolveNote('经验', l.replace(/^- \[[^\]]+\] /, '').slice(0, 200)));
+        addLog('success', `✅ 解题成功，自动沉淀 ${n} 条新经验（已入库，内容级去重）`);
+        addSystemMessage(`**🧠 经验已自动入库（${n} 条）**\n\n${fresh.map(l => '> ' + l.replace(/^- \[[^\]]+\] /, '')).join('\n\n')}\n\n下次同类题自动注入速查（无需手动保存）。`);
+      }
+      return n;
+    }
+    // 未确认解题成功 → 仅暂存，用户发「保存」才写入
+    for (const line of fresh) {
       state.pendingExperience.push(line);
-      addSolveNote('经验(待保存)', body.slice(0, 200));
-      n++;
+      addSolveNote('经验(待保存)', line.replace(/^- \[[^\]]+\] /, '').slice(0, 200));
     }
-    if (n) {
-      addLog('info', `本题提炼出 ${n} 条经验（已暂存，未入库）。需要沉淀时发送「保存」写进经验库`);
-      addSystemMessage(`**💾 经验已暂存（未入库）**\n\n${state.pendingExperience.slice(-n).map(l => '> ' + l.replace(/^- \[[^\]]+\] /, '')).join('\n\n')}\n\n发送 **保存** 后才写入经验库（experience.md）。`);
-    }
+    addLog('info', `本题提炼出 ${fresh.length} 条经验（已暂存，未入库）。需要沉淀时发送「保存」写进经验库`);
+    addSystemMessage(`**💾 经验已暂存（未入库）**\n\n${fresh.map(l => '> ' + l.replace(/^- \[[^\]]+\] /, '')).join('\n\n')}\n\n未确认解题成功：发送 **保存** 后才写入经验库（experience.md）。`);
+    return fresh.length;
   } catch (e) {
     addLog('warning', '经验暂存失败: ' + e.message);
+    return 0;
   }
 }
 
-// 「保存」指令：把暂存的解题经验写入 experience.md（入库由人工触发，保留原有机制）
+// 经验注入段：把与"当前题特征"最相关的历史经验拼成系统提示片段。
+// 供 buildSystemPrompt 与各求解流程（含原本写死 system prompt 的 APK/PE 路径）共用，
+// 解决"经验存了却从不被复用"的问题。
+function experienceSection() {
+  if (!state.experience) return '';
+  const picked = selectRelevantExperience(state.experience, state.findings);
+  if (!picked) return '';
+  return `\n\n## 历史经验速查（此前解题沉淀：同类场景优先复用、勿重踩已记录的坑）\n${picked}`;
+}
+
+// 自动预取知识库攻略：从本题已采集的代码/字符串里抽取"算法/工具/混淆"特征词，
+// 主动调用 wiki_search 检索历年题条目库 + 手法专题页，把最相关的摘要内联进提示词。
+// 为什么必须内联：APK/PE 两条"固定清单"主路径在提示词里**明令禁止调用工具**，
+// 若不预先取好，AI 既看不到题库也无权查 → 43 篇题库页 + frida/firmware 手法页形同虚设。
+async function prefetchKnowledge(haystack, fileType, extra = []) {
+  try {
+    const api = window.electronAPI;
+    if (!api || !api.wikiSearch) return '';
+    const hay = String(haystack || '').toLowerCase();
+    // 可在题面代码/字符串里探测到的特征词（算法族/工具/混淆/语言/平台）
+    const POOL = ['rc4', 'tea', 'xtea', 'xxtea', 'aes', 'des', '3des', 'sm4', 'sm3', 'chacha20', 'chacha', 'salsa20',
+      'twofish', 'blowfish', 'idea', 'base64', 'md5', 'sha256', 'sha1', 'rsa', 'xor', 'rot13', 'caesar', 'crc32',
+      's-box', 'sbox', 'whitebox', '白盒', 'dfa', 'ollvm', 'vm', 'upx', 'frida', 'registernatives', 'jni', 'smali',
+      'realm', 'macho', 'pyc', 'marshal', 'cuda', 'ptx', 'riscv', 'qemu', '固件', 'firmware', 'unidbg', 'angr',
+      'unicorn', 'z3', '反调试', 'ptrace', 'hook', 'native'];
+    const hits = POOL.filter(t => hay.includes(t));
+    const ft = String(fileType || '').toUpperCase();
+    if (/APK|DEX/.test(ft)) hits.unshift('apk');
+    else if (/PE|ELF|EXE|BIN/.test(ft)) hits.unshift('native');
+    else if (/PYC/.test(ft)) hits.unshift('python');
+    else if (/MACHO/.test(ft)) hits.unshift('macho');
+    const terms = [...new Set([...extra, ...hits].map(s => String(s).trim()).filter(Boolean))].slice(0, 6);
+    if (!terms.length) terms.push(ft || 'reverse');
+    const r = await api.wikiSearch(terms.join(' '), 4);
+    if (!r || !r.success || !r.result || /未找到与/.test(r.result)) return '';
+    addLog('info', `[知识库] 已按本题特征自动检索：${terms.join(' ')}`);
+    return `\n\n## 相关知识库攻略（工具已按本题特征自动检索命中，**直接参考，勿重复摸索已记录的路**）\n${r.result}`;
+  } catch (e) {
+    return '';
+  }
+}
+
+// 「保存」指令：把暂存的解题经验写入 experience.md（手动入库路径，与自动入库共用写入器）
 async function flushPendingExperience() {
   try {
     if (!Array.isArray(state.pendingExperience)) state.pendingExperience = [];
     if (!state.pendingExperience.length) {
-      addSystemMessage('**当前没有待保存的经验**\n\n解题成功时提炼的经验只暂存不入库；发送「保存」才会写入。');
+      addSystemMessage('**当前没有待保存的经验**\n\n（解题成功的经验已**自动入库**；仅未确认成功时提炼的经验需要发送「保存」写入。）');
       return;
     }
     if (!state.appPaths) return;
-    const expPath = `${state.appPaths.userData}/experience.md`;
-    const rf = await window.electronAPI.readFile(expPath);
-    if (!rf || !rf.success) {
-      await window.electronAPI.writeFile(expPath, '# 解题经验库（reverse-skill 进化层：AI 解题前自动速查）\n\n');
-    }
-    let n = 0;
-    for (const line of state.pendingExperience) {
-      const r = await window.electronAPI.appendFile(expPath, line + '\n');
-      if (r && r.success) {
-        state.experience += line + '\n';
-        n++;
-      }
-    }
+    const n = await writeExperienceEntries(state.pendingExperience.slice());
     state.pendingExperience = [];
     if (n) {
       addLog('success', `✅ 已按指令保存 ${n} 条经验进知识库，下次解题自动速查（避坑复用）`);
       addSystemMessage(`**✅ 经验已入库（${n} 条）**\n\n暂存经验已写入 experience.md，下次解题自动注入速查。`);
-      await pruneExperience();
     }
   } catch (e) {
     addLog('error', '经验保存失败: ' + e.message);

@@ -1,7 +1,7 @@
 # CTF-RE-TOOL 项目框架总览（SSOT）
 
 > **用途**：本文件是项目的**单一事实来源（SSOT）**。新开对话时**先读本文件**即可掌握项目全貌，再按需深入具体文件。
-> **版本**：v1.3.10 ｜ **形态**：Electron 桌面应用（Windows）｜ **定位**：CTF 逆向 AI 解题工作台
+> **版本**：v1.3.11 ｜ **形态**：Electron 桌面应用（Windows）｜ **定位**：CTF 逆向 AI 解题工作台
 > **一句话**：把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成 AI 可自主驱动的流水线；通过 MCP 接入 IDA/JEB/Burp，内置 11 个方法论技能 + 54 页结构化知识库。
 
 ---
@@ -13,7 +13,7 @@
 技术栈     → Electron 35 + 原生 JS（无框架、无打包器）；主进程 Node，渲染层浏览器
 代码中心   → electron/main.js（主进程/全部外部能力） + src/js/app.js（渲染层/解题编排）
 两个仓库   → ctf-tool-v2（源码，本地无远程） → ctf-re-tool-publish（镜像） → GitHub ip2867/ctf-re-tool
-当前版本   → v1.3.10（已发 GitHub Release，exe 73.3MB normal 压缩）
+当前版本   → v1.3.11（已发 GitHub Release，exe 73.3MB normal 压缩）
 ```
 
 **新对话要做的第一件事**：确认改动落在哪个仓库。**源码仓 `ctf-tool-v2` 是唯一编辑点**；`ctf-re-tool-publish` 只是复制品，改完源码后同步过去再 push。
@@ -200,21 +200,26 @@ runVerification() 复现通过后:
 ```
 
 ### 4.7 经验库（自进化）
-- `harvestExperience()` 收割 AI 输出的 `[EXPERIENCE]...[/EXPERIENCE]`（支持 `→` 多步攻击链）。
-- **只在用户发送「保存」时**才写入 `experience.md`（`flushPendingExperience()`），否则只暂存。
-- 下次解题 `selectRelevantExperience()` 按关键词注入系统提示。
+- `harvestExperience(aiText, {autoSave})` 收割 AI 输出的 `[EXPERIENCE]...[/EXPERIENCE]`（支持 `→` 多步攻击链）。
+- **解题成功（本地验证出已验证 flag）→ 自动入库**（`autoSave:true`）；未确认成功才暂存，等用户发「保存」（`flushPendingExperience()`）。
+- **去重是内容级、与日期无关**：`experienceKey()` 剥离 `[日期]` 前缀与标点后精确比对 + `experienceSimilar()` 二元组 Jaccard≥0.78 / 子串判定（吃掉"措辞微调/补半句"，不误合并"不同题"）。
+- 入库写入器统一为 `writeExperienceEntries()`（首建表头 → 追加 → 修剪），自动/手动两条路径共用。
+- 下次解题 `selectRelevantExperience()` 按关键词注入；**注入模板统一走 `experienceSection()`**（所有求解路径都调它，含写死 system prompt 的 APK/PE/Frida）。
 
 ### 4.8 系统提示 buildSystemPrompt()
-注入：真实 MCP 连接状态 + 技能索引 + wiki 索引 + 经验速查 + 已收集结论（防重复劳动）。**只注入索引，不注入全文**（省 token）。
+注入：真实 MCP 连接状态 + 技能索引 + wiki 索引 + 经验速查（`experienceSection()`）+ 已收集结论（防重复劳动）。**只注入索引，不注入全文**（省 token）。
+- **主路径自动预取**：`autoSolveFlag`/`autoSolveBinaryFlag` 是"固定清单 + 禁止调工具"提示词，AI 无权检索 → `prefetchKnowledge()` 从已采集代码/字符串探测算法·工具·混淆特征词，**调用前主动 wiki_search 并把攻略摘要内联进提示词**（否则 43 篇题库形同虚设）。
 
 ---
 
 ## 5. 知识库（wiki/）与技能（skills/）
 
-### 5.1 wikiSearch 结构化加权（v1.3.5 修复）
+### 5.1 wikiSearch 结构化加权（v1.3.5 修复 / v1.3.11 修复解析 bug）
 - 兼容两种 meta 写法：`---` front matter **和** ` ```yaml ` 围栏块（reverse/ 用的是后者）。
-- 加权字段：`tags(6)` / `key_observations|key_payload|failed_attempts(5)` / `one_liner(5)` / `attack_chain(4)` / `reasoning_chain(4)` / `vuln_type|contest|difficulty(3)`。
-- 命中片段优先展示 `one_liner`+`attack_chain`，**保留原文大小写**（防 flag 被小写化）。
+- **字段解析 `pickMetaValue()`（v1.3.11 修复）**：兼容 ① 行内 `key: value` ② 列表 `key:` 换行 + `- 步骤` ③ 块标量 `|`/`>`。
+  旧正则带 `m` 标志使 `$` 匹配行尾 → **列表写法的 attack_chain/failed_attempts 全解析为空**（43 篇里仅 13 篇解法链可用）。修复后 → 38/43。
+- 加权字段：`tags(6)` / `key_observations|key_payload|failed_attempts|lesson(5)` / `keywords(5, 手法页)` / `one_liner(5)` / `attack_chain(4)` / `reasoning_chain(4)` / `failed_attempts(4)` / `vuln_type|contest|difficulty(3)`。
+- 命中片段展示 **要点 + 解法链 + 避坑（失败教训）**，**保留原文大小写**（防 flag 被小写化）。
 
 ### 5.2 11 个技能
 `ctf-dispatch`（分流调度）｜`ctf-reverse-binary`（PE/ELF）｜`ctf-reverse-android`（APK）｜`ctf-reverse-langs`（pyc/Go/Rust/Lua）｜`ctf-reverse-tooling`（Z3/angr/Unicorn）｜`ctf-frida-dynamic`｜`ctf-antidebug`｜`ctf-jsreverse`｜`ctf-iot-firmware`｜`ctf-crypto-identify`｜`ctf-writeup`
@@ -253,6 +258,9 @@ runVerification() 复现通过后:
 | PYC custom 解密崩 | AI 的 decrypt 返回 `str` 被按 bytes 处理 | `_to_bytes_out()` 先归一化 |
 | 验证闭环 7 处复制粘贴 | 各流程各写一遍，语义漂移（`if(!vr)` 门控不一致） | v1.3.9 统一为 `verifyAndRecord()` |
 | **`flags is not defined` 崩溃** | v1.3.9 重构后 `autoSolveBinaryFlag`/`autoSolveFlag` 只解构 `verifiedFlags` 却仍引用裸 `flags`（旧声明已删） | v1.3.10 补 `const { verifiedFlags, flags } = ...`；**改 verifyAndRecord 调用点必须同时解构两个变量** |
+| **经验"存了没用"** | ① 只暂存不自动入库 → 库里长期为空；② 注入只在 `buildSystemPrompt()`，而 APK/PE 主路径用**写死 prompt**（禁止调工具、无经验段）；③ 去重按"整行含日期"→ 换日必重复 | v1.3.11：解题成功自动入库 + 内容级去重（`experienceKey`/`experienceSimilar`）；`experienceSection()` 注入**所有求解路径** |
+| **题库攻略 70% 丢失** | `wikiSearch` 解析 meta 的正则带 `m`，`$` 匹配行尾 → **列表写法** `attack_chain:`+`- 步骤` 被解析为空（43 篇仅 13 篇可用） | v1.3.11 `pickMetaValue()` 逐行解析（行内/列表/块标量）→ 38/43；摘要加"避坑" |
+| 主路径拿不到题库 | APK/PE 固定清单提示词"禁止调工具"，AI 无法 `wiki_search` | v1.3.11 `prefetchKnowledge()` 调用前主动检索并把攻略摘要**内联进提示词** |
 
 ---
 
@@ -260,7 +268,7 @@ runVerification() 复现通过后:
 
 1. **不发布私有信息**：`E:\...` 路径、IP、用户名、私有端点不得进仓库（当前 0 泄露）。
 2. `HANDOFF.md`（含真实 flag/路径）**不得**入库（已 gitignore）。
-3. 经验入库**只在用户发「保存」时**触发。
+3. 经验入库：**解题成功（已验证 flag）时自动入库**（内容级去重）；未确认成功的才需用户发「保存」。
 4. **禁止** `taskkill /F /IM node.exe`。
 5. **不 clone 含恶意样本的仓库**（只读文本）。
 6. 访问仓库前先确认凭据来源；不要往源码/README 写真实 Token。

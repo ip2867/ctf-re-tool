@@ -1,4 +1,4 @@
-# CTF-RE-TOOL v1.3.12
+# CTF-RE-TOOL v1.3.13
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -307,6 +307,39 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 
 ## 更新日志
+
+### v1.3.13 (2026-10-14) — 解题结构根治：三件套收口 + 5 类"只指路"入口真正解题
+
+前两轮（v1.3.11/v1.3.12）反复出现"某条求解路径漏接验证闭环 / 漏接经验沉淀"——根治办法不是继续补漏，而是**从结构上让遗漏不可能发生**。本轮做两件事：
+
+**一、把"三件套"收口为单一入口 `finalizeSolve()`**
+
+此前 9 个求解流程里，每处都各写一遍"`verifyAndRecord`（验证）→ `harvestExperience`（经验自动入库）"两步。这次全部替换为一行：
+
+```js
+const { verifiedFlags, flags } = await finalizeSolve(result.text, { source: 'xxx' });
+```
+
+`finalizeSolve` 内部固定完成「验证闭环 → 失败自动枚举 → 登记 flag → 解题成功则经验自动入库」，并返回 `{ vr, flags, verifiedFlags }`。**新增任何求解流程只调它一处即可**，从结构上杜绝再漏（已写入 SSOT §9）。
+
+**二、让 5 类"只会指路"的入口真正走 AI 求解**
+
+审计分流表发现：`.dex` / `.jar` / `.class` / Mach-O / `.luac` 这 5 类的 handler 只有 15~24 行 —— **只启动外部工具或打印一段指引文字，AI 完全不参与**（无验证、无经验、无题库预取）。已全部改造为真正的求解路径：
+
+| 类型 | 旧行为 | 新行为 |
+|---|---|---|
+| **DEX** | 只启动 jadx | **JEB MCP 采集类列表 + 关键类反编译 → AI 求解 → 验证闭环** |
+| **JAR / .class** | 只启动 jadx | 同上（JEB 优先；不可用时降级 jadx 并明确告知，不假装已解）|
+| **Mach-O** | 只打印一段文字 | **IDA MCP 采集 → `autoSolveBinaryFlag` 二进制求解闭环** |
+| **.luac** | 只打印一段文字 | **Python 扫描明文串/长hex/base64/常量 → AI 求解 → 验证闭环** |
+
+> 顺带纠正：`.dex`/`.jar` 此前固定启动 jadx，现按你的实际工作流改为 **JEB 优先**（JEB MCP 的 `get_all_classes`/`get_class_decompiled_code` 已全套接好）。
+
+**三、题库预取扩展到新类型**
+
+`prefetchKnowledge()` 特征词池补上 Java/Android 类（jadx/dex2jar/smali/il2cpp/unity…）与 Lua 类（luac/unluac/luaopcode），分流分支也按 DEX/JAR/LUAC 分别注入对应检索词——让新路径同样能拿到题库攻略。
+
+> 回归：语法检查全过 ｜ 求解路径审计 **10/10** 三件套全覆盖 ｜ 分流表 **12/12** 均路由到真实求解器（ZIP 除外，其本就非题目文件）｜ 经验流 6/6、相似度 5/5、手动去重 3/3 ｜ `finalizeSolve` 契约与 Lua 扫描片段均实测通过。
 
 ### v1.3.12 (2026-10-14) — 补齐 v1.3.11 遗漏的求解路径（经验覆盖 100%）+ 预取扩展到 PYC/WebJS
 

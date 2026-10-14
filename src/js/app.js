@@ -487,6 +487,9 @@ async function analyzeFile(filePath) {
     state.fileType = typeResult.fileType;
     state.fileDescription = typeResult.description || '';
     state.fileInfo = infoResult;
+    // 换题清空"待保存经验"：暂存区属本题 AI 输出，跨题残留会让上一题的经验
+    // 在下一题被误入库/误注入（且 pendingExperience 纯内存、不持久化）。
+    state.pendingExperience = [];
 
     // 同步工作目录给主进程（AI 的 glob/grep 搜索根）
     try {
@@ -3264,23 +3267,46 @@ Java.perform(function() {
     // ========== 2. Hook String.equals (字符串比较，必须降噪) ==========
     try {
         var String = Java.use("java.lang.String");
-        // 降噪：只保留"可能是校验"的比较。实测噪音：'Cipher'=='Cipher'、
-        // 'AES/CBC/PKCS5PADDING'==同串（算法名自比较）、以及各类框架串——必须排除。
-        // ⚠️ 顺序很关键：先判"明确有意义"（含 flag/key 语义或长 hex），再做噪音排除。
-        //    绝不能先按"自比较"一刀切 —— 否则 userInput.equals(正确flag) 这种
-        //    长度 ≤32 的**真实命中**会被误杀（那正是最该打印的一条）。
-        var NOISE = /^(Cipher|AES|DES|RSA|MD5|SHA[\\-0-9]*|Hmac[A-Za-z0-9]*)$/i;
-        function isAlgoName(s) { return /^[A-Za-z0-9]+\\/[A-Za-z0-9]+(\\/[A-Za-z0-9]+)?$/i.test(s) || NOISE.test(s); }
+        // 降噪：只保留"可能是校验"的比较。实测噪音：'Cipher'=='Cipher'、'AES/CBC/...'==同串
+        // （算法名自比较）、'com.nctf.hookmysecret'==''（包名，日志里几十条）、'include'=='ViewStub'
+        // /'pathInterpolator'=='linearInterpolator'（框架/资源串）、'/data/user/0/...'=='/'（路径）。
+        // ⚠️ 判定顺序（关键）：
+        //   ① 高熵串（flag 形态/长hex/base64）→ **先**返回 true —— 这是最可能的 key/密文/flag，
+        //      且"flag==flag"这种自比较正是最终校验，**不能**被 a===b 规则误杀。
+        //   ② 双方都是"噪音形态"（包名/资源路径/绝对路径/算法名/框架词/含空格）→ 排除。
+        //   ③ 语义词（flag/ctf/key/secret…）命中且**非噪音形态** → 打印。
+        //   ④ 兜底：较长且长度相近的可打印串。
+        // 教训：曾用"标识符形态"当噪音判据 → hex 串与小写词也像标识符，把真实 key 比较误杀。
+        var NOISE_ALGO = /^(Cipher|AES|DES|RSA|MD5|SHA[\\-0-9]*|Hmac[A-Za-z0-9]*)$/i;
+        var NOISE_WORD = /^(include|fragment|window|search|autofill|tag|merge|view|blink|display|accessibility|layout_inflater|requestFocus|ViewStub|FrameLayout|LinearLayout|ScrollView|TextView|ContentFrameLayout|changeBounds|changeTransform|changeScroll|autoTransition|fade)$/i;
+        function isNoiseStr(s) {
+            if (!s) return true;
+            if (/\\s/.test(s)) return true;                                   // UI 文本/多行文本
+            if (/^[a-z0-9_]+(\\.[a-z0-9_]+){2,}/i.test(s)) return true;       // 包名 com.a.b
+            if (/^(res|assets|lib|META-INF|data|system|proc)[\\/]/i.test(s)) return true;
+            if (/^\\//.test(s)) return true;                                   // 绝对路径
+            if (/^android[.:]/i.test(s)) return true;
+            if (NOISE_ALGO.test(s) || NOISE_WORD.test(s)) return true;
+            if (/(interpolator|transition|viewstub|inflater|animator)/i.test(s)) return true;
+            if (/^(change|auto)[A-Z]/.test(s)) return true;                    // Transition 属性名 changeBounds/changeClipBounds/autoTransition…
+            if (/^[A-Za-z0-9]+\\/[A-Za-z0-9\\/]+$/.test(s)) return true;       // AES/CBC/...
+            return false;
+        }
+        function isHighEntropy(s) {
+            if (!s || s.length < 8) return false;
+            if (/\\{/.test(s)) return true;                                    // xxx{...}
+            if (/^[0-9a-fA-F]{16,}$/.test(s)) return true;                     // 长 hex
+            if (/^[A-Za-z0-9+/]{20,}={0,2}$/.test(s) && /[A-Z]/.test(s) && /[a-z]/.test(s) && /[0-9]/.test(s)) return true; // base64
+            return false;
+        }
+        var SEM = /flag|ctf|key|secret|token|pass|stage/i;
         function interesting(a, b) {
             a = a || ''; b = b || '';
-            var SEM = /flag|ctf|key|secret|token|pass|stage/i;
-            var meaningful = SEM.test(a) || SEM.test(b)
-                || /\\{/.test(a) || /\\{/.test(b)
-                || ((a.length >= 16 || b.length >= 16) && /^[0-9a-fA-F+/=]+$/.test(a || b));
-            if (meaningful) return true;                           // 有 flag/key 语义 → 一定打印
-            if (isAlgoName(a) && isAlgoName(b)) return false;      // 算法名之间的比较 → 噪音
-            if (a === b) return false;                             // 无语义的常量自比较 → 噪音
-            if (a.length >= 6 && b.length >= 6 && Math.abs(a.length - b.length) <= 2) return true;
+            if (isHighEntropy(a) || isHighEntropy(b)) return true;             // ① flag/hex/base64 → 一定打印
+            if (isNoiseStr(a) && isNoiseStr(b)) return false;                  // ② 双方都是噪音形态
+            if ((SEM.test(a) && !isNoiseStr(a)) || (SEM.test(b) && !isNoiseStr(b))) return true; // ③
+            if (a === b) return false;                                         // 无语义常量自比较
+            if (a.length >= 12 && b.length >= 12 && Math.abs(a.length - b.length) <= 2) return true; // ④
             return false;
         }
 
@@ -5088,16 +5114,38 @@ ${crypto && crypto.hookClass ? `    try {
       var Arrays = Java.use('java.util.Arrays');
       Arrays.equals.overload('[I','[I').implementation = function (a,b){ var r=this.equals(a,b); send('[HIT] Arrays.equals(int[]) ' + ia(a) + ' vs ' + ia(b) + ' -> ' + r); if(r) send('[DATA] ARRAY MATCH ' + ia(a)); return r; };
     } catch (e) {}
-    // 7) String.equals（严格降噪）
+    // 7) String.equals（严格降噪：高熵优先保留；包名/资源/路径/框架词排除）
     try {
       var JStr = Java.use('java.lang.String');
-      var NOI = /(AndroidNSSP|AndroidOpenSSL|code_cache|layout_inflater|pathInterpolator|transitionSet|androidx[.]|res[\\/])/;
+      var NOI_ALGO = /^(Cipher|AES|DES|RSA|MD5|SHA[\\-0-9]*|Hmac[A-Za-z0-9]*)$/i;
+      var NOI_WORD = /^(include|fragment|window|search|autofill|tag|merge|view|blink|display|accessibility|layout_inflater|requestFocus|ViewStub|FrameLayout|LinearLayout|ScrollView|TextView|ContentFrameLayout)$/i;
+      var isNoise = function (s) {
+        if (!s) return true;
+        if (/\\s/.test(s)) return true;
+        if (/^[a-z0-9_]+(\\.[a-z0-9_]+){2,}/i.test(s)) return true;
+        if (/^(res|assets|lib|META-INF|data|system|proc)[\\/]/i.test(s)) return true;
+        if (/^\\//.test(s)) return true;
+        if (/^android[.:]/i.test(s)) return true;
+        if (NOI_ALGO.test(s) || NOI_WORD.test(s)) return true;
+        if (/(interpolator|transition|viewstub|inflater|animator)/i.test(s)) return true;
+        if (/^(change|auto)[A-Z]/.test(s)) return true;
+        if (/^[A-Za-z0-9]+[\\/][A-Za-z0-9\\/]+$/.test(s)) return true;
+        return false;
+      };
+      var isEntropy = function (s) {
+        if (!s || s.length < 8) return false;
+        if (/[{]/.test(s)) return true;
+        if (/^[0-9a-fA-F]{16,}$/.test(s)) return true;
+        if (/^[A-Za-z0-9+/]{20,}={0,2}$/.test(s) && /[A-Z]/.test(s) && /[a-z]/.test(s) && /[0-9]/.test(s)) return true;
+        return false;
+      };
       JStr.equals.implementation = function (o) {
         var a = this.toString(); var b = o ? o.toString() : '';
         var r = this.equals(o);
-        if (a.length >= 8 && b.length >= 8 && !NOI.test(a) && !NOI.test(b) && (/[{]/.test(a) || /[{]/.test(b) || /flag|ctf|key|secret|stage/i.test(a) || /flag|ctf|key|secret|stage/i.test(b))) {
-          send('[HIT] String.equals ' + r + ': "' + a + '" == "' + b + '"');
-        }
+        // 高熵优先（flag==flag、hex key 比较必须留）；否则双方皆噪音形态则丢弃；再判语义词
+        var hit = isEntropy(a) || isEntropy(b)
+          || (!(isNoise(a) && isNoise(b)) && (/flag|ctf|key|secret|token|pass|stage/i.test(a) || /flag|ctf|key|secret|token|pass|stage/i.test(b)));
+        if (hit) send('[HIT] String.equals ' + r + ': "' + a + '" == "' + b + '"');
         return r;
       };
     } catch (e) {}
@@ -5348,14 +5396,23 @@ ${mcpCache.nativeIntel.decompiled && mcpCache.nativeIntel.decompiled.length ? '�
   }
 
   // 5. 输出回灌 AI → 最终结论（沿用验证闭环）
-  // 关键：Frida 输出常达数万字符，前几千行多是启动噪音；直接 slice(0,6000) 会把
-  // 真正命中校验的 [DATA]/[HIT] 行截掉（本次 Hook 失败的教训）。改为优先抽取关键行。
-  const keyLines = String(output).split(/\r?\n/).filter(l =>
-    /\[DATA\]|\[HIT\]|NCTF\{|flag\{|ctf\{|Arrays\.equals|Cipher\.|SP\.|putString|putBoolean/i.test(l)
-  );
-  const noiseCount = String(output).split(/\r?\n/).length - keyLines.length;
-  const outputSummary = keyLines.length
-    ? `（已从 ${noiseCount + keyLines.length} 行中抽取 ${keyLines.length} 条关键行）\n` + keyLines.slice(-120).join('\n')
+  // 关键：Frida 输出常达数万字符，前几千行多是启动噪音。更重要的是**分级**：
+  //   · 高价值行（[DATA]/[FLAG]/flag 形态/加解密实参/SP 读写）**全部保留**，不参与任何截断；
+  //   · 噪音行（[HIT] 命中痕迹，常达上百条）单独限量，避免把真证据挤出窗口。
+  // 教训：此前把 [HIT] 与真证据混在一个池子里再 `slice(-120)`，而噪音多在真证据**之后** →
+  //   尾部 120 条几乎全是噪音，真证据被整段丢弃（只以 [DATA]/普通输出形式出现的 flag 就此漏掉）。
+  const allLines = String(output).split(/\r?\n/);
+  const HIT_LINE = /^\s*\[HIT\]/i;
+  const highLines = allLines.filter(l => l.trim() && !HIT_LINE.test(l) &&
+    /\[DATA\]|\[FLAG\]|NCTF\{|flag\{|ctf\{|Arrays\.equals|Cipher\.|SP\.|putString|putBoolean/i.test(l));
+  const hitLines = allLines.filter(l => HIT_LINE.test(l));
+  const HIT_KEEP = 40;                                   // 噪音行限量保留（够定位、不淹没证据）
+  const hitKept = hitLines.length > HIT_KEEP
+    ? [`（[HIT] 命中痕迹共 ${hitLines.length} 条，仅保留末尾 ${HIT_KEEP} 条作为线索）`, ...hitLines.slice(-HIT_KEEP)]
+    : hitLines;
+  const keptLines = [...highLines, ...hitKept];
+  const outputSummary = keptLines.length
+    ? `（原始 ${allLines.length} 行 → 保留高价值 ${highLines.length} 条 + [HIT] 线索 ${Math.min(hitLines.length, HIT_KEEP)}/${hitLines.length} 条）\n` + keptLines.join('\n')
     : String(output).slice(-6000);
   const concludePrompt = `Frida 动态 Hook 抓取到以下运行时输出，请据此给出最终 flag 结论。
 
@@ -7813,12 +7870,26 @@ async function harvestExperience(aiText, opts = {}) {
 
     if (opts.autoSave) {
       // 解题成功 → 直接入库（无需人工发「保存」）
-      const n = await writeExperienceEntries(fresh);
-      if (n) {
-        fresh.forEach(l => addSolveNote('经验', l.replace(/^- \[[^\]]+\] /, '').slice(0, 200)));
-        addLog('success', `✅ 解题成功，自动沉淀 ${n} 条新经验（已入库，内容级去重）`);
-        addSystemMessage(`**🧠 经验已自动入库（${n} 条）**\n\n${fresh.map(l => '> ' + l.replace(/^- \[[^\]]+\] /, '')).join('\n\n')}\n\n下次同类题自动注入速查（无需手动保存）。`);
+      // 同时把**本题更早阶段已暂存**的经验一并入库：那些暂存来自同一次解题的前序 AI 调用
+      // （如阶段2 初步分析暂存、阶段2.5 Tool-Use 才解出 flag），它们在收到本次成功信号时
+      // 已确认"属于一道已解出的题"，应一并沉淀；否则会滞留内存、关应用即丢。
+      const pendingNow = Array.isArray(state.pendingExperience) ? state.pendingExperience.slice() : [];
+      // 防御性去重：writeExperienceEntries 自身不判重，这里按内容键（含近似）合并去重，避免重复行。
+      const allFresh = [];
+      const seenKeys = [];
+      for (const line of [...fresh, ...pendingNow]) {
+        const k = experienceKey(line);
+        if (!k || seenKeys.some(x => x === k || experienceSimilar(x, k))) continue;
+        seenKeys.push(k);
+        allFresh.push(line);
       }
+      const n = await writeExperienceEntries(allFresh);
+      if (n) {
+        allFresh.forEach(l => addSolveNote('经验', l.replace(/^- \[[^\]]+\] /, '').slice(0, 200)));
+        addLog('success', `✅ 解题成功，自动沉淀 ${n} 条新经验（含前序暂存 ${pendingNow.length} 条，已入库，内容级去重）`);
+        addSystemMessage(`**🧠 经验已自动入库（${n} 条）**\n\n${allFresh.map(l => '> ' + l.replace(/^- \[[^\]]+\] /, '')).join('\n\n')}\n\n下次同类题自动注入速查（无需手动保存）。`);
+      }
+      state.pendingExperience = [];
       return n;
     }
     // 未确认解题成功 → 仅暂存，用户发「保存」才写入

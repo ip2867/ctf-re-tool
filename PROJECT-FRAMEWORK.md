@@ -1,7 +1,7 @@
 # CTF-RE-TOOL 项目框架总览（SSOT）
 
 > **用途**：本文件是项目的**单一事实来源（SSOT）**。新开对话时**先读本文件**即可掌握项目全貌，再按需深入具体文件。
-> **版本**：v1.3.14 ｜ **形态**：Electron 桌面应用（Windows）｜ **定位**：CTF 逆向 AI 解题工作台
+> **版本**：v1.4.0 ｜ **形态**：Electron 桌面应用（Windows）｜ **定位**：CTF 逆向 AI 解题工作台
 > **一句话**：把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成 AI 可自主驱动的流水线；通过 MCP 接入 IDA/JEB/Burp，内置 11 个方法论技能 + 54 页结构化知识库。
 
 ---
@@ -13,7 +13,7 @@
 技术栈     → Electron 35 + 原生 JS（无框架、无打包器）；主进程 Node，渲染层浏览器
 代码中心   → electron/main.js（主进程/全部外部能力） + src/js/app.js（渲染层/解题编排）
 两个仓库   → ctf-tool-v2（源码，本地无远程） → ctf-re-tool-publish（镜像） → GitHub ip2867/ctf-re-tool
-当前版本   → v1.3.14（已发 GitHub Release，exe 73.3MB normal 压缩）
+当前版本   → v1.4.0（已发 GitHub Release，exe 73.3MB normal 压缩）
 ```
 
 **新对话要做的第一件事**：确认改动落在哪个仓库。**源码仓 `ctf-tool-v2` 是唯一编辑点**；`ctf-re-tool-publish` 只是复制品，改完源码后同步过去再 push。
@@ -270,6 +270,9 @@ runVerification() 复现通过后:
 | **结构性漏接根治** | "验证"与"收割经验"是两步、散落 9 处 → 每轮都在补漏 | v1.3.13 收口为 `finalizeSolve()` 单一入口（一步内含四件）；**新增流程只调它**（§9） |
 | **5 类入口是空壳** | `.dex`/`.jar`/`.class`/Mach-O/`.luac` 的 handler 只有 15~24 行，只启动工具/打指引，AI 不参与 | v1.3.13 全部改造为真求解（JEB/IDA/字节抽取 → AI → finalizeSolve）；分流 12/12 均接真实求解器 |
 | **跨文件 MCP 缓存泄漏** | 新求解器往 `mcpCache.otherClasses` 塞结果不清空；`state._keyClassesByContent` 从不重置 → 连解多题时上一题数据串进本题提示词/类选择 | v1.3.14：`analyzeJavaLike` 入口 `clearMcpCache()`；`_keyClassesByContent` 并入 `clearMcpCache()` 重置 |
+| **Frida 真证据被噪音挤出** | 回灌 AI 前把 `[DATA]/[FLAG]` 与 `[HIT]` 混在一个池子再 `slice(-120)`；噪音多在真证据之后 → 真证据被整段丢弃（只以 `[DATA]` 形式出现的 flag 会漏） | v1.4.0 分级保留：高价值行**全留不截断**，`[HIT]` 单独限量（40 条） |
+| **Frida `String.equals` 降噪失效** | 语义正则 `ctf\|secret` 命中应用包名（`com.nctf.hookmysecret`）→ 每条包名比较都放行；兜底"≥6字且长度相近"太松 → 框架/资源串全泄漏（实测 129 条 `[HIT]` 全误报） | v1.4.0 高熵优先 + 噪音形态黑名单（包名/资源/路径/算法名/框架词）→ 降噪 100%，正例 5/5 保留 |
+| **经验跨阶段丢失** | 阶段2 暂存的经历，阶段2.5 成功后只入库自己那条；暂存区不持久化、不随换题清空 | v1.4.0：换题清空 `pendingExperience`；成功时把前序暂存一并入库（含去重） |
 
 ---
 

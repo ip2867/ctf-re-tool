@@ -1733,48 +1733,152 @@ async function autoAnalyze() {
 
 // JAR/.class 分析（jadx 反编译）
 async function analyzeJava() {
-  addLog('info', '执行 Java（JAR/.class）分析流程...');
-
-  addLog('info', '[1/1] 启动jadx反编译...');
-  await window.electronAPI.launchTool('jadx', state.currentFile);
-
-  addSystemMessage(`**Java 分析流程已启动**
-
-1. ✅ jadx 已启动并加载文件
-
-下一步:
-- 在 jadx 中搜索 flag / encrypt / password / key
-- 定位 main 方法和校验逻辑
-- 需要时生成解密脚本（输入"生成解密脚本"）`);
+  // JAR/.class：走 JEB 统一求解（JEB 对 JAR/class 同样可加载；不可用时降级 jadx）
+  await analyzeJavaLike('JAR', 'Java(JAR/.class)');
 }
 
-// Mach-O 分析指引
+// Mach-O 分析：IDA 支持 Mach-O（含 fat binary），走与 PE/ELF 相同的二进制求解闭环
 async function analyzeMachO() {
-  addLog('info', 'Mach-O 分析指引');
+  addSolveNote('文件', `开始分析 Mach-O：${state.fileInfo ? state.fileInfo.fileName : '未知'}`);
+  addLog('info', '开始 Mach-O (macOS/iOS) 分析流程');
+  addLog('info', '========================================');
 
-  addSystemMessage(`**Mach-O (macOS/iOS) 分析流程**
+  // fat binary（通用二进制）IDA 也能打开（可选架构）；这里直接交给 IDA MCP 采集
+  addLog('info', '[1/3] 启动 IDA 分析（支持 Mach-O / fat binary）...');
+  await launchTool('ida');
+  await new Promise(resolve => setTimeout(resolve, 3000));
+  const idaMcpConnected = await connectIdaMcpWithWait();
+  if (!idaMcpConnected) {
+    addLog('warning', 'IDA MCP 未连接，Mach-O 静态求解需 IDA 就绪');
+    addSystemMessage(`**Mach-O 分析：IDA 未就绪**
 
-1. **确认架构**：file 文件名（x86_64 / arm64 / fat binary）
-2. **IDA Pro** 直接打开（支持 Mach-O）；fat 二进制需先拆分：\`lipo -thin arm64 fat.bin -output arm64.bin\`
-3. **静态分析**：定位 main → 关键函数 → 字符串比较
-4. **Objective-C/Swift**：关注 objc_msgSend 调用和方法名
-5. **动态调试**：macOS 上用 lldb；iOS 需砸壳后的 ipa + frida
+请确认 IDA 已加载该 Mach-O 且 MCP 插件在线（127.0.0.1:13337，可自动拉起）。
 
-本机为 Windows，Mach-O 动态调试建议传到 Kali/macOS 虚拟机进行。`);
+手工要点：
+1. **确认架构**：fat binary 需拆分 \`lipo -thin arm64 fat.bin -output arm64.bin\`
+2. **Objective-C/Swift**：关注 \`objc_msgSend\` 调用与方法名
+3. **动态调试**：macOS 用 lldb；iOS 需砸壳 ipa + frida（Windows 上建议传 Kali/macOS 虚拟机）`);
+    return;
+  }
+
+  // 复用二进制求解闭环（IDA 采集 → AI 求解 → 验证 → 经验）
+  addLog('info', '[2/3] 交给 IDA MCP 驱动的二进制求解闭环...');
+  await autoSolveBinaryFlag('MACHO');
+  addLog('info', '[3/3] Mach-O 流程完成');
 }
 
-// Lua 字节码分析指引
+// Lua 字节码分析：抽取字节/常量/字符串 → AI 求解（对齐 PYC 的做法）
+// 旧实现只打印一段"用 unluac" 的指引文字，AI 完全不参与。现改为：
+//   用 python 扫描 .luac 里的明文串/长 hex/base64/大整数（常量表通常明文），喂给 AI 还原。
 async function analyzeLua() {
-  addLog('info', 'Lua 字节码分析指引');
+  addSolveNote('文件', `开始分析 Lua 字节码：${state.fileInfo ? state.fileInfo.fileName : '未知'}`);
+  addLog('info', '开始 Lua 字节码 (.luac) 分析流程');
+  addLog('info', '========================================');
 
-  addSystemMessage(`**Lua 字节码 (.luac) 分析流程**
+  // [1/3] 字节/字符串/常量抽取（纯 Python 扫描，不依赖 unluac）
+  addLog('info', '[1/3] 扫描字节/常量/字符串...');
+  let version = '未知';
+  let scan = '';
+  try {
+    const py = [
+      'import sys,re',
+      'data=open(sys.argv[1],"rb").read()',
+      'print("SIZE", len(data))',
+      'hdr=data[:4]',
+      'if len(hdr)>=4 and hdr[0]==0x1b:',
+      '    print("LUAC_MAGIC ok ver=%d.%d"%(hdr[3],hdr[4]) if len(hdr)>4 else "LUAC_MAGIC ok")',
+      'txt=data.decode("latin-1")',
+      'for m in sorted(set(re.findall(r"[ -~]{4,}", txt)), key=len, reverse=True)[:120]:',
+      '    print("STR", m[:200])',
+      'for m in sorted(set(re.findall(r"\\b[0-9a-fA-F]{24,}\\b", txt)), key=len, reverse=True)[:20]:',
+      '    print("HEX", m[:200])',
+      'for m in sorted(set(re.findall(r"\\b[A-Za-z0-9+/]{20,}={0,2}\\b", txt)), key=len, reverse=True)[:20]:',
+      '    print("B64", m[:200])'
+    ].join('\n');
+    const r = await window.electronAPI.runToolArgs(['python', '-c', py, state.currentFile]);
+    if (r && r.success && r.stdout) {
+      scan = String(r.stdout);
+      const vm = scan.match(/ver=(\d+\.\d+)/);
+      if (vm) version = vm[1];
+      const ok = /LUAC_MAGIC ok/.test(scan);
+      addLog(ok ? 'success' : 'warning', ok ? `✅ 识别为 Lua 字节码（版本 ${version}）` : '未识别到标准 luac 头（可能是自定义/混淆字节码）');
+    } else {
+      addLog('warning', 'Lua 扫描未返回输出: ' + ((r && r.error) || '未知'));
+    }
+  } catch (e) {
+    addLog('warning', 'Lua 扫描异常: ' + e.message);
+  }
+  if (scan) await caseAddEvidence('luac_scan', 'Lua 字节码扫描', scan.slice(0, 6000), 'txt');
 
-1. **确认 Lua 版本**：文件头第 5 字节（0x51=5.1, 0x52=5.2, 0x53=5.3, 0x54=5.4）
-2. **反编译**：unluac（Java 工具，需选对版本）
-   \`java -jar unluac_2015.jar file.luac > out.lua\`
-   5.3/5.4 也可用 luac -l 查看字节码
-3. **字符串提取**：常量表通常明文，\`strings 文件名 | grep -i flag\`
-4. 遇到自定义 VM/字节码混淆时，先还原 opcode 映射表`);
+  // [2/3] AI 求解（无有效数据则短路，避免臆测）
+  const hasData = scan && /^(STR|HEX|B64) /m.test(scan);
+  if (!hasData) {
+    addLog('warning', '未提取到有效常量/字符串，AI 求解跳过（避免臆测）');
+    addSystemMessage(`**Lua 字节码分析**：未从 ${state.fileInfo ? state.fileInfo.fileName : '文件'} 提取到有效字符串/常量。
+
+手工要点：
+1. **确认 Lua 版本**：文件头第 5 字节（0x51=5.1 / 0x52=5.2 / 0x53=5.3 / 0x54=5.4）
+2. **反编译**：\`java -jar unluac_2015.jar file.luac > out.lua\`（版本要对）；5.3/5.4 也可 \`luac -l\`
+3. 遇自定义 VM/字节码混淆时先还原 opcode 映射表`);
+    return;
+  }
+
+  addLog('info', '[2/3] 调用 AI 还原算法并求 flag...');
+  const knowledge = await prefetchKnowledge(scan, 'LUAC');
+  const prompt = `我在解一道 CTF Lua 字节码（.luac）逆向题。已扫描出**明文串/长hex/base64/常量**，请据此还原算法并求出 flag。
+
+文件：${state.fileInfo ? state.fileInfo.fileName : state.currentFile}
+Lua 版本：${version}
+
+## 扫描结果（STR=明文串 / HEX=长hex / B64=疑似base64）
+\`\`\`
+${scan.slice(0, 8000)}
+\`\`\`
+${knowledge}
+
+## 解题要点
+- Lua 常量表通常是明文：flag 校验常用 字符串比较 / 逐字节变换 / XOR / base64（含自定义字符表）。
+- 若为自定义 VM/字节码混淆：先还原 opcode 映射，再按解释执行反推。
+- 需要时用 \`run_python\` 实际跑一遍验证。
+
+**输出契约（务必遵守）：**
+1. 得出 flag：单独一行 \`[FLAG]flag内容[/FLAG]\`
+2. 附验证契约：${VERIFY_CONTRACT}
+3. 多个候选：\`[HYPOTHESES][{...},{...}][/HYPOTHESES]\`
+4. 末尾 \`[EXPERIENCE]每条一行,最多5条[/EXPERIENCE]\`
+不要臆造；拿不准就写"待人工验证"。`;
+
+  try {
+    state.aiBusy = true;
+    beginStreamMessage();
+    const startTime = Date.now();
+    const result = await window.electronAPI.claudeChat(
+      [{ role: 'user', content: prompt }],
+      buildSystemPrompt()
+    );
+    endStreamMessage();
+    addLog('info', `AI 求解完成，耗时 ${((Date.now() - startTime) / 1000).toFixed(1)} 秒`);
+    if (result.success && result.text) {
+      state.lastAiText = result.text;
+      addSolveNote('求解结果(Lua)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
+      // [3/3] 验证闭环 + 解题成功则经验自动入库（统一走 finalizeSolve 三件套）
+      addLog('info', '[3/3] 本地复现验证...');
+      const { verifiedFlags: vf, flags } = await finalizeSolve(result.text, { source: 'lua' });
+      addSystemMessage(`**🌙 Lua 字节码分析结果**
+
+${vf.length ? `**Flag（✅已验证）**: \`${vf[0].flag}\`` : (flags.length ? `**Flag（⚠️未验证）**: \`${flags[0]}\`` : '')}
+
+${result.text}`);
+      return;
+    }
+    if (result.aborted || /已取消/.test(result.error || '')) { addLog('info', 'Lua AI 求解已停止'); return; }
+    addLog('warning', 'AI 求解未返回内容: ' + (result.error || '未知'));
+  } catch (err) {
+    try { endStreamMessage(); } catch (e) {}
+    addLog('error', 'Lua AI 求解异常: ' + err.message);
+  } finally {
+    state.aiBusy = false;
+  }
 }
 
 // APK分析 - 基于ctf-agent工作流（完整自动化，如实汇报每步结果）
@@ -2635,21 +2739,138 @@ ${idaMcpConnected ? '✅ IDA MCP已连接' : '⚠️ IDA MCP连接失败，请�
 }
 
 // DEX分析
+// ========== Java 系（DEX / JAR / .class）统一 AI 求解（JEB 优先） ==========
+// 背景：旧 analyzeDEX / analyzeJava 各只有 ~20 行，只"启动 jadx"就结束 —— AI 完全不参与，
+// 没有验证闭环、没有经验沉淀、没有题库预取。而用户实际用的是 JEB（MCP 已全套接好：
+// get_all_classes / get_class_decompiled_code / get_manifest）。现统一为：JEB 采集 → 预取题库
+// → AI 求解 → finalizeSolve 三件套。JEB 不可用时降级为"启动 jadx + 明确指引"（不假装已解）。
+async function analyzeJavaLike(fileType, fileLabel) {
+  const label = fileLabel || fileType || 'Java';
+  addSolveNote('文件', `开始分析 ${label}：${state.fileInfo ? state.fileInfo.fileName : '未知'}`);
+  addLog('info', `开始 ${label} 分析流程（JEB 优先 + AI 求解）`);
+  addLog('info', '========================================');
+
+  // [1/4] JEB 采集：类列表 + 关键类反编译
+  addLog('info', '[1/4] 通过 JEB MCP 采集类列表与关键类反编译...');
+  let classes = null;
+  try {
+    const r = await window.electronAPI.jebMcpCall('get_all_classes', [state.currentFile]);
+    if (r && r.success && Array.isArray(r.result)) {
+      classes = r.result;
+      mcpCache.classes = r.result;
+      addLog('success', `✅ 已获取 ${classes.length} 个类`);
+    } else {
+      addLog('warning', 'JEB 未返回类列表: ' + ((r && r.error) || '未知'));
+    }
+  } catch (e) {
+    addLog('warning', 'JEB get_all_classes 失败: ' + e.message);
+  }
+
+  if (!classes || !classes.length) {
+    // 降级：JEB 不可用 → 启动 jadx 给人工，但不走 AI（无数据时调 AI 只会臆测 flag）
+    addLog('warning', 'JEB MCP 未取得类列表，降级为 jadx 静态反编译（AI 求解跳过）');
+    addSystemMessage(`**${label} 分析：JEB 未就绪**
+
+未能通过 JEB MCP 采集类列表（JEB 会自动拉起，首次约 1~2 分钟；也可在设置中确认 tools.jeb）。
+
+已退回 **jadx** 静态反编译，请手动查看：
+- 搜索 \`flag\` / \`encrypt\` / \`password\` / \`key\`
+- 定位 main 与校验逻辑
+- 需要时输入"生成解密脚本"
+
+> 提示：配好 JEB 后重试，可自动走"采集 → AI 求解 → 本地验证"闭环。`);
+    try { await window.electronAPI.launchTool('jadx', state.currentFile); } catch (e) { /* 忽略 */ }
+    return;
+  }
+
+  // [2/4] 挑选并反编译关键类（应用自身包优先 + 加解密/校验语义加权）
+  const pkgGuess = (classes.find(c => /^L(?!java|android|androidx|kotlin|javax)/.test(String(c))) || '').replace(/^L/, '').replace(/;.*$/, '').split('/').slice(0, 2).join('.');
+  const keyClasses = selectKeyClasses(classes, pkgGuess, null, 12);
+  addLog('info', `挑选 ${keyClasses.length} 个关键类进行反编译: ${keyClasses.map(c => String(c).split('/').pop()).join(', ')}`);
+  const codes = [];
+  for (const cls of keyClasses) {
+    try {
+      const clsResult = await window.electronAPI.jebMcpCall('get_class_decompiled_code', [state.currentFile, cls]);
+      if (clsResult && clsResult.success && clsResult.result) {
+        codes.push({ class: cls, code: clsResult.result });
+        mcpCache.otherClasses[cls] = clsResult.result;
+        addLog('success', `✅ 已反编译: ${String(cls).split('/').pop()}`);
+      }
+    } catch (e) { /* 忽略单个类失败 */ }
+  }
+  if (!codes.length) {
+    addLog('warning', '关键类反编译均为空，AI 求解跳过（避免臆测）');
+    addSystemMessage(`**${label} 分析**：JEB 返回了 ${classes.length} 个类，但关键类反编译为空。可手动在 JEB 中查看或重试。`);
+    return;
+  }
+  await caseAddEvidence('jeb_classes', '类反编译', codes.map(c => `// ==== ${c.class} ====\n${c.code}`).join('\n\n'), 'java');
+
+  // [3/4] AI 求解（内联题库攻略）
+  addLog('info', '[3/4] 调用 AI 分析并求解 flag...');
+  const knowledge = await prefetchKnowledge(
+    [pkgGuess, ...codes.map(c => c.code)].join('\n'), fileType || 'JAR', [pkgGuess].filter(Boolean));
+  const codeText = codes.map(c => `\n### ${c.class}\n${String(c.code).substring(0, 5000)}`).join('\n');
+  const prompt = `我在解一道 CTF ${label} 逆向题（Java 字节码）。以下是通过 JEB 反编译得到的关键类代码，请还原算法并求出 flag。
+
+文件：${state.fileInfo ? state.fileInfo.fileName : state.currentFile}
+推断包名：${pkgGuess || '未知'}
+类总数：${classes.length}，已反编译关键类 ${codes.length} 个。
+
+## 关键类反编译代码
+${codeText}
+${knowledge}
+
+## 解题要点
+- 先找校验/比较点（\`equals\`/\`compareTo\`/\`Arrays.equals\`/自定义 check），反推输入约束。
+- 常见：Base64（含自定义字符表）、AES/DES（注意 ECB/CBC 与 IV 编码）、XOR、逐字节变换、哈希比对。
+- 密文/密钥多在字符串常量或 byte[] 数组里；自定义字符表要看 \`Base64.decode\` 的替代实现。
+- 需要时用 \`run_python\` 实际跑一遍验证（不要只靠脑算）。
+
+**输出契约（务必遵守）：**
+1. 得出 flag：单独一行 \`[FLAG]flag内容[/FLAG]\`
+2. 附验证契约：${VERIFY_CONTRACT}
+3. 多个候选：\`[HYPOTHESES][{...},{...}][/HYPOTHESES]\`
+4. 末尾 \`[EXPERIENCE]每条一行,最多5条[/EXPERIENCE]\`
+不要臆造；拿不准就写"待人工验证"。`;
+
+  try {
+    state.aiBusy = true;
+    beginStreamMessage();
+    const startTime = Date.now();
+    const result = await window.electronAPI.claudeChat(
+      [{ role: 'user', content: prompt }],
+      buildSystemPrompt()
+    );
+    endStreamMessage();
+    addLog('info', `AI 求解完成，耗时 ${((Date.now() - startTime) / 1000).toFixed(1)} 秒`);
+
+    if (result.success && result.text) {
+      state.lastAiText = result.text;
+      addSolveNote('求解结果(Java)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
+      // [4/4] 验证闭环 + 解题成功则经验自动入库（统一走 finalizeSolve 三件套）
+      addLog('info', '[4/4] 本地复现验证...');
+      const { verifiedFlags: vf, flags } = await finalizeSolve(result.text, { source: 'jeb-java' });
+      addSystemMessage(`**☕ ${label} 分析结果**
+
+${vf.length ? `**Flag（✅已验证）**: \`${vf[0].flag}\`` : (flags.length ? `**Flag（⚠️未验证）**: \`${flags[0]}\`` : '')}
+
+${result.text}`);
+      return;
+    }
+    if (result.aborted || /已取消/.test(result.error || '')) { addLog('info', `${label} AI 求解已停止`); return; }
+    addLog('warning', 'AI 求解未返回内容: ' + (result.error || '未知'));
+    addSystemMessage(`**${label} 反编译完成**，但 AI 求解未返回内容。类反编译已存入证据目录，可重试。`);
+  } catch (err) {
+    try { endStreamMessage(); } catch (e) {}
+    addLog('error', `${label} AI 求解异常: ` + err.message);
+  } finally {
+    state.aiBusy = false;
+  }
+}
+
 async function analyzeDEX() {
-  addLog('info', '执行DEX分析流程...');
-
-  // 启动jadx
-  addLog('info', '[1/1] 启动jadx反编译...');
-  await window.electronAPI.launchTool('jadx', state.currentFile);
-
-  addSystemMessage(`DEX分析流程已启动:
-
-1. ✅ jadx反编译 - 已启动
-
-下一步:
-- 在jadx中查看Java代码
-- 搜索关键字符串
-- 分析加密逻辑`);
+  // DEX 单文件：走 JEB 统一求解（不再只启动 jadx）
+  await analyzeJavaLike('DEX', 'DEX');
 }
 
 // PYC分析（多后端 + AI 求解闭环）
@@ -2741,11 +2962,9 @@ ${knowledge}
     if (result.success && result.text) {
       state.lastAiText = result.text;
       addSolveNote('求解结果(PYC)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
-      // 3. 验证闭环
+      // 3. 验证闭环 + 解题成功则经验自动入库（统一走 finalizeSolve 三件套）
       addLog('info', '[3/3] 本地复现验证...');
-      const { verifiedFlags: vf, flags } = await verifyAndRecord(result.text, { source: 'pyc' });
-      // 解题成功（有已验证 flag）→ 经验自动入库；否则仅暂存（内容级去重）
-      await harvestExperience(result.text, { autoSave: vf.length > 0 });
+      const { verifiedFlags: vf, flags } = await finalizeSolve(result.text, { source: 'pyc' });
       addSystemMessage(`**🐍 PYC 分析结果**（后端：${backendInfo || '未知'}）
 
 ${vf.length ? `**Flag（✅已验证）**: \`${vf[0].flag}\`` : (flags.length ? `**Flag（⚠️未验证）**: \`${flags[0]}\`` : '')}
@@ -2970,9 +3189,8 @@ ${knowledge}
       state.lastAiText = result.text;
       const clean = String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000);
       addSolveNote('求解结果', clean);
-      const { verifiedFlags: vf } = await verifyAndRecord(result.text, { source: 'ai' });
-      // 解题成功（有已验证 flag）→ 经验自动入库；否则仅暂存（内容级去重）
-      await harvestExperience(result.text, { autoSave: vf.length > 0 });
+      // 验证闭环 + 解题成功则经验自动入库（统一走 finalizeSolve 三件套）
+      const { verifiedFlags: vf } = await finalizeSolve(result.text, { source: 'ai' });
       addSystemMessage(`**🎯 Web/JS 逆向分析结果**\n\n${result.text}`);
     } else if (result.success) {
       endStreamMessage();
@@ -5163,9 +5381,8 @@ ${state.lastAiText ? `## 此前静态分析结论（节选）\n${String(state.la
     endStreamMessage();
     if (result.success && result.text) {
       state.lastAiText = result.text;
-      const { verifiedFlags: vf } = await verifyAndRecord(result.text, { source: 'frida', noteSection: 'Flag(动态)' });
-      // 解题成功（有已验证 flag）→ 经验自动入库；否则仅暂存（内容级去重）
-      await harvestExperience(result.text, { autoSave: vf.length > 0 });
+      // 验证闭环 + 解题成功则经验自动入库（统一走 finalizeSolve 三件套）
+      const { verifiedFlags: vf } = await finalizeSolve(result.text, { source: 'frida', noteSection: 'Flag(动态)' });
       addSystemMessage(`**🎯 动态调试结论**\n\n${result.text}`);
     } else {
       addLog('warning', '动态结论生成失败: ' + (result.error || '未知'));
@@ -5517,10 +5734,8 @@ ${knowledge}
       addSolveNote('求解结果', clean);
       state.lastAiText = result.text;
 
-      // 验证闭环 + 失败时本地枚举兜底（统一走 verifyAndRecord）
-      const { verifiedFlags, flags } = await verifyAndRecord(result.text, { source: 'ai' });
-      // 解题成功（有已验证 flag）→ 经验自动入库；否则仅暂存（内容级去重）
-      await harvestExperience(result.text, { autoSave: verifiedFlags.length > 0 });
+      // 验证闭环 + 失败时本地枚举兜底 + 解题成功则经验自动入库（统一走 finalizeSolve 三件套）
+      const { verifiedFlags, flags } = await finalizeSolve(result.text, { source: 'ai' });
 
       const resultMsg = `**🎯 自动求解结果**
 
@@ -5639,11 +5854,10 @@ ${mcpCache.nativeIntel.globals && mcpCache.nativeIntel.globals.length ? `\n## SO
     if (result.success && result.text) {
       state.lastAiText = result.text;
       addSolveNote('求解结果(Tool-Use)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
-      await verifyAndRecord(result.text, { source: 'ai-deep' });
+      // 验证闭环 + 解题成功则经验自动入库（统一走 finalizeSolve 三件套）
+      await finalizeSolve(result.text, { source: 'ai-deep' });
 
       const verifiedFlags = (state.findings ? state.findings.flags : []).filter(f => f.verified);
-      // 解题成功（有已验证 flag）→ 经验自动入库；否则仅暂存（内容级去重）
-      await harvestExperience(result.text, { autoSave: verifiedFlags.length > 0 });
       const flags = extractFlags(result.text);
       addSystemMessage(`**🎯 Tool-Use 深度求解结果**
 
@@ -5718,9 +5932,8 @@ ${analysisData.mainActivityCode ? analysisData.mainActivityCode.substring(0, 200
 
       state.lastAiText = result.text;
       addSolveNote('求解结果(详细)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
-      // 详细分析同样走验证闭环 + 解题成功则经验自动入库（此前完全缺失 → JS/APK 详细路径的经验从不沉淀）
-      const { verifiedFlags: dvf, flags: dflags } = await verifyAndRecord(result.text, { source: 'ai-detail' });
-      await harvestExperience(result.text, { autoSave: dvf.length > 0 });
+      // 详细分析同样走验证闭环 + 解题成功则经验自动入库（统一走 finalizeSolve 三件套）
+      const { verifiedFlags: dvf, flags: dflags } = await finalizeSolve(result.text, { source: 'ai-detail' });
 
       const resultMsg = `**🔍 详细分析结果**
 
@@ -6047,10 +6260,8 @@ ${knowledge}
       addSolveNote('求解结果', clean);
       state.lastAiText = result.text;
 
-      // 验证闭环 + 失败时本地枚举兜底（统一走 verifyAndRecord）
-      const { verifiedFlags, flags } = await verifyAndRecord(result.text, { source: 'ai' });
-      // 解题成功（有已验证 flag）→ 经验自动入库；否则仅暂存（内容级去重）
-      await harvestExperience(result.text, { autoSave: verifiedFlags.length > 0 });
+      // 验证闭环 + 失败时本地枚举兜底 + 解题成功则经验自动入库（统一走 finalizeSolve 三件套）
+      const { verifiedFlags, flags } = await finalizeSolve(result.text, { source: 'ai' });
 
       const resultMsg = `**🎯 自动求解结果**
 
@@ -6140,10 +6351,9 @@ ${analysisData.strings ? `\n## 关键字符串\n${typeof analysisData.strings ==
     if (result.success && result.text) {
       state.lastAiText = result.text;
       addSolveNote('求解结果(Tool-Use)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
-      await verifyAndRecord(result.text, { source: 'ai-deep' });
+      // 验证闭环 + 解题成功则经验自动入库（统一走 finalizeSolve 三件套）
+      await finalizeSolve(result.text, { source: 'ai-deep' });
       const vf = (state.findings ? state.findings.flags : []).filter(f => f.verified);
-      // 解题成功（有已验证 flag）→ 经验自动入库；否则仅暂存（内容级去重）
-      await harvestExperience(result.text, { autoSave: vf.length > 0 });
       addSystemMessage(`**🎯 Tool-Use 深度求解结果**\n\n${vf.length ? `**Flag（✅已验证）**: \`${vf[0].flag}\`` : ''}\n\n${result.text}`);
       return vf.length > 0;
     }
@@ -6208,9 +6418,8 @@ ${analysisData.mainCode ? analysisData.mainCode.substring(0, 2000) : '暂无'}
 
       state.lastAiText = result.text;
       addSolveNote('求解结果(详细)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
-      // 详细分析同样走验证闭环 + 解题成功则经验自动入库（此前完全缺失 → PE/ELF 详细路径的经验从不沉淀）
-      const { verifiedFlags: dvf, flags: dflags } = await verifyAndRecord(result.text, { source: 'ai-detail' });
-      await harvestExperience(result.text, { autoSave: dvf.length > 0 });
+      // 详细分析同样走验证闭环 + 解题成功则经验自动入库（统一走 finalizeSolve 三件套）
+      const { verifiedFlags: dvf, flags: dflags } = await finalizeSolve(result.text, { source: 'ai-detail' });
 
       const resultMsg = `**🔍 详细分析结果**
 
@@ -7327,6 +7536,17 @@ async function verifyAndRecord(aiText, opts = {}) {
   return { vr, flags, verifiedFlags };
 }
 
+// 【统一入口·三件套】验证闭环 → 失败自动枚举 → 登记 flag → **解题成功则经验自动入库**。
+// 为什么收口：此前"verifyAndRecord + harvestExperience"这两步在 9 个求解流程里各写一遍，
+// 于是反复出现"某条路径只验证不收割经验""某条路径压根没接"（v1.3.11/v1.3.12 两轮补漏）。
+// 现固定为单一入口 —— 新增任何求解流程只调本函数即可，杜绝再漏（见 SSOT §9）。
+// 返回 { vr, flags, verifiedFlags }，供调用方拼结果消息。
+async function finalizeSolve(aiText, opts = {}) {
+  const { vr, flags, verifiedFlags } = await verifyAndRecord(aiText, opts);
+  await harvestExperience(aiText, { autoSave: verifiedFlags.length > 0 });
+  return { vr, flags, verifiedFlags };
+}
+
 // 验证闭环：解析 [VERIFY] → 本地复现 → 标记 flag 验证状态
 async function runVerification(aiText) {
   const contracts = parseVerifyContracts(aiText);
@@ -7638,14 +7858,21 @@ async function prefetchKnowledge(haystack, fileType, extra = []) {
       'unicorn', 'z3', '反调试', 'ptrace', 'hook', 'native',
       // Python/字节码类
       'pickle', 'renpy', 'rpyc', 'cython', 'pyinstaller', 'co_code', 'pydisasm',
+      // Java/Android 字节码类（DEX/JAR/class）
+      'jadx', 'dex2jar', 'smali', 'classloader', 'sharedpreferences', 'jni', 'il2cpp', 'unity',
+      // Lua 字节码类
+      'luac', 'unluac', 'luaopcode',
       // Web/JS 逆向类
       'jsencrypt', 'cryptojs', 'sign', 'token', 'x-bogus', 'a_bogus', '_0x', 'sm2', 'sm3', 'wasm', 'jsvmp', '瑞数'];
     const hits = POOL.filter(t => hay.includes(t));
     const ft = String(fileType || '').toUpperCase();
-    if (/APK|DEX/.test(ft)) hits.unshift('apk');
+    if (/APK/.test(ft)) hits.unshift('apk');
+    else if (/DEX/.test(ft)) hits.unshift('apk', 'dex');
+    else if (/JAR|JAVA|CLASS/.test(ft)) hits.unshift('java', 'jadx');
     else if (/PE|ELF|EXE|BIN/.test(ft)) hits.unshift('native');
     else if (/PYC/.test(ft)) hits.unshift('python');
     else if (/MACHO/.test(ft)) hits.unshift('macho');
+    else if (/LUAC|LUA/.test(ft)) hits.unshift('lua');
     else if (/JS|HTML/.test(ft)) hits.unshift('js 逆向', 'sign');
     const terms = [...new Set([...extra, ...hits].map(s => String(s).trim()).filter(Boolean))].slice(0, 6);
     if (!terms.length) terms.push(ft || 'reverse');

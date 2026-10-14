@@ -1,4 +1,4 @@
-# CTF-RE-TOOL v1.3.9
+# CTF-RE-TOOL v1.3.10
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -307,6 +307,13 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 
 ## 更新日志
+
+### v1.3.10 (2026-10-14) — 修复 v1.3.9 重构引入的 `flags is not defined`
+
+- **修复 PE/ELF 与 APK 求解流程崩溃**：v1.3.9 把各流程统一改为 `verifyAndRecord()`（返回 `{ vr, flags, verifiedFlags }`）时，
+  `autoSolveBinaryFlag`（PE/ELF）与 `autoSolveFlag`（APK）两处调用点**只解构了 `verifiedFlags`，随后仍引用已被删除的裸变量 `flags`**，
+  在拼接"自动求解结果"消息时抛 `ReferenceError: flags is not defined`，导致 AI 已成功分析却报"AI分析异常"。现补回 `flags` 解构。
+- 纯 bugfix，求解器与解题行为不变；`node --check` 通过。
 
 ### v1.3.9 (2026-10-14) — 内部重构：验证闭环去重（无行为变更）
 

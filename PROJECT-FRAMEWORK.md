@@ -1,7 +1,7 @@
 # CTF-RE-TOOL 项目框架总览（SSOT）
 
 > **用途**：本文件是项目的**单一事实来源（SSOT）**。新开对话时**先读本文件**即可掌握项目全貌，再按需深入具体文件。
-> **版本**：v1.3.9 ｜ **形态**：Electron 桌面应用（Windows）｜ **定位**：CTF 逆向 AI 解题工作台
+> **版本**：v1.3.10 ｜ **形态**：Electron 桌面应用（Windows）｜ **定位**：CTF 逆向 AI 解题工作台
 > **一句话**：把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成 AI 可自主驱动的流水线；通过 MCP 接入 IDA/JEB/Burp，内置 11 个方法论技能 + 54 页结构化知识库。
 
 ---
@@ -13,7 +13,7 @@
 技术栈     → Electron 35 + 原生 JS（无框架、无打包器）；主进程 Node，渲染层浏览器
 代码中心   → electron/main.js（主进程/全部外部能力） + src/js/app.js（渲染层/解题编排）
 两个仓库   → ctf-tool-v2（源码，本地无远程） → ctf-re-tool-publish（镜像） → GitHub ip2867/ctf-re-tool
-当前版本   → v1.3.9（已发 GitHub Release，exe 73.3MB normal 压缩）
+当前版本   → v1.3.10（已发 GitHub Release，exe 73.3MB normal 压缩）
 ```
 
 **新对话要做的第一件事**：确认改动落在哪个仓库。**源码仓 `ctf-tool-v2` 是唯一编辑点**；`ctf-re-tool-publish` 只是复制品，改完源码后同步过去再 push。
@@ -252,6 +252,7 @@ runVerification() 复现通过后:
 | PYC `xor_key` 解不出 | 整数 `199` 被当 `b"199"` 三字节密钥 | 求解器识别单字节整数 key |
 | PYC custom 解密崩 | AI 的 decrypt 返回 `str` 被按 bytes 处理 | `_to_bytes_out()` 先归一化 |
 | 验证闭环 7 处复制粘贴 | 各流程各写一遍，语义漂移（`if(!vr)` 门控不一致） | v1.3.9 统一为 `verifyAndRecord()` |
+| **`flags is not defined` 崩溃** | v1.3.9 重构后 `autoSolveBinaryFlag`/`autoSolveFlag` 只解构 `verifiedFlags` 却仍引用裸 `flags`（旧声明已删） | v1.3.10 补 `const { verifiedFlags, flags } = ...`；**改 verifyAndRecord 调用点必须同时解构两个变量** |
 
 ---
 

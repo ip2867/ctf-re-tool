@@ -1,4 +1,4 @@
-# CTF-RE-TOOL v1.3.13
+# CTF-RE-TOOL v1.3.14
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -307,6 +307,15 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 
 ## 更新日志
+
+### v1.3.14 (2026-10-14) — 复审 v1.3.13 新代码：修复跨文件 MCP 缓存泄漏
+
+对 v1.3.13 新增的求解路径做深度复审时，发现两处跨文件状态泄漏（只影响"连续分析多道题"的场景，单题无感）：
+
+- **`analyzeJavaLike` 未清 MCP 缓存**：新写的 DEX/JAR 求解器一进函数直接往 `mcpCache.otherClasses` 里塞反编译结果，但**没有先清空** —— 于是分析第 2 个文件时，第 1 个文件的关键类代码会混进本次的 AI 提示词。现改为函数入口先 `clearMcpCache()`。
+- **`state._keyClassesByContent` 从不重置**：这是 APK 内容命中筛查的产物（记录"哪几个类含关键常量"），被 `selectKeyClasses` 用来把高价值类**强制置顶**。但它只在 APK 路径写入、**从不清理** —— 分析下一题（尤其 DEX/JAR）时会把上一题的类强行排到最前，挤掉本题真正的关键类。现并入 `clearMcpCache()` 一起重置。
+
+两处都是"连续用同一进程解多道题"才会触发；修复后每题状态干净。回归：经验流 6/6、相似度 5/5、`finalizeSolve` 契约 2/2、语法全过。
 
 ### v1.3.13 (2026-10-14) — 解题结构根治：三件套收口 + 5 类"只指路"入口真正解题
 

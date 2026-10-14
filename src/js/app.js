@@ -2746,6 +2746,7 @@ ${idaMcpConnected ? '✅ IDA MCP已连接' : '⚠️ IDA MCP连接失败，请�
 // → AI 求解 → finalizeSolve 三件套。JEB 不可用时降级为"启动 jadx + 明确指引"（不假装已解）。
 async function analyzeJavaLike(fileType, fileLabel) {
   const label = fileLabel || fileType || 'Java';
+  clearMcpCache();   // 防止上一个文件的类列表/反编译残留污染本次分析
   addSolveNote('文件', `开始分析 ${label}：${state.fileInfo ? state.fileInfo.fileName : '未知'}`);
   addLog('info', `开始 ${label} 分析流程（JEB 优先 + AI 求解）`);
   addLog('info', '========================================');
@@ -5463,6 +5464,9 @@ function clearMcpCache() {
   mcpCache.mainCode = null;
   mcpCache.otherClasses = {};
   mcpCache.strings = null;
+  // 内容命中筛查结果（APK 路径填充，selectKeyClasses 读取）——不清会跨文件泄漏，
+  // 把上一题的"高价值类"强行置顶到本题的类选择里。
+  state._keyClassesByContent = null;
 }
 
 // 自动求解flag（混合方案：直接MCP + Tool Use）

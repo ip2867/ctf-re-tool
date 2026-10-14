@@ -21,7 +21,7 @@ ctf-tool-v2/                         # 源码仓（本地，无远程）
 ├── wiki/                            # 54 页可检索知识库（AI 用 wiki_search/wiki_read）
 │   ├── AI-SEARCH-INDEX.md           # 全局检索索引（优先读）
 │   ├── PAYLOAD-CHEATSHEET.md        # 套路/Payload/脚本速查
-│   ├── reverse/ (44 页 + _INDEX)    # 历年逆向题条目库（YAML meta）
+│   ├── reverse/ (43 页 + _INDEX)    # 历年逆向题条目库（YAML meta）
 │   ├── frida/ (6 页)                # 动态 Hook 手法页
 │   └── firmware/ (1 页)
 ├── assets/icons/                    # 图标

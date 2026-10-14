@@ -327,6 +327,7 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 - **Frida 能力增强**：吸收两大开源 Frida Hook 项目精华——RegisterNatives 拦截、JCE 通杀自吐、SSL pinning 绕过（Java+native）、脱壳、反检测；兜底模板注入题目情报做针对性 Hook（不再是固定模板）
 - **AI 解题流程优化**：APK/PE/ELF 深度求解改为四阶段流水线提示词；AI 脚本语法错自动重新生成 2 轮
 - **环境自愈**：frida client/server 版本一致性自检、双 adb 互杀重连、装 APK 前 package 服务就绪轮询、GUI 窗口可见性修复（IDA/JEB/Nox）
+- **Frida 枚举失败自动降级为按 PID 附加**：某些模拟器（如 Nox Android9）上 `frida-ps`/`-f`/`-n`/`-F` 会抛 `queryIntentActivities NullPointerException`（**即使 client=server 版本完全一致**，是枚举路径本身的 quirk）——旧逻辑据此判"Frida 不可用"并跳过整个动态阶段。现改为 `adb pidof/ps` 取 PID → `frida -p <PID>` 附加（实测该路径正常），动态阶段继续
 - **隐私与安全**：移除源码/文档中硬编码的私有 AI 中转地址（Base URL 默认留空，未配置时明确报错）；`git-filter-repo` 抹除历史中的私有域名与本机路径；清理构建残留与一次性调试脚本
 - **发现并修复**：`wikiSearch` 结构化 meta 解析失效（见上）；`baseUrl` 为空时由 `Invalid URL` 改为明确的中文配置提示
 

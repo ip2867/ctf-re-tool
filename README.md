@@ -1,4 +1,4 @@
-# CTF-RE-TOOL v1.3.11
+# CTF-RE-TOOL v1.3.12
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -307,6 +307,20 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 
 ## 更新日志
+
+### v1.3.12 (2026-10-14) — 补齐 v1.3.11 遗漏的求解路径（经验覆盖 100%）+ 预取扩展到 PYC/WebJS
+
+v1.3.11 建立了"解题成功自动入库 + 注入所有求解路径 + 主路径预取题库"的机制，本轮**逐函数审计**后发现三处遗漏并补齐，另把预取扩展到其余文件类型。
+
+- **补齐经验沉淀与注入的遗漏路径**（此前这些路径解题成功也不会沉淀经验）：
+  - `analyzeWebJSCore`（Web/JS 逆向）：只做了验证闭环，**没有收割经验** → 现补 `harvestExperience(autoSave)`。
+  - `detailedAnalysis`（APK 用户主动"详细分析"）/ `detailedBinaryAnalysis`（PE/ELF 同）：**既没验证也没收割经验** → 现补上完整验证闭环 + 经验自动入库。
+  - 至此 **9 条求解路径全部** `verify✓ harvest✓ 经验注入✓`（审计脚本逐函数核对）。
+- **手动 `经验 <内容>` 也走去重**：此前该命令直接追加写盘、绕过 v1.3.11 的内容级去重 → 现改走 `experienceKey`/`experienceSimilar` 判定 + 统一写入器，重复回写会被拦下并提示"已存在"。
+- **预取扩展到 PYC / WebJS**：`analyzePYC`（从反汇编/常量/字符串探测特征词）与 `analyzeWebJSCore`（从代理历史探测 sign/token/CryptoJS/瑞数等）也会在调用 AI 前主动检索题库并把攻略内联进提示词。
+- **特征词池扩充**：新增 Python/字节码类（pickle/renpy/rpyc/cython/pyinstaller…）与 Web/JS 类（JSEncrypt/CryptoJS/X-Bogus/sm2/wasm/jsvmp/瑞数…）。
+
+> 回归：经验流 6/6、相似度判别 5/5、手动回写去重 3/3；逐函数审计 9/9 求解路径全覆盖；`node --check` 三个 JS 全过。
 
 ### v1.3.11 (2026-10-14) — 经验库"自动沉淀、真去重、真复用"；修复题库攻略 70% 丢失
 

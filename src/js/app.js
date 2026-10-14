@@ -1082,21 +1082,22 @@ async function processUserMessage(message) {
   if (lowerMessage.startsWith('经验') || lowerMessage.startsWith('查经验')) {
     const text = message.replace(/^(经验|查经验)\s*/, '').trim();
     if (text && state.appPaths) {
-      const line = `- [${new Date().toISOString().slice(0, 10)}] ${text}\n`;
-      const expPath = `${state.appPaths.userData}/experience.md`;
-      // 首次创建补表头（read-file 对缺失文件返回 {success:false} 而不是抛异常）
-      const rf = await window.electronAPI.readFile(expPath);
-      if (!rf || !rf.success) {
-        await window.electronAPI.writeFile(expPath, '# 解题经验库（reverse-skill 进化层：AI 解题前自动速查）\n\n');
-      }
-      const r = await window.electronAPI.appendFile(expPath, line);
-      if (r && r.success) {
-        state.experience += line;
-        addSolveNote('经验', text);
-        addSystemMessage(`**💡 经验已入库**\n\n> ${text}\n\n下次分析时自动注入系统提示（经验速查），同类题可直接复用。`);
-        await pruneExperience();
+      // 走与自动入库相同的"内容级去重 + 统一写入器"，避免手动回写绕过去重造成重复
+      const line = `- [${new Date().toISOString().slice(0, 10)}] ${text}`;
+      const key = experienceKey(text);
+      const existing = [];
+      for (const l of String(state.experience || '').split('\n')) { const k = experienceKey(l); if (k) existing.push(k); }
+      const dup = existing.some(k => k === key || experienceSimilar(k, key));
+      if (dup) {
+        addSystemMessage(`**ℹ️ 该经验已存在（去重命中）**\n\n> ${text}\n\n未重复入库。发送 \`查经验\` 查看现有经验库。`);
       } else {
-        addLog('error', '经验写入失败');
+        const n = await writeExperienceEntries([line]);
+        if (n) {
+          addSolveNote('经验', text);
+          addSystemMessage(`**💡 经验已入库**\n\n> ${text}\n\n下次分析时自动注入系统提示（经验速查），同类题可直接复用。`);
+        } else {
+          addLog('error', '经验写入失败');
+        }
       }
     } else {
       const lines = (state.experience || '').trim();
@@ -2694,6 +2695,9 @@ async function analyzePYC() {
   // 2. 交给 AI 做算法还原（PYC 的关键信息都在反汇编/常量里，不需要外部工具）
   addLog('info', '[2/3] 调用 AI 还原算法并求 flag...');
   const pyVersion = (meta.match(/PYVER\s+(\S+)/) || [])[1] || '未知';
+  // 自动预取：从反汇编/常量/字符串里探测特征词（marshal/renpy/pickle/xor…）检索知识库，内联攻略
+  const knowledge = await prefetchKnowledge([disasm, consts, strings].join('\n'), 'PYC');
+
   const prompt = `我在解一道 CTF Python 字节码（.pyc）逆向题。已用反汇编工具提取出**反汇编 + 全部常量 + 字符串**，请据此还原算法并求出 flag。
 
 文件：${state.fileInfo ? state.fileInfo.fileName : state.currentFile}
@@ -2705,6 +2709,7 @@ ${disasm.slice(0, 12000)}
 \`\`\`
 ${consts ? `\n## 常量表（co_consts，**密钥/密文/数值常量都在这里，务必逐条检查**）\n\`\`\`\n${consts.slice(0, 4000)}\n\`\`\`` : ''}
 ${strings ? `\n## 原始字节串扫描（含明文串/base64/hex/大整数）\n\`\`\`\n${strings.slice(0, 3000)}\n\`\`\`` : ''}
+${knowledge}
 
 ## 解题要点
 - Python 字节码常只需**读常量 + 读逻辑**即可还原，不需要动态运行：
@@ -2939,9 +2944,12 @@ async function analyzeWebJSCore(targetUrl) {
   const jsFileHint = (state.fileType === 'JS' || state.fileType === 'HTML') && state.currentFile
     ? `\n用户还拖入了 ${state.fileType} 文件：${state.currentFile} —— 先用 read_file 读取原文，结合抓包数据分析其中的加密/签名逻辑。\n`
     : '';
+  // 自动预取：从代理历史里探测特征词（sign/token/JSEncrypt/CryptoJS/瑞数…）检索知识库，内联攻略
+  const knowledge = await prefetchKnowledge(String(historyText || ''), state.fileType || 'JS');
   const prompt = `Web/JS 逆向任务。${targetUrl ? '目标: ' + targetUrl + '。' : ''}${jsFileHint}
 当前 Burp 代理历史（实时数据）：
 ${String(historyText).substring(0, 5000)}
+${knowledge}
 
 请按 ctf-jsreverse 五阶段流程执行（先用 read_skill 加载完整方法论）：
 1. 从代理历史定位带加密参数的请求（sign/token/data/X-Bogus 等）
@@ -2962,7 +2970,9 @@ ${String(historyText).substring(0, 5000)}
       state.lastAiText = result.text;
       const clean = String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000);
       addSolveNote('求解结果', clean);
-      await verifyAndRecord(result.text, { source: 'ai' });
+      const { verifiedFlags: vf } = await verifyAndRecord(result.text, { source: 'ai' });
+      // 解题成功（有已验证 flag）→ 经验自动入库；否则仅暂存（内容级去重）
+      await harvestExperience(result.text, { autoSave: vf.length > 0 });
       addSystemMessage(`**🎯 Web/JS 逆向分析结果**\n\n${result.text}`);
     } else if (result.success) {
       endStreamMessage();
@@ -5706,10 +5716,17 @@ ${analysisData.mainActivityCode ? analysisData.mainActivityCode.substring(0, 200
       addLog('success', '详细分析完成！');
       addLog('success', '========================================');
 
+      state.lastAiText = result.text;
+      addSolveNote('求解结果(详细)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
+      // 详细分析同样走验证闭环 + 解题成功则经验自动入库（此前完全缺失 → JS/APK 详细路径的经验从不沉淀）
+      const { verifiedFlags: dvf, flags: dflags } = await verifyAndRecord(result.text, { source: 'ai-detail' });
+      await harvestExperience(result.text, { autoSave: dvf.length > 0 });
+
       const resultMsg = `**🔍 详细分析结果**
 
 **文件**: ${state.fileInfo.fileName}
 **包名**: ${analysisData.packageName || '未知'}
+${dvf.length ? `**Flag（✅已验证）**: \`${dvf[0].flag}\`` : (dflags.length ? `**Flag（⚠️未验证）**: \`${dflags[0]}\`` : '')}
 
 ${result.text}`;
 
@@ -6189,10 +6206,17 @@ ${analysisData.mainCode ? analysisData.mainCode.substring(0, 2000) : '暂无'}
       addLog('success', '详细分析完成！');
       addLog('success', '========================================');
 
+      state.lastAiText = result.text;
+      addSolveNote('求解结果(详细)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
+      // 详细分析同样走验证闭环 + 解题成功则经验自动入库（此前完全缺失 → PE/ELF 详细路径的经验从不沉淀）
+      const { verifiedFlags: dvf, flags: dflags } = await verifyAndRecord(result.text, { source: 'ai-detail' });
+      await harvestExperience(result.text, { autoSave: dvf.length > 0 });
+
       const resultMsg = `**🔍 详细分析结果**
 
 **文件**: ${state.fileInfo.fileName}
 **类型**: ${fileType}
+${dvf.length ? `**Flag（✅已验证）**: \`${dvf[0].flag}\`` : (dflags.length ? `**Flag（⚠️未验证）**: \`${dflags[0]}\`` : '')}
 
 ${result.text}`;
 
@@ -7611,13 +7635,18 @@ async function prefetchKnowledge(haystack, fileType, extra = []) {
       'twofish', 'blowfish', 'idea', 'base64', 'md5', 'sha256', 'sha1', 'rsa', 'xor', 'rot13', 'caesar', 'crc32',
       's-box', 'sbox', 'whitebox', '白盒', 'dfa', 'ollvm', 'vm', 'upx', 'frida', 'registernatives', 'jni', 'smali',
       'realm', 'macho', 'pyc', 'marshal', 'cuda', 'ptx', 'riscv', 'qemu', '固件', 'firmware', 'unidbg', 'angr',
-      'unicorn', 'z3', '反调试', 'ptrace', 'hook', 'native'];
+      'unicorn', 'z3', '反调试', 'ptrace', 'hook', 'native',
+      // Python/字节码类
+      'pickle', 'renpy', 'rpyc', 'cython', 'pyinstaller', 'co_code', 'pydisasm',
+      // Web/JS 逆向类
+      'jsencrypt', 'cryptojs', 'sign', 'token', 'x-bogus', 'a_bogus', '_0x', 'sm2', 'sm3', 'wasm', 'jsvmp', '瑞数'];
     const hits = POOL.filter(t => hay.includes(t));
     const ft = String(fileType || '').toUpperCase();
     if (/APK|DEX/.test(ft)) hits.unshift('apk');
     else if (/PE|ELF|EXE|BIN/.test(ft)) hits.unshift('native');
     else if (/PYC/.test(ft)) hits.unshift('python');
     else if (/MACHO/.test(ft)) hits.unshift('macho');
+    else if (/JS|HTML/.test(ft)) hits.unshift('js 逆向', 'sign');
     const terms = [...new Set([...extra, ...hits].map(s => String(s).trim()).filter(Boolean))].slice(0, 6);
     if (!terms.length) terms.push(ft || 'reverse');
     const r = await api.wikiSearch(terms.join(' '), 4);

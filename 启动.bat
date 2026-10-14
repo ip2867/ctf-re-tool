@@ -1,6 +1,6 @@
 @echo off
 echo ========================================
-echo   CTF Reverse Engineering Tool v1.3.11
+echo   CTF Reverse Engineering Tool v1.3.12
 echo ========================================
 echo.
 echo 功能特性:

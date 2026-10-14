@@ -5500,7 +5500,7 @@ ${otherClassesText}
       await harvestExperience(result.text);
 
       // 验证闭环 + 失败时本地枚举兜底（统一走 verifyAndRecord）
-      const { verifiedFlags } = await verifyAndRecord(result.text, { source: 'ai' });
+      const { verifiedFlags, flags } = await verifyAndRecord(result.text, { source: 'ai' });
 
       const resultMsg = `**🎯 自动求解结果**
 
@@ -6015,7 +6015,7 @@ ${globalsText}
       await harvestExperience(result.text);
 
       // 验证闭环 + 失败时本地枚举兜底（统一走 verifyAndRecord）
-      const { verifiedFlags } = await verifyAndRecord(result.text, { source: 'ai' });
+      const { verifiedFlags, flags } = await verifyAndRecord(result.text, { source: 'ai' });
 
       const resultMsg = `**🎯 自动求解结果**
 

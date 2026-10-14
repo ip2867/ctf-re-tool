@@ -4773,20 +4773,19 @@ async function autoFridaStage() {
     return;
   }
 
-  // 1b. Frida 兼容性自检：端口通不代表能用。某些 frida-server 版本在与旧版模拟器
-  //     （如 Nox Android 9）组合时，连 frida-ps 都会抛
-  //     `java.lang.NullPointerException: queryIntentActivities on null`——
-  //     spawn/attach 全部失败。这里提前探一次，明确报因并给出降级指引。
+  // 1b. Frida 能力自检：端口通不代表枚举可用。某些 frida-server 版本在与旧版模拟器
+  //     （如 Nox Android 9）组合时，会抛
+  //     `NullPointerException: queryIntentActivities on null`——导致 frida-ps / -f / -n / -F 全失败。
+  //     但 **按 PID attach（frida -p <PID>，PID 用 adb pidof/ps 取）走的是另一条路径，实测可用**。
+  //     因此这里不再"判死刑"，只在枚举失败时**提示已切换到 PID 模式**，动态阶段照常继续。
   let fridaCompat = true;
   try {
     const ps = await window.electronAPI.fridaPs();
     const psText = JSON.stringify(ps || {});
     if (/queryIntentActivities|NullPointerException|unable to communicate|major versions match/i.test(psText)) {
       fridaCompat = false;
-      addLog('warning', '⚠️ Frida 与当前模拟器不兼容（frida-ps 报 queryIntentActivities NullPointerException）');
-      addLog('warning', '这通常是 frida-server 版本过新、与模拟器 Android 版本不匹配所致。');
-      addLog('info', '建议：将 frida 与 frida-server 一并降到兼容版本（如 16.7.19），再重试。');
-      addSystemMessage('**⚠️ Frida 版本不兼容**\n\n`frida-ps` 报 `queryIntentActivities NullPointerException`——frida-server 与模拟器不兼容（常见于 frida 17.x + Nox Android 9）。\n\n**建议**：把 **frida 与 frida-server 都降到 16.7.19**（client 与 server 大版本需一致），重启 frida-server 后重试。');
+      addLog('info', 'Frida 进程枚举不可用（queryIntentActivities NPE）——已自动切换为「按 PID 附加」模式（adb 取 PID），动态阶段继续。');
+      addSystemMessage('**ℹ️ Frida 枚举不可用，已切换 PID 模式**\n\n`frida-ps` / `-f` / `-n` 走的是会 NPE 的枚举路径（frida + 本模拟器的已知 quirk）。\n本工具已改为用 **adb 取 PID → `frida -p <PID>` 附加**，该路径实测正常，动态调试阶段继续执行。\n\n> 若想彻底根治（让枚举也能用），可把 frida 与 frida-server 一并降到与模拟器匹配的版本并重启 server。');
     }
   } catch (e) { /* 探活失败不阻断，交给后续 spawn 回退处理 */ }
 

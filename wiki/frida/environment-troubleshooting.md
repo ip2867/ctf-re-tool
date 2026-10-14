@@ -44,12 +44,36 @@ Attempt to invoke virtual method 'java.util.List android.content.pm.PackageManag
 Failed to spawn: unable to communicate with remote frida-server;
 please ensure that major versions match ...
 ```
-且 **`frida-ps -H ... ` 也报同样的错**（关键判据——连列进程都不行，就不是脚本的事）。
+且 **`frida-ps -H ... ` 也报错**（连列进程都不行 → 不是脚本的问题，是 frida 连接/枚举层的问题）。
+**看具体报错区分**：`major versions match` → 根因①（版本不一致）；`queryIntentActivities` → 根因②（枚举路径坏，换版本也没用，走 PID）。
 
-**根因**：**PC 端 frida 客户端 与 设备端 frida-server 版本不一致**（大版本或次版本不同）。
-（曾误判为"frida 17.x 与 Nox Android9 不兼容"，**实为误判**——实测 client/server **只要一致**，16/16 与 17/17 **都能正常** `frida-ps`+`spawn`；不一致则必崩。）
+**根因（两种，务必分辨）**：
 
-**修复（实测有效）**：让 **client 与 server 版本完全一致**（推荐都用 16.7.19）：
+**① 版本不一致**（次/大版本不同）→ 连 `frida-ps` 都报
+`unable to communicate with remote frida-server; please ensure that major versions match`。
+这种**必须**让 client 与 server 完全一致（下方步骤）。
+
+**② 版本一致但仍枚举失败（Nox Android9 的已知 quirk）** → `frida-ps` / `-f` / `-n` / `-F` 报
+`NullPointerException: queryIntentActivities on null`。
+**实测：client=16.7.19 且 server=16.7.19（完全一致）时，这些"枚举类"操作依然全崩。**
+根因是这条枚举路径在旧模拟器上取不到 PackageManager，**与版本是否一致无关**——所以"降到 16.7.19"**并不能**修好它。
+
+> ⚠️ 纠错：早期文档写"client/server 一致就都能正常 frida-ps"，**该结论不准确**。准确结论是：
+> 版本一致能消除 **①**；但 **②**（queryIntentActivities NPE）是**枚举路径本身**的问题，换版本无效。
+
+**②的解法（实测有效）：绕开枚举，改用「按 PID 附加」**
+`frida -p <PID>` 与 `-f/-n/-F` 走的是**完全不同的代码路径**，实测在同一环境下 **完全正常**：
+```bash
+# 1) 用 adb 取 PID（不经过 frida 的枚举）
+nox_adb -s 127.0.0.1:62025 shell "monkey -p <包名> -c android.intent.category.LAUNCHER 1"  # 先拉起
+nox_adb -s 127.0.0.1:62025 shell "pidof <包名>"        # 拿到 PID（如 3701）
+# 2) 按 PID attach
+frida -H 127.0.0.1:27042 -p 3701 -l hook.js            # ✅ 正常注入
+```
+**本工具已自动采用此策略**：`frida-ps` 枚举失败时不再中止动态阶段，而是
+`adb pidof/ps -A` 取 PID → `frida -p <PID>` 附加（`electron/main.js` 的 `resolvePidByName` / `buildAttachArgs`）。
+
+**①的修复（仅当版本确实不一致时）**：让 **client 与 server 版本完全一致**（推荐都用 16.7.19）：
 ```bash
 # 1) PC 端对齐
 python -m pip install "frida==16.7.19" "frida-tools==12.5.0"

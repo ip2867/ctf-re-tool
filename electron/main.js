@@ -3717,6 +3717,65 @@ function resolveFridaProcessName(target) {
   })();
 }
 
+// 用 adb `pidof <包名>` 拿 PID —— 这是 frida-ps 枚举失败时的**可靠后备**。
+// 背景：frida 16.7.19 + 某些 Nox Android9 镜像上，frida-ps（枚举进程/应用，
+// 内部走 queryIntentActivities）会抛 NullPointerException，导致 -f/-n/-F 全部不可用；
+// 但 **`frida -p <PID>` 直接按 PID attach 完全正常**（已实测：ATTACH_OK）。
+// 返回 pid(数字) 或 null。
+function adbPidOf(name) {
+  return new Promise((resolve) => {
+    const port = config.emulator.adb_port;
+    let done = false;
+    const fin = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      const c = spawn(resolveAdbPath(), ['-s', `127.0.0.1:${port}`, 'shell', 'pidof', String(name)], { shell: false, windowsHide: true });
+      let o = '';
+      c.stdout.on('data', d => o += d.toString());
+      c.on('error', () => fin(null));
+      c.on('close', () => {
+        const m = String(o).trim().match(/\b(\d+)\b/);
+        fin(m ? Number(m[1]) : null);
+      });
+      setTimeout(() => { try { c.kill(); } catch (e) {} fin(null); }, 8000);
+    } catch (e) { fin(null); }
+  });
+}
+
+// 用 adb `ps -A` 全表搜进程名（pidof 取不到时的兜底，兼容只按包名/末段匹配）。
+function adbFindPidByPs(name) {
+  return new Promise((resolve) => {
+    const port = config.emulator.adb_port;
+    let done = false;
+    const fin = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      const c = spawn(resolveAdbPath(), ['-s', `127.0.0.1:${port}`, 'shell', 'ps', '-A'], { shell: false, windowsHide: true });
+      let o = '';
+      c.stdout.on('data', d => o += d.toString());
+      c.on('error', () => fin(null));
+      c.on('close', () => {
+        const q = String(name || '').toLowerCase();
+        const seg = q.split('.').pop();
+        const rows = String(o).split(/\r?\n/).map(l => {
+          const m = l.match(/^\S+\s+(\d+)\s+\d+\s+.*?\s(\S+)\s*$/);
+          return m ? { pid: Number(m[1]), name: m[2] } : null;
+        }).filter(Boolean);
+        const hit = rows.find(r => r.name.toLowerCase() === q)
+          || rows.find(r => r.name.toLowerCase().includes(q) || q.includes(r.name.toLowerCase()))
+          || (seg && seg.length >= 4 ? rows.find(r => r.name.toLowerCase().includes(seg)) : null);
+        fin(hit ? hit.pid : null);
+      });
+      setTimeout(() => { try { c.kill(); } catch (e) {} fin(null); }, 10000);
+    } catch (e) { fin(null); }
+  });
+}
+
+// 解析"包名/进程名 → PID"（先 pidof，再 ps -A 兜底）
+async function resolvePidByName(name) {
+  let pid = await adbPidOf(name);
+  if (!pid) pid = await adbFindPidByPs(name);
+  return pid || null;
+}
+
 // 执行Frida Hook
 // 执行Frida Hook脚本（spawn，避免 shell 注入；唯一临时文件名，finally 清理）
 async function execFridaHook(script, target, opts) {
@@ -3732,8 +3791,16 @@ async function execFridaHook(script, target, opts) {
   const buildAttachArgs = async (t) => {
     const a = ['-H', `127.0.0.1:${port}`];
     if (t) {
-      const resolved = await resolveFridaProcessName(t);
-      a.push('-n', (resolved && resolved.name) ? resolved.name : t);
+      // 优先按 PID attach：frida-ps 枚举在部分环境（frida16.7.19+Nox9）会 NPE，
+      // 而 -p <PID> 走的是完全不同的路径，实测稳定可用。用 adb 直接取 PID，绕开枚举。
+      const pid = await resolvePidByName(t);
+      if (pid) {
+        a.push('-p', String(pid));
+      } else {
+        // 兜底：仍按进程名（-n），仅在确实取不到 PID 时用
+        const resolved = await resolveFridaProcessName(t);
+        a.push('-n', (resolved && resolved.name) ? resolved.name : t);
+      }
     } else {
       a.push('-F');
     }
@@ -3790,12 +3857,46 @@ async function execFridaHook(script, target, opts) {
       }
     }
     const attachArgs = await buildAttachArgs(target);
-    const out = await runFridaOnce(attachArgs, tempFile, opts);
+    let out = await runFridaOnce(attachArgs, tempFile, opts);
+    // `-F`（附加前台应用）在 frida-ps 枚举坏掉的环境也会失败；此时取"当前前台包名的 PID"再 attach。
+    if (!target && out && /queryIntentActivities|NullPointerException|Unable to get frontmost|unable to find process|not found/i.test(out) && !/\[DATA\]|\[HIT\]/.test(out)) {
+      const fg = await adbForegroundPackage();
+      if (fg) {
+        const pid = await resolvePidByName(fg);
+        if (pid) {
+          const args2 = ['-H', `127.0.0.1:${port}`, '-p', String(pid), '-l', tempFile];
+          const out2 = await runFridaOnce(args2, tempFile, opts);
+          return { success: true, output: `[-F 失败，改按前台应用 PID=${pid}(${fg}) attach]\n` + out2 };
+        }
+      }
+    }
     return { success: true, output: out };
   } catch (err) {
     try { fs.unlinkSync(tempFile); } catch (e) {}
     return { success: false, error: err.message, output: '' };
   }
+}
+
+// 取当前前台包名（dumpsys activity）。frida -F 失败时的替代定位方式。
+function adbForegroundPackage() {
+  return new Promise((resolve) => {
+    const port = config.emulator.adb_port;
+    let done = false;
+    const fin = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      const c = spawn(resolveAdbPath(), ['-s', `127.0.0.1:${port}`, 'shell', 'dumpsys', 'activity', 'activities'], { shell: false, windowsHide: true });
+      let o = '';
+      c.stdout.on('data', d => o += d.toString());
+      c.on('error', () => fin(null));
+      c.on('close', () => {
+        // 形如：mResumedActivity: ActivityRecord{... com.pkg/.Activity ...}
+        const m = String(o).match(/mResumedActivity:.*?\s([a-zA-Z][\w]*(\.[\w]+)+)\//)
+          || String(o).match(/topResumedActivity.*?\s([a-zA-Z][\w]*(\.[\w]+)+)\//);
+        fin(m ? m[1] : null);
+      });
+      setTimeout(() => { try { c.kill(); } catch (e) {} fin(null); }, 8000);
+    } catch (e) { fin(null); }
+  });
 }
 
 // 单次 frida 执行：spawn 一个 frida 进程，滚动窗口抓取输出后解析。

@@ -53,6 +53,14 @@
 - **知识**: [advanced-native-and-jce.md](frida/advanced-native-and-jce.md) §脱壳
 - **关键词**: `脱壳` `DEX魔数` `dex\n035` `内存dump` `frida-dexdump` `UPX` `OEP`
 
+### 运行型 / 公式型 / 短密文（CTF² 实战方法论）
+
+- **运行型（伴生输出反演）**: [reverse/method_runtime_challenges.md](reverse/method_runtime_challenges.md)
+- **并行扫描/置换网络**: [reverse/method_parallel_scan_inversion.md](reverse/method_parallel_scan_inversion.md)（Blelloch up/down-sweep 精确逆序、MPI 单位标签求置换）
+- **Excel 公式校验器**: [reverse/method_excel_formula_verifier.md](reverse/method_excel_formula_verifier.md)（OOXML 解压、公式→ReLU/矩阵乘、stride 反推、逐字符枚举）
+- **短密文秒解/协议封装**: [reverse/method_short_ciphertext_triage.md](reverse/method_short_ciphertext_triage.md)（单字节全扫、前缀匹配、剥控制字符头）
+- **关键词**: `运行型` `flag.out` `Blelloch` `up-sweep` `MPI` `单位标签` `xlsx` `SUMPRODUCT` `stride` `enc.txt` `协议头` `控制字符`
+
 ### 历年大赛逆向题（结构化条目库）
 - **库**: [reverse/_INDEX.md](reverse/_INDEX.md) — 每题含 `attack_chain`（解法步骤）、`reasoning_chain`（思维链）、`failed_attempts`（避坑）
 - **关键词**: 见各条目 tags

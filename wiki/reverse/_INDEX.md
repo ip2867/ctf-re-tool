@@ -48,6 +48,10 @@
 | 41 | [第三届古剑山网络安全功防大赛初赛Reverse全解wp](第三届古剑山网络安全功防大赛初赛_第三届古剑山网络安全功防大赛初赛Reverse全解wp.md) | 第三届古剑山网络安全功防大赛初赛 | 2025 | hard | 古剑山初赛Reverse全解5题：easyre RC4+异或+HelloWorl |
 | 42 | [第五届"鹏城杯"初赛 Reverse-MDriver-赛题解析](鹏城杯_第五届_鹏城杯_初赛_Reverse-MDriver-赛题解析.md) | 鹏城杯 | 2025 | hard | 鹏城杯2025 WFP callout驱动逆向,ClassifyFn识别WFP过 |
 | 43 | [贵阳大数据及网络安全精英对抗赛 Reverse EZRE_0 解题](贵阳大数据_贵阳大数据及网络安全精英对抗赛_Reverse_EZRE_0_解题.md) | 贵阳大数据 | 2023 | medium | EZRE_0 Reverse：错位异或 + TLS 回调 RC4(JT8U9pt |
+| 44 | [method_runtime_challenges](method_runtime_challenges.md) | CTF² Agent Arena | 2026 | method | 运行型逆向（伴生输出反演）：输出首元素=flag首字符 ASCII，已知明文推算子，6排列暴力反演 |
+| 45 | [method_parallel_scan_inversion](method_parallel_scan_inversion.md) | CTF² Agent Arena | 2026 | method | 并行扫描/置换网络：Blelloch up/down-sweep 精确逆序；MPI 环形搬运=单位标签求置换 |
+| 46 | [method_excel_formula_verifier](method_excel_formula_verifier.md) | CTF² Agent Arena | 2026 | method | Excel 公式校验器：OOXML 解压，SUMPRODUCT=矩阵乘，stride 行号锚点反推，逐字符枚举 |
+| 47 | [method_short_ciphertext_triage](method_short_ciphertext_triage.md) | CTF² Agent Arena | 2026 | method | 短密文秒解（enc.txt类）：单字节 XOR/移位全扫、Caesar+前缀匹配；协议封装明文剥控制字符头 |
 
 ## 关键词（tags 汇总）
 

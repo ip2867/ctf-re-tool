@@ -109,7 +109,11 @@ const DEFAULT_CONFIG = {
     // 可选：独立 JEB MCP server.py 所在目录（留空 = 依赖 JEB 插件自带 HTTP 服务）
     jebMcpScript: '',
     // 可选：自备的浏览器 MCP（SSE 端点）；留空则用内置受控浏览器 CDP
-    browser: ''
+    browser: '',
+    // CTF²（DASCTF Agent Arena）开放平台 MCP：练习题/附件/提交 flag。
+    // 鉴权用环境变量式 Bearer Token；Token 留空表示未配置（在设置页填写，只存 userData/config.json）。
+    ctf2: 'https://ctf2.dasctf.com/api/ai/v1/mcp',
+    ctf2Token: ''
   },
   kali: {
     vmxPath: '',
@@ -139,6 +143,12 @@ const DEFAULT_CONFIG = {
   workspace: {
     // 脚本/WP 输出目录，空则用应用目录下的 scripts/
     scriptsDir: ''
+  },
+  platform: {
+    // CTF² 平台拉题：附件下载目录（默认 E:\ctf\pratice）
+    downloadDir: 'E:\\ctf\\pratice',
+    // 批量解题跳过清单（题名数组）：人工已解出/不想自动跑的题
+    skipChallenges: []
   }
 };
 
@@ -462,7 +472,7 @@ ipcMain.handle('detect-file-type', async (event, filePath) => {
         description += ' (内嵌 AutoIt 脚本，可用 MyAut2Exe 提取)';
       }
     }
-    // APK / JAR / ZIP 区分：同为 PK 头，看中央目录内容
+    // APK / JAR / ZIP / OOXML 区分：同为 PK 头，看中央目录内容
     else if (magic === '504B0304' || ext === '.zip' || ext === '.apk' || ext === '.jar') {
       if (ext === '.apk' || zipContainsEntry(filePath, 'AndroidManifest.xml')) {
         fileType = 'APK';
@@ -470,6 +480,12 @@ ipcMain.handle('detect-file-type', async (event, filePath) => {
       } else if (ext === '.jar' || zipContainsEntry(filePath, 'META-INF/MANIFEST.MF')) {
         fileType = 'JAR';
         description = 'Java Archive（可用 jadx 反编译）';
+      } else if (ext === '.xlsx' || ext === '.xlsm' || zipContainsEntry(filePath, 'xl/workbook.xml')) {
+        fileType = 'XLSX';
+        description = 'Excel Workbook（OOXML；ExceLLM 类"Excel 逆向"题载体，按 ZIP 容器解压分析）';
+      } else if (ext === '.docx' || ext === '.pptx' || zipContainsEntry(filePath, 'word/document.xml') || zipContainsEntry(filePath, 'ppt/presentation.xml')) {
+        fileType = 'XLSX';
+        description = 'OOXML 文档（Word/PowerPoint；按 ZIP 容器解压分析）';
       } else {
         fileType = 'ZIP';
         description = 'ZIP Archive';
@@ -484,6 +500,17 @@ ipcMain.handle('detect-file-type', async (event, filePath) => {
     else if (ext === '.html' || ext === '.htm') {
       fileType = 'HTML';
       description = 'Web Page（可提取内嵌 JS 分析）';
+    }
+    // XML / JSON 文本结构（OOXML 解压产物等）：走文本分析，绝不进 Kali 固件流程
+    else if (ext === '.xml' || ext === '.rels' || ext === '.json' || ext === '.plist' || ext === '.yml' || ext === '.yaml') {
+      fileType = 'XML';
+      description = '结构化文本（XML/JSON 等；直读内容分析，公式/密钥/常量常藏其中）';
+    }
+    // 纯文本（.txt/.enc 等）：直读内容分析。enc.txt(34B) 曾被 UNKNOWN→Kali 白烧 60s，
+    // 而它的全部信息就是那 34 个字符（RSA 密文/编码串等）。
+    else if (ext === '.txt' || ext === '.enc' || ext === '.log' || ext === '.md' || ext === '.csv') {
+      fileType = 'TXT';
+      description = '文本文件（直读内容分析：密文/编码/提示常以纯文本给出）';
     }
 
     return {
@@ -2308,6 +2335,299 @@ async function burpMcpCallTool(logicalName, args) {
   }
 }
 
+// ========== CTF²（DASCTF Agent Arena）开放平台 MCP 客户端 ==========
+// 与 IDA/JEB/Burp 不同：这是公网 HTTPS 的 Streamable HTTP MCP 端点，用 Bearer Token 鉴权。
+// 工具名固定（ctf2_list_practice_challenges / ctf2_get_practice_challenge / ctf2_get_attachment_url
+// / ctf2_submit_flag / ctf2_agent_whoami 等），无需名字映射 —— 直接透传。
+// 复用 sendMCPRequest 的 extraHeaders 通道放 Authorization（该通道本就为此预留）。
+let ctf2McpState = { sessionId: null, baseUrl: null, token: null };
+
+function ctf2Token() {
+  return String((config.mcp && config.mcp.ctf2Token) || '').trim();
+}
+function ctf2BaseUrl() {
+  return String((config.mcp && config.mcp.ctf2) || '').trim();
+}
+// 地址或 Token 变化时丢弃旧会话（换号后旧 session 无效）
+function ctf2EnsureStateFresh() {
+  const url = ctf2BaseUrl();
+  const tok = ctf2Token();
+  if (ctf2McpState.baseUrl !== url || ctf2McpState.token !== tok) {
+    ctf2McpState = { sessionId: null, baseUrl: url, token: tok };
+  }
+}
+function ctf2ResetConnection() {
+  ctf2McpState = { sessionId: null, baseUrl: ctf2BaseUrl(), token: ctf2Token() };
+}
+
+// 构造请求头：有 Token 就带 Bearer（无 Token 时也让请求发出，由服务端返回 401 以便给出明确报错）
+function ctf2Headers() {
+  const h = {};
+  const tok = ctf2Token();
+  if (tok) h['Authorization'] = 'Bearer ' + tok;
+  if (ctf2McpState.sessionId) h['Mcp-Session-Id'] = ctf2McpState.sessionId;
+  return h;
+}
+
+async function ctf2McpEnsureSession() {
+  ctf2EnsureStateFresh();
+  if (!ctf2BaseUrl()) throw new Error('未配置 CTF² MCP 地址（设置页 → CTF²）');
+  if (!ctf2Token()) throw new Error('未配置 CTF² Token（在平台「凭证」页创建后填入设置页 → CTF² Token）');
+  if (ctf2McpState.sessionId) return ctf2McpState.sessionId;
+  const init = await sendMCPRequest(ctf2BaseUrl(), 'initialize', {
+    protocolVersion: '2024-11-05',
+    capabilities: {},
+    clientInfo: { name: 'ctf-re-tool', version: '1.4' }
+  }, ctf2Headers(), 30000);
+  ctf2McpState.sessionId = (init && (init._headers || {})['mcp-session-id'])
+    || (init && init.result && init.result.sessionId) || null;
+  try {
+    await sendMCPRequest(ctf2BaseUrl(), 'notifications/initialized', {}, ctf2Headers(), 8000);
+  } catch (e) { /* 非关键 */ }
+  return ctf2McpState.sessionId;
+}
+
+// 调用平台 MCP 工具（工具名直通），返回解包后的数据
+async function ctf2McpCallTool(toolName, args) {
+  const doCall = async () => {
+    await ctf2McpEnsureSession();
+    const resp = await sendMCPRequest(ctf2BaseUrl(), 'tools/call', {
+      name: toolName, arguments: args || {}
+    }, ctf2Headers(), 60000);
+    if (resp && resp.error) throw new Error(resp.error.message || JSON.stringify(resp.error));
+    return unwrapMcpContent(resp);
+  };
+  try {
+    return await doCall();
+  } catch (err) {
+    // 会话失效/网络瞬断 → 重置重试一次；tools/call 超时不重试（可能已执行，非幂等）
+    if (/400|401|403|404|session|ECONN|socket|ETIMEDOUT|EAI_AGAIN/i.test(err.message) && !/timeout/i.test(err.message)) {
+      ctf2ResetConnection();
+      try { return await doCall(); } catch (e2) { throw e2; }
+    }
+    throw err;
+  }
+}
+
+// 探活：whoami（能返回即说明地址 + Token 均可用）
+async function ctf2Probe() {
+  const me = await ctf2McpCallTool('ctf2_agent_whoami', {});
+  return { ok: true, me };
+}
+
+// 列出平台可用工具（供设置页/诊断显示）
+async function ctf2ListTools() {
+  await ctf2McpEnsureSession();
+  const resp = await sendMCPRequest(ctf2BaseUrl(), 'tools/list', {}, ctf2Headers(), 30000);
+  const tools = (resp && resp.result && resp.result.tools) || [];
+  return tools.map(t => ({ name: t.name, description: t.description || '' }));
+}
+
+// 主进程下载附件到本地（渲染层无 HTTP 能力；下载由主进程发起，不受 write-file 白名单限制）
+// 返回 { success, path, bytes, filename }
+async function ctf2DownloadAttachment(url, destDir) {
+  return new Promise((resolve) => {
+    let u;
+    try { u = new URL(String(url || '')); } catch (e) { return resolve({ success: false, error: '附件 URL 非法: ' + url }); }
+    if (!/^https?:$/.test(u.protocol)) return resolve({ success: false, error: '仅支持 http/https 下载' });
+
+    const MAX = 300 * 1024 * 1024; // 300MB 上限，防御异常大文件
+    const client = u.protocol === 'https:' ? https : http;
+    const req = client.get(u, { timeout: 120000, headers: { 'User-Agent': 'ctf-re-tool' } }, (res) => {
+      // 跟随重定向（最多 5 跳）
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && (req._hops || 0) < 5) {
+        res.resume();
+        req._hops = (req._hops || 0) + 1;
+        const next = new URL(res.headers.location, u).toString();
+        return resolve(ctf2DownloadAttachment(next, destDir));
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return resolve({ success: false, error: '下载失败 HTTP ' + res.statusCode });
+      }
+      // 文件名：优先 Content-Disposition，其次 URL 路径末段
+      let filename = '';
+      const cd = res.headers['content-disposition'] || '';
+      const m1 = cd.match(/filename\*?=(?:UTF-8'')?["']?([^;"']+)/i);
+      if (m1) filename = decodeURIComponent(m1[1]);
+      if (!filename) {
+        const seg = decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || '');
+        filename = seg || ('attachment_' + Date.now());
+      }
+      filename = filename.replace(/[\\/:*?"<>|]/g, '_').slice(0, 120) || ('attachment_' + Date.now());
+      const destDirSafe = destDir || app.getPath('temp');
+      // 目录碰撞防御：下载目录下若已存在同名"目录"（如历史拉题建的 parallelism/），
+      // writeFileSync 会 EISDIR 整轮中止 → 改名重试到不撞目录为止（同名普通文件则覆盖，属重下同一附件）。
+      let destPath = path.join(destDirSafe, filename);
+      if (fs.existsSync(destPath)) {
+        let st = null;
+        try { st = fs.statSync(destPath); } catch (e) {}
+        if (st && st.isDirectory()) {
+          const ext = path.extname(filename);
+          const base = path.basename(filename, ext);
+          let i = 1;
+          do {
+            destPath = path.join(destDirSafe, `${base}_${i++}${ext}`);
+            st = null;
+            try { st = fs.statSync(destPath); } catch (e) {}
+          } while (st && st.isDirectory() && i < 100);
+          filename = path.basename(destPath);
+        }
+      }
+
+      const chunks = [];
+      let total = 0;
+      res.on('data', (c) => {
+        total += c.length;
+        if (total > MAX) { req.destroy(); }
+        else chunks.push(c);
+      });
+      res.on('end', () => {
+        if (total > MAX) return resolve({ success: false, error: '附件超过 300MB 上限，已中止' });
+        try {
+          fs.mkdirSync(destDirSafe, { recursive: true });
+          fs.writeFileSync(destPath, Buffer.concat(chunks));
+          resolve({ success: true, path: destPath, bytes: total, filename });
+        } catch (e) {
+          resolve({ success: false, error: '写入失败: ' + e.message });
+        }
+      });
+      res.on('error', (e) => resolve({ success: false, error: '下载中断: ' + e.message }));
+    });
+    req.on('timeout', () => { req.destroy(); resolve({ success: false, error: '下载超时（120s）' }); });
+    req.on('error', (e) => resolve({ success: false, error: '下载请求失败: ' + e.message }));
+  });
+}
+
+// IPC: CTF² MCP 工具直通调用（仅前端流水线使用；不注册进 AI 工具定义）
+ipcMain.handle('ctf2-mcp-call', async (event, toolName, args) => {
+  try {
+    const result = await ctf2McpCallTool(toolName, args);
+    return { success: true, result };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+// IPC: 探活（whoami）
+ipcMain.handle('ctf2-probe', async () => {
+  try { return { success: true, ...(await ctf2Probe()) }; }
+  catch (err) { return { success: false, error: err.message }; }
+});
+// IPC: 列出平台工具
+ipcMain.handle('ctf2-tools', async () => {
+  try { return { success: true, tools: await ctf2ListTools() }; }
+  catch (err) { return { success: false, error: err.message }; }
+});
+// IPC: 下载附件到本地目录
+ipcMain.handle('ctf2-download', async (event, url, destDir) => {
+  try { return await ctf2DownloadAttachment(url, destDir); }
+  catch (err) { return { success: false, error: err.message }; }
+});
+
+// IPC: 按精确进程名清理本题拉起的外部分析工具（批量解题的"每题收尾"步骤）。
+// 白名单逐个精确 taskkill（绝不全杀 node/electron/系统进程）；不存在的进程静默忽略。
+ipcMain.handle('ctf2-cleanup-tools', async () => {
+  const { execSync } = require('child_process');
+  const targets = [
+    'ida.exe', 'ida64.exe',           // IDA
+    'jeb-wincon.exe', 'jeb.exe',      // JEB（jeb_wincon.bat 的实际进程名）
+    'java.exe'                        // jadx/unluac/apktool 等 Java 系（JEB 也走 java？JEB 用自带 jvm 进程名同上）
+  ];
+  const killed = [];
+  for (const name of targets) {
+    try { execSync('taskkill /F /IM ' + name, { stdio: 'ignore', timeout: 15000 }); killed.push(name); } catch (e) { /* 进程不存在 → 忽略 */ }
+  }
+  return { success: true, killed };
+});
+
+// IPC: 解压平台 zip 手包（渲染层无 Node 能力，解压必须走主进程）。
+// 返回 { success, dir, files: [绝对路径...] }，files 按"可分析优先级"排序（ELF/PE/pyc/无扩展名在前），
+// files[0] 即推荐主文件。
+ipcMain.handle('ctf2-unzip', async (event, zipPath) => {
+  const { execSync } = require('child_process');
+  try {
+    if (!fs.existsSync(zipPath)) return { success: false, error: '文件不存在: ' + zipPath };
+    // ZIP 系列容器一律放行：.zip / .apk / .jar / .xlsx / .docx / .pptx / .aar / .ipa
+    // （ExceLLM 实测：xlsx 附件被 "仅支持 .zip" 拒收 → 整轮 0 秒结束。OOXML 本质就是 zip）
+    if (!/\.(zip|apk|jar|xlsx|xlsm|docx|pptx|aar|ipa|epub)$/i.test(zipPath)) {
+      // 无扩展名/其他扩展名时看魔数：PK\x03\x04 也放行
+      let head = '';
+      try { head = fs.readFileSync(zipPath).slice(0, 4).toString('hex'); } catch (e) {}
+      if (head !== '504b0304') return { success: false, error: '非 ZIP 容器（扩展名与魔数均不符）: ' + zipPath };
+    }
+    const dir = String(zipPath).replace(/\.[^.]+$/, '') + '_x';
+    // 幂等解压：先删旧目录。上一轮 IDA 会在解压目录里生成 .id0/.id2/.til/.nam 数据库，
+    // 残留会混进伴生文件清单污染 AI 上下文（not-baby-parallelism 第二轮实测暴露）。
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
+    // Expand-Archive 对 .xlsx 等非 .zip 扩展名会拒绝 → 先复制成 .zip 再解压（PowerShell 5.1 限制）
+    const tmpZip = /\.(zip)$/i.test(zipPath) ? zipPath : path.join(app.getPath('temp'), 'ctf2_unzip_' + Date.now().toString(36) + '.zip');
+    if (tmpZip !== zipPath) { try { fs.copyFileSync(zipPath, tmpZip); } catch (e) { return { success: false, error: '复制为 .zip 失败: ' + e.message }; } }
+    try {
+      execSync('powershell -NoProfile -Command "Expand-Archive -Path \'' + tmpZip + '\' -DestinationPath \'' + dir + '\' -Force"', { timeout: 90000, stdio: 'ignore' });
+    } finally {
+      if (tmpZip !== zipPath) { try { fs.rmSync(tmpZip, { force: true }); } catch (e) {} }
+    }
+    // xlsx/docx 解压出的是 XML 结构（xl/worksheets、word/document.xml），对 AI 直接读意义有限，
+    // 但解压目录本身就是证据（sharedStrings.xml 常藏字符串、xl/workbook.xml 有 sheet 清单），
+    // 原样列出即可；真正"能跑"的优先级打分保持不变。
+    const JUNK = /\.(til|id2|nam|id0|id1|i64|idb|bak)$/i;
+    const files = [];
+    (function walk(d) {
+      let ents = [];
+      try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
+      for (const e of ents) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walk(p); else { if (!JUNK.test(p)) files.push(p); }
+      }
+    })(dir);
+    // 可分析优先级打分：ELF > PE > pyc > Mach-O/Class > 无扩展名 > .bin > 其他
+    // OOXML 感知（ExceLLM 类 Excel 逆向题）：workbook.xml / worksheets / sharedStrings 是逻辑所在，
+    // docProps（core/app/custom.xml）是元数据噪声——241 字节的 custom.xml 曾被当成"主文件"
+    // 送进 Kali 固件流程白烧 60s。字体/rels/[Content_Types] 同属噪声。
+    // sheet 之间再按"公式元素数 + 文件大小"分主次：展示壳 sheet1 常只有 IF(VERIFY!Z1=1,...)，
+    // 真校验器（大量 SUMPRODUCT/权重）在公式最多的 sheet（ExceLLM 实测 sheet4=VERIFY 164KB）。
+    const ooxmlSheetFormulaCount = (p) => {
+      try {
+        const t = fs.readFileSync(p, 'utf8');
+        return (t.match(/<f[ >]/g) || []).length;
+      } catch (e) { return 0; }
+    };
+    const ooxmlScore = (p) => {
+      const n = p.replace(/\\/g, '/').toLowerCase();
+      if (/xl\/worksheets\/sheet\d+\.xml$/.test(n)) {
+        const fc = ooxmlSheetFormulaCount(p);
+        // 公式数是 sheet 之间的主导因子（独立高位项，最多 900000，远大于 1MB 级的大小扣分）：
+        // ExceLLM 实测 sheet1=1 公式展示壳 / sheet4=244 公式校验器。
+        return 90 + Math.min(fc, 900) * 0.1 + (fc > 0 ? 6 : 0);
+      }
+      if (/xl\/(workbook|sharedstrings|calcchain)\.xml$/.test(n)) return 92; // sheet 结构 + 字符串 + 计算链
+      if (/xl\/.*\.xml$/.test(n)) return 80;                             // 其它 xl/ 下 XML（styles 等次要）
+      if (/docprops\//.test(n)) return 1;                                // 元数据噪声，最后才考虑
+      if (/\[content_types\]\.xml$/.test(n) || /\.rels$/.test(n)) return 2;
+      return null; // 非 OOXML 特征 → 走通用打分
+    };
+    const score = (p) => {
+      const oo = ooxmlScore(p);
+      if (oo !== null) return oo * 100000 - Math.min(fs.statSync(p).size, 99999);
+      let b = Buffer.alloc(0);
+      try { b = fs.readFileSync(p).slice(0, 8); } catch (e) {}
+      let s = 10;
+      if (b[0] === 0x7f && b[1] === 0x45 && b[2] === 0x4c && b[3] === 0x46) s = 100;
+      else if (b[0] === 0x4d && b[1] === 0x5a) s = 95;
+      else if (/\.pyc$/i.test(p)) s = 90;
+      else if (b[0] === 0xca && b[1] === 0xfe && b[2] === 0xba && b[3] === 0xbe) s = 85;
+      else if (!/\.[a-z0-9]{1,4}$/i.test(p)) s = 60;
+      else if (/\.bin$/i.test(p)) s = 40;
+      // 同分时小文件优先（主程序通常比数据小）
+      return s * 100000 - Math.min(fs.statSync(p).size, 99999);
+    };
+    files.sort((a, b) => score(b) - score(a));
+    return { success: true, dir, files };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
 // IPC: Burp MCP 调用
 ipcMain.handle('burp-mcp-call', async (event, toolName, args) => {
   try {
@@ -2624,6 +2944,18 @@ ipcMain.handle('test-mcp-connection', async (event, type) => {
           transport: burpMcpState.transport,
           message: 'Burp MCP 连接成功（' + burpMcpState.transport + ' 传输）'
         };
+      case 'ctf2': {
+        // 公网 Streamable HTTP + Bearer Token：initialize + whoami 探活 + tools/list
+        const probe = await ctf2Probe();
+        let tools = [];
+        try { tools = await ctf2ListTools(); } catch (e) { /* tools/list 失败不阻塞探活结论 */ }
+        return {
+          success: true,
+          me: probe.me,
+          tools,
+          message: 'CTF² 平台连接成功'
+        };
+      }
       default:
         return { success: false, error: 'Unknown MCP type' };
     }
@@ -2973,15 +3305,27 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
 
   const tools = getToolDefinitions();
   let conversationHistory = [...messages];
-  // 单轮工具循环上限：过小会导致"反编译→还原→求解"这类多步任务被硬截断，
-  // 模型只能返回半截前言。默认放宽到 25，可用环境变量 CTF_MAX_TOOL_ITER 覆盖。
-  const MAX_TOOL_ITERATIONS = parseInt(process.env.CTF_MAX_TOOL_ITER, 10) || 25;
+  // 单轮工具循环上限：复杂逆向题（如并行归并+反演）实测需要大量"反编译→推演→写脚本→修正"迭代，
+  // 25 次总在"写最终脚本"之前耗尽。放宽到 60，可用环境变量 CTF_MAX_TOOL_ITER 覆盖。
+  const MAX_TOOL_ITERATIONS = parseInt(process.env.CTF_MAX_TOOL_ITER, 10) || 60;
+  const SPRINT_AT = parseInt(process.env.CTF_SPRINT_AT, 10) || 50; // 冲刺触发点
   let maxIterations = MAX_TOOL_ITERATIONS;
   let lastResponse = null;
   let collectedText = '';
+  let sprintInjected = false;
 
   while (maxIterations > 0) {
     maxIterations--;
+
+    // 冲刺阶段：到达 SPRINT_AT 后注入一次强制收尾指令——停止一切新分析，落地结论/脚本。
+    // （复杂题 4 轮实测均耗尽预算于"写最终脚本之前"，靠提示词自约不够，代码强制兜底。）
+    if (!sprintInjected && maxIterations === SPRINT_AT - 1 && conversationHistory.length > 2) {
+      sprintInjected = true;
+      conversationHistory.push({
+        role: 'user',
+        content: [{ type: 'text', text: '⏱ 冲刺指令：工具预算还剩 ' + (SPRINT_AT) + ' 轮。**立即停止一切新的分析/反编译**，把你已有的全部发现落成最终脚本（run_python）并跑出结果；若脚本失败就修正后重跑。最后必须输出 [FLAG]...[/FLAG] 或 [HYPOTHESES][...][/HYPOTHESES]。' }]
+      });
+    }
 
     if (claudeAborted) {
       return {
@@ -3014,8 +3358,16 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
       collectedText += (collectedText ? '\n\n' : '') + response.text;
     }
 
-    // 如果有文本响应且没有工具调用，直接返回
+    // 如果有文本响应且没有工具调用，直接返回。
+    // ⚠️ 例外：stop_reason === 'max_tokens' 时模型只是被截断（可能正要调工具/给结论），
+    // 直接返回会把"半截思考"当最终答案（not-baby-parallelism 三轮实测：95s 后文本断在半句）。
+    // 处理：截断时注入"继续"指令再走一轮（预算内），而非终止。
     if (response.text && (!response.toolCalls || response.toolCalls.length === 0)) {
+      if (response.stopReason === 'max_tokens' && maxIterations > 1) {
+        conversationHistory.push({ role: 'assistant', content: response.content && response.content.length ? response.content : [{ type: 'text', text: response.text }] });
+        conversationHistory.push({ role: 'user', content: [{ type: 'text', text: '（输出被 max_tokens 截断。请从中断处继续：优先给出最终结论/flag，不要再展开新分析。）' }] });
+        continue;
+      }
       return {
         success: true,
         text: response.text
@@ -3275,6 +3627,18 @@ function getToolDefinitions() {
         required: ["address"]
       }
     },
+    {
+      name: "ida_get_bytes",
+      description: "读取IDA中指定地址的原始字节（hex），用于取 vtable 内容/常量表/数据段。返回每行16字节的 hex + ASCII。",
+      input_schema: {
+        type: "object",
+        properties: {
+          address: { type: "string", description: "起始地址（如 0x7D10 或 7D10）" },
+          size: { type: "string", description: "要读的字节数（默认 256，最大 65536）" }
+        },
+        required: ["address"]
+      }
+    },
     // ========== 浏览器 MCP 工具 ==========
     {
       name: "browser_search",
@@ -3486,6 +3850,56 @@ async function executeToolCall(toolName, input) {
 
       case 'ida_get_xrefs':
         return await callIdaMcp('xrefs_to', { addr: input.address });
+
+      case 'ida_get_bytes': {
+        // 真实 ida-pro-mcp 的 get_bytes schema 实测是 { regions: [{address,size}] }；
+        // 不同实现可能是 {address,size}。两种形态都试，参数被拒（missing/invalid）则换下一种，
+        // 全失败再回退 py_exec_file 跑 IDAPython（终兜底）。
+        const addr = String(input.address || '').trim();
+        const size = Math.min(parseInt(input.size, 10) || 256, 65536);
+        const isBad = (r) => !r || /missing|required param|invalid|error|失败|Expected/i.test(String(r).slice(0, 300));
+        const addrNum = /^[0-9a-fA-Fx]+$/.test(addr) ? '0x' + addr.replace(/^0x/i, '') : addr;
+        const attempts = [
+          { regions: [{ address: addrNum, size }] },
+          { regions: [addrNum] },
+          { address: addrNum, size },
+          { address: addrNum, count: size }
+        ];
+        let lastResp = '';
+        for (const args of attempts) {
+          try {
+            const r = await callIdaMcp('get_bytes', args);
+            lastResp = String(r || '');
+            if (!isBad(lastResp)) return r;
+          } catch (e) { lastResp = e.message; }
+        }
+        // 终兜底：py_exec_file 跑 IDAPython
+        try {
+          const py = `import ida_bytes
+ea=${/^[0-9a-fA-F]+$/.test(addr.replace(/^0x/i, '')) ? '0x' + addr.replace(/^0x/i, '') : JSON.stringify(addr)}
+n=${size}
+data=ida_bytes.get_bytes(ea,n) or b''
+print('BYTES '+data.hex())
+`;
+          const tmp = path.join(app.getPath('temp'), 'ctf_get_bytes.py');
+          fs.writeFileSync(tmp, py, 'utf8');
+          const r = await callIdaMcp('py_exec_file', { path: tmp });
+          const mm = String(r || '').match(/BYTES\s+([0-9a-f]+)/i);
+          if (mm) {
+            const buf = Buffer.from(mm[1], 'hex');
+            const lines = [];
+            for (let i = 0; i < buf.length; i += 16) {
+              const seg = buf.slice(i, i + 16);
+              const ascii = [...seg].map(b => (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b) : '.').join('');
+              lines.push(('0000' + i.toString(16)).slice(-4) + '  ' + seg.toString('hex').replace(/(..)/g, '$1 ').trim() + '  ' + ascii);
+            }
+            return lines.join('\n');
+          }
+          return r;
+        } catch (e2) {
+          return 'ida_get_bytes 全部形态失败（最后错误: ' + lastResp.slice(0, 150) + '）。替代方案：用 run_python 直接解析本地 ELF 文件读该地址（文件在 ' + (state && state.currentFile) + '）';
+        }
+      }
 
       // ========== 浏览器 MCP 工具 ==========
       case 'browser_search':

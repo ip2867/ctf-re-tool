@@ -68,6 +68,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   testMcpConnection: (type) => ipcRenderer.invoke('test-mcp-connection', type),
   checkPort: (port) => ipcRenderer.invoke('check-port', port),
 
+  // CTF²（DASCTF Agent Arena）开放平台：练习题 / 附件 / 提交 flag（仅前端流水线调用，不开放给 AI）
+  ctf2McpCall: (toolName, args) => ipcRenderer.invoke('ctf2-mcp-call', toolName, args),
+  ctf2Probe: () => ipcRenderer.invoke('ctf2-probe'),
+  ctf2Tools: () => ipcRenderer.invoke('ctf2-tools'),
+  ctf2Download: (url, destDir) => ipcRenderer.invoke('ctf2-download', url, destDir),
+  ctf2CleanupTools: () => ipcRenderer.invoke('ctf2-cleanup-tools'),
+  ctf2Unzip: (zipPath) => ipcRenderer.invoke('ctf2-unzip', zipPath),
+
   // Claude API 功能
   claudeChat: (messages, systemPrompt, opts) => ipcRenderer.invoke('claude-chat', messages, systemPrompt, opts),
   testClaudeConnection: () => ipcRenderer.invoke('test-claude-connection'),

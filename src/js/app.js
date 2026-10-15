@@ -21,7 +21,9 @@ const state = {
   lastVerifyContracts: null, // 最近一次解析出的 [VERIFY] 契约（供 Hook 主动解密复用）
   currentScript: null, // 最近生成的脚本 {content,type}（聊天即预览，自动落盘）
   experience: '',      // 全局经验库（experience.md 内容，注入系统提示）
-  flowAbortRequested: false // 自动化流程（analyzeWebJS 轮询等）的中止标志
+  flowAbortRequested: false, // 自动化流程（analyzeWebJS 轮询等）的中止标志
+  platformBusy: false,  // CTF² 平台拉题流程进行中（防重入）
+  platformLoop: false   // CTF² 连续解题模式（true=平台判对后自动下一题；false=单题）
 };
 
 // 新建 findings 结构
@@ -166,6 +168,13 @@ function setupWindowStateListener() {
 async function loadConfig() {
   try {
     state.config = await window.electronAPI.getConfig();
+    // 平台批量解题跳过清单（config.platform.skipChallenges: ["time-travel", ...]）——
+    // 人工已解出/不想自动跑的题写在这里，连续模式会跳过它们。
+    const skip = state.config && state.config.platform && state.config.platform.skipChallenges;
+    if (Array.isArray(skip) && skip.length) {
+      state.platformSkipSet = new Set(skip.map(s => String(s)));
+      addLog('info', '[平台] 跳过清单: ' + skip.join(', '));
+    }
     addLog('info', '配置加载成功');
   } catch (err) {
     addLog('error', '配置加载失败: ' + err.message);
@@ -265,6 +274,8 @@ function setupEventListeners() {
   document.getElementById('btn-run-hook').addEventListener('click', runHook);
   document.getElementById('btn-generate-script').addEventListener('click', generateScript);
   document.getElementById('btn-generate-wp').addEventListener('click', generateWriteup);
+  // （v1.5.0：平台拉题按钮已移除——CTF² 自动解题流水线为内部测试功能，不随版本发布；
+  //   solveOneFromPlatform/solveOnePlatformRound 保留在代码中，可经控制台调用）
 
   // 按钮可用状态
   const actionsButtons = ['btn-auto-analyze', 'btn-deploy-frida', 'btn-run-hook', 'btn-generate-script', 'btn-generate-wp'];
@@ -277,6 +288,8 @@ function setupEventListeners() {
   document.getElementById('btn-cancel-settings').addEventListener('click', closeSettings);
   const testAiBtn = document.getElementById('btn-test-ai');
   if (testAiBtn) testAiBtn.addEventListener('click', testAiConnection);
+  const testCtf2Btn = document.getElementById('btn-test-ctf2');
+  if (testCtf2Btn) testCtf2Btn.addEventListener('click', testCtf2Connection);
 
   // MCP按钮
   document.getElementById('btn-ida-mcp').addEventListener('click', connectIdaMcp);
@@ -490,6 +503,12 @@ async function analyzeFile(filePath) {
     // 换题清空"待保存经验"：暂存区属本题 AI 输出，跨题残留会让上一题的经验
     // 在下一题被误入库/误注入（且 pendingExperience 纯内存、不持久化）。
     state.pendingExperience = [];
+    // 换题同时清 lastAiText 与平台上下文：否则上一题的 AI 结论会串进
+    // 本题的失败档案（recordFailure）/复盘（postSolveReview）/静态结论注入。
+    state.lastAiText = '';
+    state._platformChallenge = null;
+    state._platformChallengeDesc = '';
+    state._platformFiles = null;
 
     // 同步工作目录给主进程（AI 的 glob/grep 搜索根）
     try {
@@ -533,6 +552,316 @@ async function analyzeFile(filePath) {
   } catch (err) {
     addLog('error', '文件分析失败: ' + err.message);
   }
+}
+
+// ========== CTF²（DASCTF Agent Arena）平台：拉一道逆向题 → 本地解题 → 提交 flag ==========
+// 设计：平台工具只由本流水线（前端）调用，不注册进 AI 工具定义 → AI 无法自主提交/改靶机。
+// 依赖：设置页填 CTF² Token；附件下载目录默认 E:\ctf\pratice（可配置）。
+
+// 判断一道平台题是否属于"逆向"（字段名容错：category/tags/type/challenge_type 都可能）
+function ctf2IsReverse(ch) {
+  if (!ch || typeof ch !== 'object') return false;
+  const RE = /^(reverse|re|reversing|逆向)$/i;
+  const cands = [ch.category, ch.type, ch.challenge_type, ch.tag, ch.direction];
+  for (const c of cands) { if (c && RE.test(String(c).trim())) return true; }
+  const tags = ch.tags || ch.tag_list || ch.categories;
+  if (Array.isArray(tags)) { for (const t of tags) { if (t && RE.test(String(t).trim())) return true; } }
+  return false;
+}
+
+// 从平台返回里尽量取出题目数组（字段名容错）
+function ctf2ExtractList(res) {
+  if (!res) return [];
+  if (Array.isArray(res)) return res;
+  for (const k of ['challenges', 'items', 'list', 'data', 'results']) {
+    if (Array.isArray(res[k])) return res[k];
+  }
+  // 有些 MCP 返回 result.content[].text 是 JSON 字符串，unwrap 后可能是字符串
+  if (typeof res === 'string') {
+    try { const j = JSON.parse(res); return ctf2ExtractList(j); } catch (e) { return []; }
+  }
+  return [];
+}
+
+function ctf2ChallengeId(ch) {
+  return ch && (ch.id ?? ch.challenge_id ?? ch.challengeId ?? ch.uuid ?? ch.slug);
+}
+function ctf2ChallengeName(ch) {
+  return ch && (ch.name || ch.title || ch.challenge_name || ('#' + ctf2ChallengeId(ch)));
+}
+// 是否已解（字段容错）
+function ctf2IsSolved(ch) {
+  if (!ch) return false;
+  return !!(ch.solved || ch.is_solved || ch.solve_status === 'solved' || ch.status === 'solved' || ch.passed);
+}
+
+// 主流程：拉一道未解逆向题 → 下载附件 → 解题 → 提交 flag
+// 平台真实契约（2026-10-14 实测 tools/list schema）：
+//   - 列题必须带 practice_ground_id；分类字段 category，逆向的值是 "REVERSE"（大写）
+//   - 附件参数是 file_id；提交必须带 confirmation:true
+// 返回 { ok, submitted, challenge, note }；ok=false 时 note 说明原因。
+async function solveOnePlatformRound() {
+  const dlDir = (state.config && state.config.platform && state.config.platform.downloadDir) || 'E:\\ctf\\pratice';
+  try {
+    addLog('info', '========================================');
+    addLog('info', '[平台] 从 CTF² 拉取一道未解的逆向题');
+    addLog('info', '========================================');
+
+    // 0) 探活
+    const probe = await window.electronAPI.ctf2Probe();
+    if (!probe || !probe.success) {
+      addLog('error', '平台连接失败: ' + ((probe && probe.error) || '未知'));
+      addSystemMessage(`**平台连接失败**\n\n${(probe && probe.error) || '未知'}\n\n请在设置页填写 CTF² 地址与 Token（平台「凭证」页创建）。`);
+      return { ok: false, note: 'connect-failed' };
+    }
+    addLog('success', '✅ 平台连接成功（whoami 通过）');
+
+    // 1) 发现练习场（列题必须带 practice_ground_id）
+    addLog('info', '[1/6] 发现练习场...');
+    const groundsRes = await window.electronAPI.ctf2McpCall('ctf2_list_practice_grounds', { limit: 20 });
+    if (groundsRes && groundsRes.success === false) { addLog('error', '列练习场失败: ' + groundsRes.error); return { ok: false, note: 'grounds-failed' }; }
+    const groundsRaw = (groundsRes && groundsRes.result !== undefined) ? groundsRes.result : groundsRes;
+    const grounds = ctf2ExtractList(groundsRaw);
+    if (!grounds.length) { addLog('error', '未发现任何练习场'); return { ok: false, note: 'no-grounds' }; }
+    const ground = grounds.find(g => g && g.is_active !== false) || grounds[0];
+    const groundId = ground.id;
+    addLog('info', `练习场: ${ground.name || groundId}（共 ${grounds.length} 个场，本题库约 ${ground.challenge_count || '?'} 道）`);
+
+    // 2) 列逆向未解题（category=REVERSE + unsolved_only）
+    addLog('info', '[2/6] 拉取逆向未解题列表...');
+    const listRes = await window.electronAPI.ctf2McpCall('ctf2_list_practice_challenges', {
+      practice_ground_id: groundId, category: 'REVERSE', unsolved_only: true, limit: 30
+    });
+    if (listRes && listRes.success === false) { addLog('error', '拉取列表失败: ' + listRes.error); return { ok: false, note: 'list-failed' }; }
+    const raw = ctf2ParsePayload((listRes && listRes.result !== undefined) ? listRes.result : listRes);
+    const all = ctf2ExtractList(raw);
+    // 跳过清单：本地已人工解出/不想自动跑的题（state.platformSkipSet，UI 或控制台预置）
+    const skipSet = (state.platformSkipSet instanceof Set) ? state.platformSkipSet : new Set();
+    const candidates = all.filter(ch => ctf2IsReverse(ch) && !ctf2IsSolved(ch) && ch.has_attachments && !skipSet.has(String(ch.name)));
+    const skippedNote = skipSet.size ? `（已跳过 ${[...skipSet].join(', ')}）` : '';
+    addLog('info', `平台返回 ${all.length} 道逆向未解题，其中带附件 ${candidates.length} 道${skippedNote}` + (candidates.length ? `：${candidates.map(c => c.name).join(', ')}` : ''));
+    if (!candidates.length) {
+      addSystemMessage(`**无带附件的逆向未解题**\n\n练习场「${ground.name || groundId}」返回 ${all.length} 道逆向未解题，但均无附件（可能需要靶机）。当前流水线只处理带附件的题。`);
+      addLog('warning', '无带附件的逆向未解题');
+      return { ok: false, note: 'no-candidates' };
+    }
+
+    // 3) 取第一道，拿详情 + 附件清单
+    const ch = candidates[0];
+    const cid = ch.id;
+    addLog('info', `[3/6] 选定题目: ${ch.name}（难度 ${ch.difficulty || '?'}，${ch.friendly_id || cid}）`);
+    state._platformChallenge = ch;   // 供失败提示注入/复盘取题名
+    const detailRes = await window.electronAPI.ctf2McpCall('ctf2_get_practice_challenge', { challenge_id: cid, practice_ground_id: groundId });
+    if (detailRes && detailRes.success === false) { addLog('error', '取题目详情失败: ' + detailRes.error); return { ok: false, note: 'detail-failed', challenge: { id: cid, name: ch.name } }; }
+    const detail = ctf2ParsePayload((detailRes && detailRes.result !== undefined) ? detailRes.result : detailRes);
+    try { addLog('info', '[平台] 题目详情（诊断，节选）: ' + JSON.stringify(detail).slice(0, 1500)); } catch (e) {}
+    // 实测详情外面包了一层 { challenge: {...}, ... }（诊断日志证实）——解一层，并容错多层包裹
+    const cDetail = ctf2ParsePayload((detail && (detail.challenge || detail.data)) || detail);
+    await caseAddEvidence('platform_challenge', '平台题目详情', JSON.stringify(detail, null, 2), 'json');
+    // 题目描述（官方用法说明，如 "Run with pppp -n ..."）存到平台上下文，Tool-Use 提示词直接内联
+    // （此前被丢弃 → AI 每轮都在猜 -n/-i/-o 的语义，其实题面写着）
+    state._platformChallengeDesc = (cDetail && (cDetail.description || cDetail.desc)) || '';
+
+    // 附件在详情 files[] 里，结构 { id, file: { original_name, mime_type, size } }（2026-10-14 实测）
+    // file_id = files[].id（外层），文件名在 files[].file.original_name
+    const atts = (cDetail && cDetail.files) || (detail && detail.files) || (cDetail && (cDetail.attachments || cDetail.attachment)) || [];
+    const attList = (Array.isArray(atts) ? atts : [atts]).filter(Boolean);
+    if (!attList.length) {
+      addLog('warning', '该题无附件（可能是靶机型逆向题，暂不支持）');
+      addSystemMessage(`**${ch.name} 无附件**\n\n该题可能是需要靶机的类型，当前流水线只处理「带附件的逆向题」。`);
+      return { ok: false, note: 'no-attachment', challenge: { id: cid, name: ch.name } };
+    }
+
+    // 4) 取附件下载地址并下载（参数：challenge_id + file_id + practice_ground_id）
+    // 每题附件下载到独立子目录 <dlDir>/<题名>/：共享根目录会把所有题的文件混在一起，
+    // AI 的 workdir 也落在根目录 → glob/翻目录时翻到上一题的解压残留（RomanRomance 实测：
+    // AI 把上一题 ExceLLM 的 sheet 当本题逻辑，把上题 flag 当本题答案）。
+    const chDir = dlDir.replace(/[\\/]+$/, '') + '\\' + String(ch.name).replace(/[\\/:*?"<>|]/g, '_');
+    addLog('info', `[4/6] 下载附件（${attList.length} 个）到 ${chDir} ...`);
+    let localFile = null;
+    const downloaded = [];
+    for (const att of attList) {
+      const fileId = att.id ?? att.file_id;                       // 外层 id 即 file_id（实测）
+      const inner = att.file || {};                                // 内层文件元数据
+      const attName = inner.original_name || att.filename || att.name || ('file_' + fileId);
+      let urlRes;
+      try {
+        urlRes = await window.electronAPI.ctf2McpCall('ctf2_get_attachment_url', { challenge_id: cid, file_id: fileId, practice_ground_id: groundId });
+      } catch (e) { addLog('warning', `取附件地址失败(${attName}): ${e.message}`); continue; }
+      if (urlRes && urlRes.success === false) { addLog('warning', `取附件地址失败(${attName}): ${urlRes.error}`); continue; }
+      const uObj = ctf2ParsePayload((urlRes && urlRes.result !== undefined) ? urlRes.result : urlRes);
+      // URL 实测在 attachment.url（2026-10-14），其余字段名做容错
+      const url = (uObj && ((uObj.attachment && uObj.attachment.url) || uObj.url || uObj.download_url || uObj.href)) || (typeof uObj === 'string' ? uObj : '');
+      if (!url) { addLog('warning', `附件 ${attName} 未返回下载地址: ` + JSON.stringify(uObj).slice(0, 200)); continue; }
+      const dl = await window.electronAPI.ctf2Download(url, chDir);
+      if (dl && dl.success) {
+        addLog('success', `✅ 已下载: ${dl.path}（${(dl.bytes / 1024).toFixed(1)} KB）`);
+        downloaded.push(dl.path);
+        if (!localFile) localFile = dl.path;
+      } else {
+        addLog('warning', `下载失败(${attName}): ${(dl && dl.error) || '未知'}`);
+      }
+    }
+    if (!localFile) { addLog('error', '所有附件均下载失败，流程中止'); return { ok: false, note: 'download-failed', challenge: { id: cid, name: ch.name } }; }
+    // 同题伴生附件（如 enc.txt + ELF 主程序）：主文件=第一个可分析物，其余登记供 AI read_file
+    // 选择策略：文本小文件常是"密文/输入"（enc.txt），ELF/PE/pyc/zip 才是"主程序" → 主文件按类型权重挑
+    if (downloaded.length > 1) {
+      const typeWeight = (p) => {
+        const ext = String(p).toLowerCase();
+        if (/\.(zip|apk|jar|xlsx|docx|pptx)$/.test(ext)) return 5;
+        if (/\.(pyc|dex|jar)$/.test(ext)) return 5;
+        if (!/\.[a-z0-9]{1,5}$/.test(ext)) return 5;              // 无扩展名 = ELF/PE 常见
+        if (/\.(txt|enc|json|xml|log|md)$/.test(ext)) return 1;   // 文本 = 伴生密文/提示
+        return 3;
+      };
+      downloaded.sort((a, b) => typeWeight(b) - typeWeight(a));
+      localFile = downloaded[0];
+      addLog('info', `[多附件] 主文件: ${localFile.split('\\').pop()}，伴生: ${downloaded.slice(1).map(p => p.split('\\').pop()).join(', ')}`);
+      state._platformFiles = downloaded.slice();                  // 全部登记（AI 可 read_file）
+    }
+
+    // 5) 走现有逆向解题流程（analyzeFile 识别类型 → autoAnalyze 分派 → finalizeSolve 验证）
+    addLog('info', `[5/6] 交给本地逆向流程解题: ${localFile}`);
+    state._platformContext = true;   // 平台上下文：ZIP 附件自动解压取主文件（区别于手动拖 zip）
+    await analyzeFile(localFile);
+    addLog('info', '开始自动分析（现有逆向分流）...');
+    await autoAnalyze();
+
+    // 6) 收集"已验证"的 flag → 提交平台（必须带 confirmation:true）
+    addLog('info', '[6/6] 检查是否产出已验证 flag 并提交平台...');
+    const verified = ((state.findings && state.findings.flags) || []).filter(f => f.verified);
+    if (!verified.length) {
+      addLog('warning', '未产出「已验证」flag，跳过提交（未验证不提交，避免污染正确率）');
+      addSystemMessage(`**${ch.name}**：本地未得到已验证 flag，未提交。\n\n可人工复核后手动提交，或重试。`);
+      return { ok: false, note: 'no-verified-flag', challenge: { id: cid, name: ch.name, difficulty: ch.difficulty }, verified_flags: [] };
+    }
+    let submitResult = null;
+    for (const f of verified) {
+      const sub = await window.electronAPI.ctf2McpCall('ctf2_submit_flag', {
+        challenge_id: cid, practice_ground_id: groundId, flag: f.flag, confirmation: true
+      });
+      if (sub && sub.success === false) { addLog('warning', `提交请求失败: ${sub.error}`); continue; }
+      const subData = ctf2ParsePayload((sub && sub.result !== undefined) ? sub.result : sub);
+      const s = JSON.stringify(subData);
+      const ok = /correct|正确|通过|accepted|valid/i.test(s) && !/incorrect|wrong|invalid/i.test(s);
+      submitResult = { flag: f.flag, correct: ok, raw: s.slice(0, 400) };
+      addLog(ok ? 'success' : 'warning', `提交 ${f.flag} → ${s.slice(0, 200)}`);
+      addSolveNote('平台提交', `challenge=${ch.name} flag=${f.flag} result=${s.slice(0, 200)}`);
+      addSystemMessage(ok
+        ? `**🎯 题目「${ch.name}」已解出并提交成功**\n\n\`${f.flag}\``
+        : `**题目「${ch.name}」提交结果**\n\n\`${f.flag}\`\n\n平台返回: ${s.slice(0, 300)}`);
+      if (ok) break; // 一道题命中即可
+    }
+    return {
+      ok: !!(submitResult && submitResult.correct),
+      submitted: submitResult,
+      challenge: { id: cid, name: ch.name, difficulty: ch.difficulty, friendly_id: ch.friendly_id },
+      ground_id: groundId,
+      local_file: localFile,
+      verified_flags: verified.map(f => f.flag)
+    };
+  } catch (err) {
+    addLog('error', '平台拉题流程异常: ' + err.message);
+    return { ok: false, note: 'exception: ' + err.message };
+  }
+}
+
+// 循环模式：拉题 → 解题 → 提交 → （平台判对）→ 清理外部工具 → 下一题。
+// state.platformLoop 由 UI 开关置位；每轮之间检查 flowAbortRequested / platformLoop。
+// 「平台判对」是继续的必要条件：提交被判错或没解出来都会停（避免在同一难度上空转烧配额）。
+async function solveOneFromPlatform() {
+  if (state.platformBusy) { addLog('warning', '平台拉题流程进行中，请稍候'); return; }
+  state.platformBusy = true;
+  const loopMode = !!state.platformLoop;
+  try {
+    let total = 0, solved = 0;
+    do {
+      if (state.flowAbortRequested) { addLog('info', '[平台] 收到停止信号，结束循环'); break; }
+      // 每轮开始前强制清理外部工具（IDA/JEB/java）：上一题若未清（如本轮是循环首轮但用户之前
+      // 手动跑过），旧 IDA 会占住 13337，新 IDA 实例连不上 MCP → 采集打到旧题目的库上。必须先清。
+      try {
+        const cl0 = await window.electronAPI.ctf2CleanupTools();
+        if (cl0 && cl0.killed && cl0.killed.length) addLog('info', '[循环] 轮前清理外部工具: ' + cl0.killed.join(', '));
+      } catch (e) { /* 清理失败不阻塞 */ }
+      if (total > 0) {
+        addLog('info', `[循环] 等待 5 秒后开始下一题...`);
+        await new Promise(r => setTimeout(r, 5000));
+      }
+      state.flowAbortRequested = false;   // 每轮开始清零：停止信号只作用于"当前这轮的边界"
+      const r = await solveOnePlatformRound();
+      total++;
+      // 无论本题成败都清理（未解出也会走 break——清理放 break 之前）
+      try {
+        const cl = await window.electronAPI.ctf2CleanupTools();
+        addLog('info', `[循环] 题后清理外部工具进程: ${(cl && cl.killed && cl.killed.length) ? cl.killed.join(', ') : '（无运行中的）'}`);
+      } catch (e) { /* 清理失败不阻塞 */ }
+      if (r && r.ok) {
+        solved++;
+        addLog('success', `[循环] ✅ ${r.challenge.name} 已解出并提交成功（累计 ${solved}/${total}）`);
+        // 成长闭环②：曾失败过的题解出 → 自动复盘证伪（清除被证伪的污染经验，沉淀复盘教训）
+        if (state.lastAiText) {
+          try { await postSolveReview(r.challenge.name, state.lastAiText); } catch (e) { /* 复盘失败不阻塞 */ }
+        }
+      } else {
+        // 成长闭环①：失败存档（方向结论），下次拉到同题自动注入"已排除的路"。
+        // 仅当 AI 真正产出过分析（lastAiText 非空）才存档——no-attachment/download-failed
+        // 这类"结构性失败"没有方向结论可言，存档只会在复盘时误导 AI 判定。
+        const structuralFail = ['no-attachment', 'no-candidates', 'no-grounds', 'connect-failed', 'grounds-failed', 'list-failed', 'detail-failed', 'download-failed'].includes((r && r.note) || '');
+        if (!structuralFail && state.lastAiText) {
+          try {
+            await recordFailure(r && r.challenge ? r.challenge.name : (state.fileInfo && state.fileInfo.fileName), state.lastAiText, (r && r.note) || '');
+          } catch (e) { /* 存档失败不阻塞 */ }
+        }
+        addLog('warning', `[循环] 本题未解出（${(r && r.note) || 'unknown'}），循环模式在此停止`);
+        if (loopMode) addSystemMessage('**循环停止**\n\n本题未解出（提交判错或未得到已验证 flag）。连续模式只在"平台判对"后继续，避免卡在同一题空转。\n\n本题的失败方向已存档——下次再拉到它会自动注入"已排除的路"，并可发「复盘」对照官方题解证伪。');
+        break;
+      }
+    } while (loopMode);
+    if (loopMode) {
+      addLog('info', `[循环] 结束：共尝试 ${total} 题，解出 ${solved} 题`);
+      addSystemMessage(`**循环解题结束**\n\n尝试 ${total} 题，解出 ${solved} 题。`);
+    }
+  } finally {
+    state.platformBusy = false;
+  }
+}
+
+// MCP 返回的 content[].text 常是 JSON 字符串 → 先解一层
+function ctf2ParsePayload(x) {
+  if (typeof x === 'string') { try { return JSON.parse(x); } catch (e) { return x; } }
+  return x;
+}
+
+// 平台 zip 手包处理：解压（主进程）→ 按"可分析物优先"挑主文件（ELF/PE/pyc/无扩展名…）
+// → analyzeFile+autoAnalyze 继续流程。渲染层无 Node 能力：解压走 ctf2Unzip IPC，
+// 文件头魔数走 readFile 读 base64？——readFile 返回 utf8 文本，二进制会坏 → 魔数判定改在主进程做。
+async function analyzeZipHandout(zipPath) {
+  addLog('info', '[zip手包] 解压: ' + zipPath);
+  const r = await window.electronAPI.ctf2Unzip(zipPath);
+  if (!r || !r.success) {
+    addLog('error', '[zip手包] 解压失败: ' + ((r && r.error) || '未知'));
+    addSystemMessage('**ZIP 解压失败**\n\n' + ((r && r.error) || '未知'));
+    return;
+  }
+  const files = r.files || [];
+  addLog('info', `[zip手包] 共 ${files.length} 个文件: ${files.map(f => String(f).split('\\').pop()).join(', ')}`);
+  if (!files.length) { addLog('warning', '[zip手包] 解压后为空'); return; }
+  // 主进程已按"可分析优先级"排好序（ctf2-unzip 返回 files[0] 即最佳候选）
+  const main = files[0];
+  addLog('success', '[zip手包] 选定主文件: ' + String(main).split('\\').pop());
+  // 同包其它文件（输入样例/数据/说明）登记到平台上下文，供提示词与 Tool-Use AI 取用
+  // 教训（not-baby-parallelism）：flag.out/input.bin 这类伴生文件被无视，AI 明确要"配套输入输出"
+  // 却拿不到 → 判成"无法静态还原"。手包里所有文件都是题目证据，必须全部交给 AI。
+  state._platformFiles = files.slice();
+  if (files.length > 1) {
+    addLog('info', '[zip手包] 同包伴生文件（已登记，AI 可 read_file）: '
+      + files.slice(1).map(f => String(f).split('\\').pop()).join(', '));
+    try {
+      await caseAddEvidence('zip_handout_files', '手包全部文件清单', files.join('\n'), 'txt');
+    } catch (e) { /* 证据失败不阻塞 */ }
+  }
+  await analyzeFile(main);
+  await autoAnalyze();
 }
 
 // 更新文件信息UI
@@ -683,8 +1012,11 @@ async function launchTool(toolName, filePath = null) {
         // 参数数组分离启动 IDA 并打开文件（防注入）；-A 自主模式：
         // 跳过 "Load a new file" 等人工对话框，按默认加载器自动建库分析。
         // 冷启动时若模态框卡住，MCP 插件的 autostart 永远不会执行（13337 起不来）。
+        // ⚠️ 曾尝试 -o<独立数据库路径>（目录与完整 .i64 两种写法都试过）→ IDA 9 弹对话框卡死、
+        // 13337 永不监听（两轮实测）。结论：**不要用 -o**，同目录建库；数据库文件污染问题由
+        // ctf2-unzip 的"幂等解压 + .til/.id0/... 过滤"兜底（已验证有效）。
         result = await window.electronAPI.runToolArgs([idaPath, '-A', fileToOpen], { gui: true });
-        addLog('info', `IDA打开文件: ${fileToOpen}（-A 自主模式，跳过加载对话框）`);
+        addLog('info', `IDA打开文件: ${fileToOpen}（-A 自主模式）`);
       } else {
         result = await window.electronAPI.runToolArgs([idaPath, '-A'], { gui: true });
       }
@@ -1078,6 +1410,14 @@ async function processUserMessage(message) {
   // 「保存」：把暂存的解题经验写入经验库（自动入库已改为手动触发）
   if (/^(保存|保存经验|入库)$/.test(message.trim())) {
     await flushPendingExperience();
+    return;
+  }
+
+  // 「复盘」：对当前题的历史失败做证伪复盘（清除被证伪的污染经验 + 沉淀复盘教训）
+  if (/^复盘$/.test(message.trim())) {
+    const name = (state._platformChallenge && state._platformChallenge.name) || (state.fileInfo && state.fileInfo.fileName);
+    if (!name) { addSystemMessage('**当前没有题目上下文**\n\n请先通过平台拉题或选择文件，再发「复盘」。'); return; }
+    await postSolveReview(name, state.lastAiText || '');
     return;
   }
 
@@ -1721,8 +2061,25 @@ async function autoAnalyze() {
       await analyzeWebJS();
       break;
     case 'ZIP':
-      addSystemMessage('**ZIP 压缩包**\n\n不是 APK（未找到 AndroidManifest.xml）。\n建议：`kali binwalk -e 文件名` 提取内容，或检查是否嵌套题目文件。');
+    case 'XLSX': {
+      // 平台附件常是 zip 手包（内含 ELF/EXE/pyc 等）。自动解压 → 挑可分析的主文件继续流程；
+      // 非"平台拉题"上下文（手动拖 zip）仍走原提示。
+      // XLSX/OOXML（ExceLLM 类 Excel 逆向题）本质是 ZIP 容器，同路径解压看内部结构。
+      if (state._platformContext) {
+        await analyzeZipHandout(state.currentFile);
+      } else {
+        addSystemMessage('**ZIP 压缩包**\n\n不是 APK（未找到 AndroidManifest.xml）。\n建议：`kali binwalk -e 文件名` 提取内容，或检查是否嵌套题目文件。');
+      }
       break;
+    }
+    case 'XML':
+    case 'TXT': {
+      // 结构化文本（OOXML 解压产物：sheet 公式 / sharedStrings / plist 等）与纯文本
+      // （enc.txt 密文等）：直读全文喂 AI 文本分析——绝不进 Kali 固件流程
+      //（ExceLLM/enc.txt 实测：UNKNOWN 落 Kali，3 次握手超时白烧 60s，而信息就在文本里）。
+      await analyzeXMLText();
+      break;
+    }
     case 'BIN':
     case 'UNKNOWN':
       // 尝试用Kali分析（固件/bin文件）
@@ -1731,6 +2088,117 @@ async function autoAnalyze() {
     default:
       addLog('warning', '不支持的文件类型，尝试用Kali分析...');
       await analyzeBIN();
+  }
+}
+
+// 结构化文本（XML/JSON/plist）分析：读全文（≤256KB 截断）→ 证据 → AI 文本求解闭环。
+// Excel 公式题（ExceLLM）、Android manifest、macOS plist 等都靠这条路。
+// 注意：不进 analyzeWebJS（那是 Burp/浏览器抓包流程）；直接复用 autoSolveBinaryFlag 的
+// "AI 提示 → claudeChatCascade → finalizeSolve 三件套"骨架，但数据源是文件原文而非 IDA。
+async function analyzeXMLText() {
+  const label = (state.fileInfo && state.fileInfo.fileName) || 'structured.xml';
+  addSolveNote('文件', `开始分析结构化文本：${label}`);
+  addLog('info', 'XML/结构化文本分析流程（直读内容，不走 Kali/IDA）');
+  addLog('info', '========================================');
+
+  // [1/2] 读全文进证据（≤256KB 截断；表格类 XML 公式常达百 KB）
+  let xmlText = '';
+  try {
+    const rf = await window.electronAPI.readFile(state.currentFile);
+    if (rf && rf.success) {
+      xmlText = rf.content || '';
+      await caseAddEvidence('xml_source', 'XML/结构化文本原文', xmlText.length > 262144 ? xmlText.slice(0, 262144) + '\n...(truncated)' : xmlText, 'xml');
+      addLog('success', `✅ XML 原文已读入并存证（${xmlText.length} 字符${xmlText.length > 262144 ? '，超 256KB 已截断' : ''}）`);
+    } else {
+      addLog('warning', 'XML 读取失败: ' + ((rf && rf.error) || '未知'));
+    }
+  } catch (e) {
+    addLog('warning', 'XML 读取异常: ' + e.message);
+  }
+
+  // 伴生文件（同包其它 XML）预览清单——AI 可用 read_file 自取
+  const sideFiles = (Array.isArray(state._platformFiles) ? state._platformFiles : [])
+    .filter(p => String(p) !== String(state.currentFile));
+  const sideNote = sideFiles.length
+    ? `\n\n## 同包伴生文件（可用 read_file 工具读取）\n${sideFiles.map(p => `- ${p}`).join('\n')}`
+    : '';
+
+  // [2/2] AI 求解（直接分析 XML 文本；Excel 公式题的公式就是"代码"）
+  addLog('info', '[2/2] AI 分析 XML 内容并求解...');
+  const xmlSlice = xmlText.length > 200000 ? xmlText.slice(0, 200000) + '\n...(truncated)' : xmlText;
+  const knowledge = await prefetchKnowledge(xmlText.slice(0, 30000), 'XML');
+
+  const analysisPrompt = `我正在分析一个CTF题目，载体是结构化文本（XML/JSON/plist，可能来自 Excel/OOXML 解压）。
+
+文件路径：${state.currentFile}
+
+## 文件全文
+\`\`\`xml
+${xmlSlice || '（读取失败，请用 read_file 工具自行读取）'}
+\`\`\`${sideNote}
+${knowledge}
+
+⚠️ 题目边界（重要）：只分析**当前文件与上面列出的伴生文件**。下载目录里可能有其它题目的历史
+残留文件（目录名是别的题名），那些与本题无关——绝不读取、更不要把它们的内容当本题答案。
+经验库的相似经验只作方法参考，本题的结论必须来自本题文件。
+
+请分析上面的内容，找出：
+1. 该文件的用途与题目机制（如 Excel 公式实现的校验器/神经网络：SUMPRODUCT 加权求和、MAX(0,...)=ReLU、--(...)=布尔转整数、sheet 间的引用链）
+2. flag 的生成或验证逻辑（公式中的常量表/权重表/约束条件如何反推输入）
+3. 直接给出 flag
+
+方法指引：
+- Excel 公式题把 SUMPRODUCT(BITS!..., WEIGHTS!...) 看作矩阵乘法，阈值比较看作激活函数；
+- 主文件常常只是校验器的一部分（如 VERIFY sheet），**BITS（输入位展开）/WEIGHTS（权重常量）在伴生文件里**：
+  用 read_file 工具读取伴生文件（同包 sheet XML 均在），把权重表和 BITS 公式看全后再反推；
+- 数据齐了用 bash 工具写 Python 复现前向计算，从约束（如"27 个神经元全为 1"）反推每位输入的 ASCII。
+- 若当前文件是**密文/编码文本**（enc.txt 等）：优先做单字节 XOR / 移位 / 换表等轻量变换枚举，
+  用 bash 跑 Python 暴力扫描并匹配常见 flag 前缀（flag|ctf|sun|dice|sunshine...）；不要急着复杂化。
+
+**输出契约（必须遵守）：**
+1. 得到 flag 时：单独一行 \`[FLAG]flag内容[/FLAG]\`
+2. 若能给出算法+密钥+密文，必须附验证数据（工具会本地复现）：
+   \`${VERIFY_CONTRACT}\`
+   （custom 需附 "code":"def decrypt(data,key): ...完整函数"；多个候选时输出 \`[HYPOTHESES][{...},{...}][/HYPOTHESES]\` 供本地枚举）
+
+如果无法可靠得到完整 flag，不要只回复"无法分析"，必须输出：
+## 题目掌握度
+- 已确认的关键点：
+- 当前推断及置信度：高/中/低
+- 仍缺少的信息：
+## 人工引导
+- 需要用户补充哪些文件/数据：`;
+
+  addLog('info', '分析提示构建完成，长度: ' + analysisPrompt.length + ' 字符');
+
+  state.aiBusy = true;
+  beginStreamMessage();
+  const startTime = Date.now();
+  try {
+    // 不带"不要调用任何工具"措辞 → claudeChatWithTools 走 Tool-Use 路径，
+    // AI 可 read_file 读伴生 sheet / bash 跑 Python 反推（ExceLLM 类多 sheet 题必需）。
+    const result = await claudeChatCascade(
+      [{ role: 'user', content: analysisPrompt }],
+      `你是CTF逆向解题专家。可以调用工具：read_file 读取题目伴生文件，bash 执行 Python 复现计算。拿到完整数据后再给结论。\n解题学习闭环（强制）：回答最后必须输出 [EXPERIENCE]每条一行，格式"题型特征→关键套路/踩过的坑→下次怎么做"，最多5条、每条200字内[/EXPERIENCE]（确无新收获则写"无新增经验"），工具会自动写入经验库，下次同类题优先复用、避免重复踩坑。` + experienceSection()
+    );
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    addLog('info', `AI响应完成，耗时 ${elapsed} 秒`);
+    endStreamMessage();
+    if (result.success && result.text) {
+      const clean = String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000);
+      addSolveNote('求解结果', clean);
+      state.lastAiText = result.text;
+      await finalizeSolve(result.text, { source: 'ai' });
+      addSystemMessage(`**🎯 XML 分析结果**\n\n**文件**: ${label}\n\n${result.text}`);
+    } else {
+      addLog('warning', 'AI 分析未返回有效结果: ' + ((result && result.error) || '未知'));
+      endStreamMessage();
+    }
+  } catch (e) {
+    endStreamMessage();
+    addLog('error', 'XML AI 分析异常: ' + e.message);
+  } finally {
+    state.aiBusy = false;
   }
 }
 
@@ -4242,6 +4710,11 @@ function openSettings() {
     set('setting-mcp-burp', mcp.burp);
     set('setting-burp', state.config.tools.burp);
 
+    // CTF² 平台
+    set('setting-ctf2-url', mcp.ctf2);
+    set('setting-ctf2-token', mcp.ctf2Token);
+    set('setting-ctf2-dir', (state.config.platform && state.config.platform.downloadDir) || '');
+
     const kali = state.config.kali || {};
     set('setting-kali-vmx', kali.vmxPath);
     set('setting-kali-host', kali.sshHost);
@@ -6370,26 +6843,82 @@ async function toolUseDeepSolveBinary(analysisData, fileType) {
   const fnSummary = analysisData.functions
     ? (typeof analysisData.functions === 'string' ? analysisData.functions : JSON.stringify(analysisData.functions)).slice(0, 4000)
     : '（未获取）';
+  // 平台手包伴生文件（flag.out/input.bin/README 等）：AI 的 run_python/bash 可直接用绝对路径访问。
+  // 多文件题优化（not-baby-parallelism 四轮实测）：文本类伴生文件**内容直接内联**进提示词，
+  // 省掉 AI 每轮"重新发现+read_file+凭记忆复述"的重复劳动（此前同一文件被推演 5 遍）。
+  const sideFiles = (Array.isArray(state._platformFiles) ? state._platformFiles : [])
+    .filter(p => String(p) !== String(state.currentFile));
+  const TEXT_EXT = /\.(txt|out|md|json|log|csv|py|c|cpp|h|js|html|xml|yaml|yml|ini|cfg)$/i;
+  let sideFilesBlock = '';
+  if (sideFiles.length) {
+    const parts = [];
+    const inlined = [];
+    for (const p of sideFiles) {
+      let inlinedThis = false;
+      try {
+        const st = await window.electronAPI.getFileInfo(p).catch(() => null);
+        const sz = st && st.success ? st.size : 0;
+        if (sz <= 8192 && (TEXT_EXT.test(p) || sz === 0)) {
+          const rf = await window.electronAPI.readFile(p);
+          if (rf && rf.success) {
+            parts.push(`### ${p}（内容已内联）\n\`\`\`\n${String(rf.content).slice(0, 6000)}\n\`\`\``);
+            inlined.push(p.split('\\').pop());
+            inlinedThis = true;
+          }
+        }
+      } catch (e) { /* 读失败按未内联处理 */ }
+      if (!inlinedThis) parts.push(`- ${p}（二进制/大文件，用 read_file 或 run_python 处理）`);
+    }
+    sideFilesBlock = `\n## 同包伴生文件（${sideFiles.length} 个${inlined.length ? `，其中 ${inlined.length} 个已内联全文` : ''}）\n${parts.join('\n')}\n⚠️ 输入样例/输出样例/说明文档往往就是解题钥匙——上面对象已给出，**不要凭记忆推演，直接用**。\n`;
+  }
+  // 平台题目描述（含官方用法说明，如 "Run with pppp -n ..."）：此前被丢弃，AI 每轮都在猜参数语义
+  const platDesc = state._platformChallengeDesc
+    ? `\n## 题目描述（平台官方，含运行用法）\n${String(state._platformChallengeDesc).slice(0, 2000)}\n`
+    : '';
+  // 成长闭环③：本题历史失败档案注入——已排除的路先摆出来，AI 优先换路而非重蹈覆辙
+  const failHint = state._platformChallenge ? await failureHintSection(state._platformChallenge.name) : '';
   const prompt = `我在解一道 CTF ${fileType || '二进制'} 题，静态固定清单分析未得出 flag。请**使用工具**自主深入分析并求出 flag。
-
+${platDesc}${failHint}
 文件路径：${state.currentFile}
-
 ## 已获取的函数列表（节选）
 ${fnSummary}
 ${analysisData.mainCode ? `\n## 入口函数反编译\n\`\`\`c\n${String(analysisData.mainCode).slice(0, 4000)}\n\`\`\`` : ''}
 ${analysisData.otherFunctions && analysisData.otherFunctions.length ? `\n## 已反编译的其它函数\n${analysisData.otherFunctions.map(f => `### ${f.name}\n\`\`\`c\n${String(f.code).slice(0, 3000)}\n\`\`\``).join('\n\n')}` : ''}
 ${analysisData.strings ? `\n## 关键字符串\n${typeof analysisData.strings === 'string' ? analysisData.strings.slice(0, 2000) : JSON.stringify(analysisData.strings).slice(0, 2000)}` : ''}
+${sideFilesBlock}
 
 ## 你必须严格按 4 阶段推进（每阶段先出证据）
 ① **收集（代码+数据缺一不可）**：用 \`ida_decompile\` 反编译入口与关键函数；**务必**用
-   \`ida_list_globals\` + \`ida_get_bytes\` 取出被引用的**常量表**（密钥/密文/S盒/VM字节码都在 .data/.rodata）；
+   \`ida_get_bytes\`（读任意地址原始字节，hex+ASCII）+ \`ida_list_globals\` 取出被引用的**常量表/vtable 内容**
+   （密钥/密文/S盒/VM字节码/函数指针表都在 .data/.rodata）；
    用 \`ida_find_strings\` 搜 flag/key/密文特征串。⚠️ **只给代码不给常量表 = 无解**。
    （IDA MCP 未连接时，用 run_python 配 capstone/pefile 手工解析。）
+   📄 **伴生文本文件（.txt/.out/README 等）直接用 \`read_file\` 读全文**——不要凭部分信息反复猜测其内容
+   （实测教训：flag.out 的 51 个数字被 AI 凭记忆推演了 3 遍，全是重复劳动）。
 ② **定位算法**：认出算法特征（TEA 魔数 0x9E3779B9 / RC4 双 S 盒 / AES S 盒 / XOR 流 / 自定义 VM/查表），
    写清算法名 + 关键地址 + 输入输出形态。
 ③ **写脚本本地验证**：用 run_python 实现还原，正反双向验证（反推 key 后正向加密对回目标常量）；
    需要约束/符号执行/模拟执行时用 Z3 / angr / Unicorn。
+③' **运行型题目路径（重要！）**：若程序**没有**静态校验逻辑，而是"输入→处理→输出"的工具型程序
+   （判断特征：getopt 命令行参数 / ifstream+ofstream / 线程池 / 计时输出；题目描述给出运行用法），
+   先做 **10 秒分诊**（决定走哪条路，判错方向全盘皆输）：
+   **伴生 .out/.txt 若全是纯数字 → 测两问**：① 首值是否可打印 ASCII（如 chr(100)='d'）？
+   ② 反编译中变换循环是否从下标 1 开始（即**元素 0 永不被更新**）？
+   **两问都中 = 数据变换型**：flag 就是程序当时的输入，被确定性变换写进输出文件——
+   **不要运行程序，直接反演输出**：利用已知明文（dice{/flag{/ctf{ 前缀 + 元素0 不变）推出算子
+   （逐位测 xor/add(减)/mul(整除) 哪个能出可打印字符），算子洗牌顺序不用预测 glibc rand——
+   3!=6 种排列暴力 + "全元素可打印 ASCII"约束即可锁定；按程序循环结构逆向走一遍，chr 拼接出 flag。
+   ⚠️ 多线程/semaphore/std::thread 只是**执行机制**，别烧预算逆向 _State_impl vtable/嵌套 invoke 链
+   ——变换语义从"调用 sem_wait 的 lambda 函数体"找，或干脆用已知明文绕过。
+   **分诊不中（输出与 flag 无字符关联）= 真运行型**：flag 在运行行为里（特定输入的输出/种子复现随机序列），
+   才走 WSL（\`wsl --status\` 检测）/Unicorn/qiling 运行路线。
 ④ **结论**：有把握才给 flag；证据不足就写明"待人工验证 + 还缺什么"，不要猜。
+
+⏱ **预算纪律（必读）**：本轮你共有约 **60 次工具调用**（充足，但别挥霍）。
+- 收集阶段（反编译/读伴生文件/常量）：目标 **15 次内**完成。
+- 第 **16 次起：进入执行**——写还原/模拟/反演脚本（run_python），**用实验代替继续读代码**；
+  脚本报错就修脚本再跑（这算执行，不算收集）。
+- 第 **55 次起（冲刺）**：无论状态如何，停止一切新分析，把已有发现落地为最终脚本或结论。
 
 **输出契约：**
 1. flag：单独一行 \`[FLAG]flag内容[/FLAG]\`
@@ -7081,6 +7610,12 @@ FLAG_RE = re.compile(rb"(?:nctf|flag|ctf|nssctf|sctf|dasctf|hgame|iscc|sictf|moe
 def printable(b):
     try:
         t = b.decode("utf-8")
+        # 协议封装明文常带控制字符头尾（如 \x03\x11+len 用户名）：只剥首尾控制符，
+        # 主体可打印即返回可读文本——否则整段回退 hex，flag 就被埋进 hex 里没人认得。
+        CTRL = bytes(range(0, 9)) + bytes(range(11, 13)) + bytes(range(14, 32))
+        core = t.strip(CTRL.decode("latin-1"))
+        if core and all(ch.isprintable() or ch in "\\r\\n\\t" for ch in core):
+            return core
         if all(ch.isprintable() or ch in "\\r\\n\\t" for ch in t):
             return t
     except Exception:
@@ -7253,15 +7788,49 @@ def run_one(i, a):
                 if algo == "custom":
                     ns = {}
                     exec(a["code"], ns)
-                    # 契约语义歧义兜底：AI 写的 decrypt(data,key) 通常期望"原始字符串"
-                    # （自己在函数内 base64.b64decode），而工具曾按已解码 bytes 传入 ->
-                    # 双重解码/str.encode 报错。这里先传原始字符串，失败再回退 bytes。
+                    fn = ns.get("decrypt") or ns.get("custom_decrypt") or ns.get("solve") or ns.get("decrypt_flag")
+                    if fn is None:
+                        raise RuntimeError("code 未定义 decrypt 函数（找过 decrypt/custom_decrypt/solve/decrypt_flag）")
+                    # 调用形态自适应（AI 写法五花八门，参数个数不一致是本地复现失败的头号原因）：
+                    #   ①decrypt(target) 单参（数据变换/置换类题的标准写法）
+                    #   ②decrypt(ct_bytes, key_bytes) 二参 bytes
+                    #   ③decrypt(raw_ct_str, raw_key_str) 二参原文（函数内部自己 base64/hex 解码）
+                    #   ④decrypt(ct_bytes, key=keyspec) 关键字参
+                    # 全部失败才报错；用 inspect 判形参个数优先尝试最可能形态，减少无效异常噪音。
                     raw_ct = a.get("ciphertext", "")
                     raw_key = "" if keyspec is None else str(keyspec)
+                    import inspect as _inspect
                     try:
-                        out = ns["decrypt"](raw_ct, raw_key)
+                        arity = len(_inspect.signature(fn).parameters)
                     except Exception:
-                        out = ns["decrypt"](ct, k)
+                        arity = None
+                    order = []
+                    if arity == 1:
+                        order = [("raw", raw_ct, None), ("bytes", ct, None)]
+                    else:
+                        order = [
+                            ("raw2", raw_ct, raw_key),
+                            ("bytes2", ct, k),
+                            ("raw1", raw_ct, None),
+                            ("bytes1", ct, None),
+                            ("kw", ct, keyspec),
+                        ]
+                    out = None
+                    last_err = None
+                    for tag, d1, d2 in order:
+                        try:
+                            if d2 is None:
+                                out = fn(d1)
+                            elif tag == "kw":
+                                out = fn(d1, key=d2)
+                            else:
+                                out = fn(d1, d2)
+                            break
+                        except TypeError as e:
+                            last_err = e
+                            continue
+                    if out is None and last_err is not None:
+                        raise last_err
                 elif algo == "xor":
                     out = dec_xor(ct, k)
                 elif algo == "rc4":
@@ -7311,9 +7880,22 @@ def run_one(i, a):
             pt = printable(out)
             outs.append((ke, pt))
             m = FLAG_RE.search(out)
-            hit = (exp and exp in pt.lower()) or bool(m) or _pt_score(out) >= 4
+            # expected 匹配分级（AI 常把 expected 截断成 flag 前缀，如只给 "dice{P4ra..."）：
+            #   完全相等 / 解密结果包含 expected / expected 包含解密结果（AI 截断了明文一侧）
+            # → 都算命中；命中值优先取 FLAG_RE 完整匹配，其次取解密结果全文（完整 flag 比截断前缀有价值）。
+            exp_hit = False
+            if exp:
+                ptl = pt.lower()
+                if exp in ptl or (ptl and ptl in exp):
+                    exp_hit = True
+            hit = exp_hit or bool(m) or _pt_score(out) >= 4
             if hit:
-                fl = m.group(0).decode("utf-8", "ignore") if m else exp
+                if m:
+                    fl = m.group(0).decode("utf-8", "ignore")
+                elif exp_hit and len(pt) >= len(exp):
+                    fl = pt.strip()
+                else:
+                    fl = exp
                 # 去重：同一 attempt 内多个 key 候选常解出**同一个** flag（如 key "199" 的
                 # ascii/int 两个候选），只打印一次，避免下游把重复 [HIT] 当多个候选。
                 if fl not in _hit_seen:
@@ -7602,6 +8184,146 @@ async function verifyAndRecord(aiText, opts = {}) {
 // 于是反复出现"某条路径只验证不收割经验""某条路径压根没接"（v1.3.11/v1.3.12 两轮补漏）。
 // 现固定为单一入口 —— 新增任何求解流程只调本函数即可，杜绝再漏（见 SSOT §9）。
 // 返回 { vr, flags, verifiedFlags }，供调用方拼结果消息。
+// ========== 解题成长闭环：失败计数 → 复盘证伪 → 经验自净 ==========
+// 目标（用户要求）：不是"人工喂知识"，而是工具根据每次解题自己成长——
+//   ① 同题反复失败 → 记录每次的"方向结论"，下次自动带着"已排除的路"重试；
+//   ② 解出后复盘 → 对比失败结论与成功路径，**证伪并删除污染经验**（经验库只增不删会让错误经验永远毒害未来题）。
+
+// 失败档案：{ challengeKey: [{ts, note, source}] }，持久化到 userData/failures.json
+function failureLogPath() {
+  return (state.appPaths && state.appPaths.userData ? state.appPaths.userData : '') + '/failures.json';
+}
+function loadFailureLog() {
+  if (state._failureLog) return state._failureLog;
+  try {
+    const p = failureLogPath();
+    if (p && window.electronAPI.readFileSync) { /* 渲染层无同步读，走异步入口 */ }
+  } catch (e) {}
+  state._failureLog = state._failureLog || {};
+  return state._failureLog;
+}
+async function loadFailureLogAsync() {
+  if (state._failureLog) return state._failureLog;
+  try {
+    const rf = await window.electronAPI.readFile(failureLogPath());
+    if (rf && rf.success) state._failureLog = JSON.parse(rf.content || '{}');
+    else state._failureLog = {};
+  } catch (e) { state._failureLog = {}; }
+  return state._failureLog;
+}
+async function saveFailureLog() {
+  try {
+    await window.electronAPI.writeFile(failureLogPath(), JSON.stringify(state._failureLog || {}, null, 2));
+  } catch (e) { /* 落盘失败不阻塞 */ }
+}
+function challengeKeyOf(name) {
+  return String(name || state.fileInfo && state.fileInfo.fileName || 'unknown').toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]+/g, '_').slice(0, 60);
+}
+
+// 失败时记录：本题这轮的"方向结论"（从 AI 文本提炼首条掌握度/推断，限 200 字）
+async function recordFailure(challengeName, aiText, note) {
+  const log = await loadFailureLogAsync();
+  const key = challengeKeyOf(challengeName);
+  log[key] = log[key] || [];
+  // 提炼本轮"走了哪条路"：优先取「当前推断」段，退而取首 200 字
+  let dir = '';
+  const m = String(aiText || '').match(/当前推断及置信度[:：]?\s*([\s\S]{0,200})/);
+  if (m) dir = m[1].replace(/\s+/g, ' ').trim();
+  else dir = String(aiText || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  log[key].push({ ts: new Date().toISOString(), dir: dir || note || '（无结论）', note: note || '' });
+  if (log[key].length > 6) log[key] = log[key].slice(-6);   // 每题最多留 6 条失败记录
+  state._failureLog = log;
+  await saveFailureLog();
+  const n = log[key].length;
+  addLog('warning', `[成长] ${challengeName} 第 ${n} 次未解出，方向已存档${n >= 2 ? '（下次自动注入已排除的路）' : ''}`);
+  return n;
+}
+
+// 解出后复盘：对比本题的失败记录与成功路径，让 AI 证伪旧结论 → 删除被证伪的经验条目
+async function postSolveReview(challengeName, successText) {
+  const log = await loadFailureLogAsync();
+  const key = challengeKeyOf(challengeName);
+  const fails = log[key] || [];
+  if (!fails.length) return 0;   // 一次就解出 → 无失败可复盘
+  addLog('info', `[成长] ${challengeName} 曾失败 ${fails.length} 次，开始复盘：对比失败方向与成功路径…`);
+  const failLines = fails.map((f, i) => `${i + 1}. [${f.ts.slice(0, 10)}] ${f.dir}`).join('\n');
+  const reviewPrompt = `我在解 CTF 题「${challengeName}」时经历了 ${fails.length} 次失败后最终解出。
+
+## 每次失败时的方向结论（已存档）
+${failLines}
+
+## 最终成功路径
+${String(successText || '').replace(/\s+/g, ' ').slice(0, 2500)}
+
+## 复盘任务（只做证伪，不写新经验）
+对照成功路径，逐条判断上面的失败结论：
+- 哪条是**方向性错误**（不只是信息不足，而是方法/认知本身错了，例如把数据格式读错、猜错算法结构）？
+- 这些错误结论是否可能已作为"经验"沉淀进经验库，毒害未来的同类题？
+
+**输出契约（务必遵守）：**
+1. 逐条判定：结论 N = 方向错误 / 仅信息不足
+2. 对"方向错误"的每条：给出一行 \`[KILL]错误经验的特征文字（尽量取经验库里可能存在的原句片段，10~40字）[/KILL]\`
+3. 最后 \`[LESSON]一句话：下次遇到同类题，第一步应该做什么（≤120字）[/LESSON]\`
+不要展开新分析。`;
+
+  try {
+    state.aiBusy = true;
+    const result = await window.electronAPI.claudeChat(
+      [{ role: 'user', content: reviewPrompt }],
+      '你是CTF逆向复盘专家。只做失败证伪，输出严格按契约。不要调用任何工具。'
+    );
+    if (!result || !result.success || !result.text) { addLog('warning', '[成长] 复盘 AI 未返回内容'); return 0; }
+    // 1) 提取 [LESSON] → 入经验库（这是"从失败中长出来"的真经验）
+    const lesson = (result.text.match(/\[LESSON\]([\s\S]*?)\[\/LESSON\]/i) || [])[1];
+    if (lesson && lesson.trim()) {
+      const line = `- [${new Date().toISOString().slice(0, 10)}] 复盘「${challengeName}」▶ ${lesson.trim().replace(/\s+/g, ' ').slice(0, 300)}`;
+      await writeExperienceEntries([line]);
+    }
+    // 2) 提取 [KILL] → 从 experience.md 删除匹配的污染条目
+    const kills = [...result.text.matchAll(/\[KILL\]([\s\S]*?)\[\/KILL\]/gi)].map(m => experienceKey(m[1].trim()));
+    let killed = 0;
+    if (kills.length) {
+      const expPath = `${state.appPaths.userData}/experience.md`;
+      const rf = await window.electronAPI.readFile(expPath);
+      if (rf && rf.success) {
+        const kept = [];
+        for (const l of String(rf.content).split('\n')) {
+          if (!l.trim().startsWith('- [')) { kept.push(l); continue; }
+          const k = experienceKey(l);
+          if (kills.some(kk => kk && (k === kk || experienceSimilar(k, kk)))) { killed++; continue; }  // 证伪 → 移除
+          kept.push(l);
+        }
+        if (killed) {
+          await window.electronAPI.writeFile(expPath, kept.join('\n'));
+          state.experience = kept.join('\n');
+        }
+      }
+    }
+    // 3) 清掉本题失败档案（已复盘完毕）
+    delete log[key];
+    state._failureLog = log;
+    await saveFailureLog();
+    addLog('success', `[成长] 复盘完成：判定方向性错误 ${kills.length} 项，清除污染经验 ${killed} 条${lesson ? '，新增复盘教训 1 条' : ''}`);
+    addSystemMessage(`**🧬 复盘完成（${challengeName}）**\n\n失败 ${fails.length} 次的方向已逐一证伪：清除污染经验 **${killed} 条**，沉淀复盘教训 1 条。\n\n> ${lesson ? lesson.trim().slice(0, 200) : '（无）'}\n\n经验库已自净——同类题下次不会再被错误结论误导。`);
+    return killed;
+  } catch (e) {
+    addLog('warning', '[成长] 复盘异常: ' + e.message);
+    return 0;
+  } finally {
+    state.aiBusy = false;
+  }
+}
+
+// 失败注入：拉题前查本题失败档案，≥1 次失败就把"已排除的路"注入提示词（让 AI 换路而非重蹈）
+async function failureHintSection(challengeName) {
+  const log = await loadFailureLogAsync();
+  const key = challengeKeyOf(challengeName);
+  const fails = log[key] || [];
+  if (!fails.length) return '';
+  const lines = fails.map((f, i) => `${i + 1}. [第${i + 1}次尝试] ${f.dir}`).join('\n');
+  return `\n\n## ⚠️ 本题历史失败记录（${fails.length} 次，**这些路已走过且未解出**）\n${lines}\n**请优先换一条与上述不同的路线**；若必须重走其中一条，先说明这次与上次的本质差异。\n（另：可主动搜索该题的公开题解（题名+赛事名）对照正解方向——站在题解肩上比盲目重试高效。）\n`;
+}
+
 async function finalizeSolve(aiText, opts = {}) {
   const { vr, flags, verifiedFlags } = await verifyAndRecord(aiText, opts);
   await harvestExperience(aiText, { autoSave: verifiedFlags.length > 0 });
@@ -8962,6 +9684,30 @@ async function testAiConnection() {
   }
 }
 
+// 测试 CTF² 平台连接：先保存设置（拿到地址/Token），再 whoami 探活 + 列工具
+async function testCtf2Connection() {
+  const btn = document.getElementById('btn-test-ctf2');
+  if (btn) btn.disabled = true;
+  addLog('info', '正在测试 CTF² 平台连接...');
+  try {
+    await saveSettings({ keepOpen: true });
+    const probe = await window.electronAPI.ctf2Probe();
+    if (probe && probe.success) {
+      addLog('success', '✅ CTF² 平台连接成功');
+      let toolNames = [];
+      try { const t = await window.electronAPI.ctf2Tools(); if (t && t.success) toolNames = (t.tools || []).map(x => x.name); } catch (e) {}
+      addSystemMessage(`**CTF² 平台连接成功**\n\n账号信息：\n\`\`\`\n${JSON.stringify(probe.me, null, 2).slice(0, 800)}\n\`\`\`\n\n可用工具（${toolNames.length}）：${toolNames.join(', ') || '（未取到）'}`);
+    } else {
+      addLog('error', 'CTF² 平台连接失败: ' + ((probe && probe.error) || '未知'));
+      addSystemMessage(`**CTF² 平台连接失败**\n\n${(probe && probe.error) || '未知'}\n\n请确认：① 设置页填了 Token（平台「凭证」页创建）；② 地址为 https://ctf2.dasctf.com/api/ai/v1/mcp。`);
+    }
+  } catch (err) {
+    addLog('error', 'CTF² 平台连接测试异常: ' + err.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 // 保存设置（只合并表单存在的键，保留 emulator.nox_path、浏览器MCP 等未展示字段）
 async function saveSettings(opts = {}) {
   const keepOpen = !!(opts && opts.keepOpen);
@@ -9010,6 +9756,15 @@ async function saveSettings(opts = {}) {
   if (mcpJeb !== null) newConfig.mcp.jebMcp = mcpJeb;
   if (mcpJebScript !== null) newConfig.mcp.jebMcpScript = mcpJebScript;
   if (mcpBurp !== null) newConfig.mcp.burp = mcpBurp;
+
+  // CTF² 平台
+  const ctf2Url = val('setting-ctf2-url');
+  const ctf2Token = val('setting-ctf2-token');
+  if (ctf2Url !== null) newConfig.mcp.ctf2 = ctf2Url;
+  if (ctf2Token !== null) newConfig.mcp.ctf2Token = ctf2Token;
+  newConfig.platform = newConfig.platform || {};
+  const ctf2Dir = val('setting-ctf2-dir');
+  if (ctf2Dir !== null) newConfig.platform.downloadDir = ctf2Dir;
 
   // Kali
   newConfig.kali = newConfig.kali || {};

@@ -1,4 +1,4 @@
-# CTF-RE-TOOL v1.4.0
+# CTF-RE-TOOL v1.5.0
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -307,6 +307,30 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 
 ## 更新日志
+
+### v1.5.0 (2026-10-15) — CTF² 平台 8 题实战打磨：验证闭环三修 + 新题型分流 + 题目隔离
+
+接入 CTF² Agent Arena 真实解题 8 道（全解出）：ELF×5 / XLSX / TXT / zip 手包，全程观察工具表现就地修复 9 个缺陷。
+
+**验证闭环（[VERIFY] 契约本地复现）三修 —— custom 契约命中率 0/3 → 3/3**
+1. **调用形态自适应**：AI 常写单参 `decrypt(target)`（置换/数据变换类），旧脚本只按双参调用 → TypeError 全灭。现按 `inspect.signature` 自动尝试 单参/双参原文/双参bytes/关键字参 五种形态，函数名兼容 `decrypt/custom_decrypt/solve/decrypt_flag`。
+2. **expected 双向包含**：AI 给的 expected 常被截断成 flag 前缀（如 `dice{P4ra...`），与完整明文全等必败。改双向包含判定，命中值优先取 FLAG_RE 完整匹配。
+3. **printable() 剥协议头**：RC4 等明文常带控制字符封装头（`\x03\x11+len`），整段被判不可打印回退成 hex，flag 被埋掉。现剥首尾控制符后再判，主体可读即返回文本。
+
+**新题型分流（直读文本，不再误入固件流程）**
+- `detect-file-type` 新增 **XML**（xml/rels/json/plist/yml）与 **TXT**（txt/enc/log/md/csv）两类。
+- 新增 `analyzeXMLText()`：全文直读（≤256KB）→ Tool-Use AI 求解（可 read_file 伴生文件、bash 跑 Python 反推）——Excel 公式题、短密文题不再被丢给 Kali 白等 60 秒。
+- **OOXML 感知**：xlsx/docx/pptx 按 ZIP 容器解压；主文件按「公式数」主导打分（ExceLLM 实测 244 公式的 VERIFY sheet 正确胜出，元数据 docProps 沉底）。
+
+**平台/下载器加固**
+- 下载器目录碰撞防御：附件与同名目录冲突时自动改名重试（EISDIR 整轮中止 → 消除）。
+- 每题附件独立子目录 `<下载目录>/<题名>/` + 多附件主文件按类型权重挑选（ELF/PE/pyc/zip 优先）——杜绝 AI 跨题读到历史残留文件（实战真实发生过：AI 把上一题的解压产物当成当前题的逻辑）。
+- CTF² 自动解题流水线（MCP 客户端/下载/解压/清理）保留在代码内，**平台拉题按钮从 UI 移除**（内部测试功能不随版本发布）。
+
+**求解器增强**
+- AI Tool-Use 提示词加预算纪律（60 轮上限 + 冲刺指令）与「伴生文本必须 read_file 读全文」纪律。
+- max_tokens 截断自动续写；IDA `-o` 参数坑规避（同目录建库）。
+
 
 ### v1.4.0 (2026-10-14) — 修复 Frida Hook 证据被噪音淹没 / 降噪失效 / 经验跨阶段丢失
 

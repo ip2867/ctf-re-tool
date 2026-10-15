@@ -17,7 +17,7 @@
     <div class="titlebar-drag">
       <span class="brand-mark" aria-hidden="true"><i class="fas fa-terminal"></i></span>
       <span class="brand-title">CTF Reverse Engineering Tool</span>
-      <span class="version-badge">v1.4.0</span>
+      <span class="version-badge">v1.5.0</span>
     </div>
     <div class="titlebar-actions">
       <button id="btn-settings" class="titlebar-btn" title="设置">
@@ -482,6 +482,25 @@
           <div class="setting-row">
             <label>Burp 启动</label>
             <input type="text" id="setting-burp" class="input" placeholder="Start.bat 路径">
+          </div>
+        </div>
+        <div class="settings-group">
+          <h4><i class="fas fa-trophy"></i> CTF² 平台（DASCTF Agent Arena）</h4>
+          <div class="setting-row">
+            <label>MCP 地址</label>
+            <input type="text" id="setting-ctf2-url" class="input" placeholder="https://ctf2.dasctf.com/api/ai/v1/mcp">
+          </div>
+          <div class="setting-row">
+            <label>访问 Token</label>
+            <input type="password" id="setting-ctf2-token" class="input" placeholder="平台「凭证」页创建的 Token">
+          </div>
+          <div class="setting-row">
+            <label>附件下载目录</label>
+            <input type="text" id="setting-ctf2-dir" class="input" placeholder="E:\ctf\pratice">
+          </div>
+          <div class="setting-row">
+            <label>&nbsp;</label>
+            <button id="btn-test-ctf2" class="btn btn-small"><i class="fas fa-plug"></i> 测试平台连接</button>
           </div>
         </div>
         <div class="settings-group">

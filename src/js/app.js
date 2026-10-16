@@ -7553,7 +7553,7 @@ function utf8ToBase64(str) {
 // 教训：此前 5 处提示词各写一份、内容漂移，其中有的漏了 chacha20 → 求解器也没实现，
 // 导致"契约承诺支持但本地复现报 unknown algo"。此处集中一份，且必须与 buildSolvePython
 // 里的分支保持同步（新增算法：改这里 + 加求解器分支，两处一起改）。
-const VERIFY_ALGOS = 'rc4|tea|xtea|xxtea|xor|aes_ecb|aes_cbc|des_ecb|des_cbc|des3_ecb|sm4_ecb|chacha20|salsa20|base64|base64_custom|node_js|custom';
+const VERIFY_ALGOS = 'rc4|tea|xtea|xxtea|xor|aes_ecb|aes_cbc|des_ecb|des_cbc|des3_ecb|sm4_ecb|sm4_cbc|sm3|chacha20|salsa20|base64|base64_custom|node_js|custom';
 // 完整契约示例（含 iv/code 等可选字段说明），供各提示词统一插值。
 const VERIFY_CONTRACT = `[VERIFY]{"algo":"${VERIFY_ALGOS}","key":"密钥","key_encoding":"ascii|hex","ciphertext":"密文","encoding":"hex|base64|ascii","expected":"flag或前缀","iv":"(aes_cbc/des_cbc/chacha20 需要；chacha20 的 iv 可为 12B nonce 或 16B=nonce12+counter4)","iv_encoding":"ascii|hex|base64","counter":"(chacha20 可选，counter 初值；不给则自动枚举)","code":"(custom/node_js 需要)完整函数"}[/VERIFY]`;
 
@@ -7713,6 +7713,40 @@ def dec_sm4(d, k):
     from gmssl.sm4 import CryptSM4, SM4_DECRYPT
     c = CryptSM4(); c.set_key(k, SM4_DECRYPT)
     return c.crypt_ecb(d)
+
+def dec_sm4_cbc(d, k, iv):
+    """SM4-CBC：国密对称常考模式（ECB 之外）。iv 16 字节；缺失时枚举全零/密文首块。"""
+    from gmssl.sm4 import CryptSM4, SM4_DECRYPT
+    ivs = []
+    if iv and len(iv) == 16:
+        ivs.append(iv)
+    # iv 缺失/长度不对 → 兜底候选（全零、密文首块）——与 AES-CBC 同策略，避免单契约必败
+    ivs.append(bytes(16))
+    if len(d) >= 16:
+        ivs.append(bytes(d[:16]))
+    last = None
+    for i in ivs:
+        try:
+            c = CryptSM4(); c.set_key(k, SM4_DECRYPT)
+            out = c.crypt_cbc(i, bytes(d))
+            # 命中可打印/flag 形态即返回（多候选择优）
+            t = printable(out)
+            if FLAG_RE.search(out) or (t and sum(1 for ch in t if ch.isprintable()) >= len(t) * 0.9):
+                return out
+            last = out
+        except Exception as e:
+            last = None
+    return last if last is not None else bytes(d)
+
+def dec_sm3(d, k=None):
+    """SM3 是哈希（不可逆）：'解密'语义下无法还原明文。
+    此处仅用于把密文当"消息"算 SM3 摘要，供"SM3(输入)==目标常量"时对比候选。"""
+    try:
+        from gmssl.sm3 import sm3_hash
+        return bytes.fromhex(sm3_hash(list(d)))
+    except Exception:
+        # 无 gmssl.sm3 时降级：返回原数据（上层会因无 flag 形态而不命中，不会误报）
+        return bytes(d)
 
 def dec_chacha20(d, k, nonce, counter=0, variant="chacha20"):
     """ChaCha20 stream cipher. nonce: 12B (IETF, 32-bit counter) or 8B (original, 64-bit counter).
@@ -8043,6 +8077,10 @@ def run_one(i, a):
                     out = dec_des3(ct, k)
                 elif algo == "sm4_ecb":
                     out = dec_sm4(ct, k)
+                elif algo == "sm4_cbc":
+                    out = dec_sm4_cbc(ct, k, iv_bytes(a))
+                elif algo == "sm3":
+                    out = dec_sm3(ct, k)
                 elif algo in ("chacha20", "chacha20_ietf", "chacha20_original", "salsa20"):
                     # ChaCha20：key 32B，nonce 12B(IETF)/8B(original)。
                     # iv 字段可能给 12B nonce，或 16B「nonce(12B)+counter(4B)」（本项目约定）。

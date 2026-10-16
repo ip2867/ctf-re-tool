@@ -14,7 +14,10 @@ metadata:
 |---|---|---|
 | `0x9E3779B9` | TEA/XTEA/XXTEA | 看 32 轮循环 + 移位数：`<<4 >>5`=TEA；`<<4 >>5`+key数组轮换=XTEA；按块遍历+奇偶配对=XXTEA |
 | S盒 `63 7C 77 7B F2 6B 6F C5` | AES | 找密钥扩展(KeyExpansion)确认 key 长度 16/24/32；ECB/CBC 看 IV |
-| S盒 `D6 90 E9 FE CC E1 3D B7` | SM4 | 32轮非平衡Feistel结构+线性变换L；gmssl 库直接解 |
+| S盒 `D6 90 E9 FE CC E1 3D B7` | SM4 | 32轮非平衡Feistel结构+线性变换L；gmssl 库直接解（ECB/CBC） |
+| 常量 `a3b1bac6 56aa3350 677d9197 b27022dc`（FK） | SM4（铁证） | 系统参数 FK 出现在二进制即为 SM4；轮常数 CK 表同理 |
+| 摘要 IV 以 `0x7380166f` 开头 + 64 轮 | SM3 | **哈希不是加密**：`SM3(输入)==常量`→爆破；逐字节比较→截断逆推；`SM3(key\|\|msg)`→长度扩展攻击 |
+| 256 位曲线参数 + 大数模运算 + 签名 | SM2 | ECC 公钥类：考点在 nonce 复用（`d=(z1-z2)/(s1-s2)`）/弱随机/曲线参数未校验，不是破曲线 |
 | `0x67452301 0xEFCDAB89 0x98BADCFE 0x10325476` | MD5 | 不可逆，只能碰撞/查表；若比较"MD5(输入)==常量"则爆破或逐字节截断比较可逆推 |
 | `0x6A09E667 0xBB67AE85` | SHA256 | 同上 |
 | `0xEDB88320` | CRC32 | 碰撞爆破（短 flag 可行）；注意自定义初值/异或值 |
@@ -47,5 +50,8 @@ metadata:
  {"algo":"xxtea","key":"...","ciphertext":"...","encoding":"hex","variant":"be32"}
 ][/HYPOTHESES]
 ```
-支持 algo：tea/xtea/xxtea/rc4/xor/aes_ecb/aes_cbc/des_ecb/des_cbc/des3_ecb/sm4_ecb/base64/base64_custom/custom。
+支持 algo：tea/xtea/xxtea/rc4/xor/aes_ecb/aes_cbc/des_ecb/des_cbc/des3_ecb/sm4_ecb/sm4_cbc/sm3/chacha20/salsa20/base64/base64_custom/custom。
+国密提示：SM4 先试 `sm4_ecb` 再试 `sm4_cbc`（附 `iv`+`iv_encoding`）；S 盒被改的变体 gmssl 解不出，需按 32 轮手写。
+SM3 是哈希（不可逆），`algo:"sm3"` 仅用于"SM3(候选)==目标"的对比，不产出明文。
+完整国密方法（SM2/SM3/SM4 分型与打法）见知识库 `wiki/reverse/method_gm_crypto.md`。
 注意：crc32 碰撞不适合放进 HYPOTHESES（自动求解窗口 30 秒跑不完），按需单独给完整碰撞脚本；custom 需附 `code` 字段（完整 Python `def decrypt(data,key)`）。

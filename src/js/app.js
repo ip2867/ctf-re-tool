@@ -7069,6 +7069,10 @@ ${sideFilesBlock}
    - 反演顺序：若确认是标准轮结构（SubBytes/ShiftRows/MixColumns/AddRoundKey），可把自定义 S 盒换成逆 S 盒，
      其余用标准 AES 解密框架。
    ⚠️ 若 run_python 报"超时"，那是**算得久不是方法错**——按提示缩小搜索空间或拆分，不要换方法重头再来。
+   ⚠️ **RVA→文件偏移不要手算**（如 0xfa00+(va-0x421000) 这种）——极易错且会让你反复重跑同一脚本直到卡死。
+      正确做法：用 pefile.PE(path).get_offset_from_rva(rva) 或 pe.get_memory_mapped_image()[va]（按虚拟地址索引）；
+      读常量表优先用 ida_get_bytes(address)（IDA 已加载，直接按 VA 读，无需换算）。
+   ⚠️ **同一脚本不要重复跑 3 次以上**——拿不到结果说明方法有问题，先看报错原文定位根因，别换写法重试。
 ③' **运行型题目路径（重要！）**：若程序**没有**静态校验逻辑，而是"输入→处理→输出"的工具型程序
    （判断特征：getopt 命令行参数 / ifstream+ofstream / 线程池 / 计时输出；题目描述给出运行用法），
    先做 **10 秒分诊**（决定走哪条路，判错方向全盘皆输）：

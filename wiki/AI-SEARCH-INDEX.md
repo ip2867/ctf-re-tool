@@ -58,6 +58,7 @@
 - **运行型（伴生输出反演）**: [reverse/method_runtime_challenges.md](reverse/method_runtime_challenges.md)
 - **并行扫描/置换网络**: [reverse/method_parallel_scan_inversion.md](reverse/method_parallel_scan_inversion.md)（Blelloch up/down-sweep 精确逆序、MPI 单位标签求置换）
 - **Excel 公式校验器**: [reverse/method_excel_formula_verifier.md](reverse/method_excel_formula_verifier.md)（OOXML 解压、公式→ReLU/矩阵乘、stride 反推、逐字符枚举）
+- **PE加载器/内嵌PE/VM型**: [reverse/method_pe_loader_vm_obfuscation.md](reverse/method_pe_loader_vm_obfuscation.md)（三层伪装拆法：decoy识别→异或提取内嵌PE→VM里认出魔改标准算法；含 RVA 换算/RVA→offset 别手算）
 - **国密算法（SM2/SM3/SM4）**: [reverse/method_gm_crypto.md](reverse/method_gm_crypto.md)（10 秒分型看常量：SM4 S盒 0xD6 / SM3 IV 0x7380166f / SM2 ECC；对称解密·哈希爆破·nonce 复用三类打法）
 - **短密文秒解/协议封装**: [reverse/method_short_ciphertext_triage.md](reverse/method_short_ciphertext_triage.md)（单字节全扫、前缀匹配、剥控制字符头）
 - **关键词**: `运行型` `flag.out` `Blelloch` `up-sweep` `MPI` `单位标签` `xlsx` `SUMPRODUCT` `stride` `enc.txt` `协议头` `控制字符` `国密` `SM4` `SM3` `SM2` `gmssl`

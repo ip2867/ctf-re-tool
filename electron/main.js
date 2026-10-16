@@ -3466,6 +3466,8 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
   // "只说不做"催促：模型输出行动意图却零工具调用时注入催促继续执行（最多 3 次，防死循环）
   let actionNudged = false;
   let actionNudgeCount = 0;
+  // 重复调用计数（工具名+参数签名 → 次数）：同一调用重复 ≥3 次时警告换路，防"原地打转"卡死
+  const dupCounter = new Map();
 
   while (maxIterations > 0) {
     maxIterations--;
@@ -3575,6 +3577,27 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
         console.log(`[Tool Use] 调用工具: ${toolCall.name}`, toolCall.input);
         // 持久化工具调用日志（stdout 只在 npm 窗口可见，排查"工具到底执行没执行"时需要落盘证据）
         try { logToolCall(toolCall.name, toolCall.input); } catch (e) {}
+
+        // ── 重复调用检测（防"原地打转"卡死）──
+        // 实测（Disguise）：AI 把同一个"读 stage2 常量表"脚本跑了 30 次，每次都因手算 RVA→offset
+        // 换算错误拿不到数据，就换个写法再试，整个任务卡死。这里统计"工具名+参数签名"出现次数，
+        // 达阈值后不再照常执行，而是回报明确警告 + 换路建议（避免预算被同一动作烧光）。
+        const sig = toolCall.name + '|' + (() => { try { return JSON.stringify(toolCall.input || {}).slice(0, 400); } catch (e) { return String(toolCall.input); } })();
+        const cnt = (dupCounter.get(sig) || 0) + 1;
+        dupCounter.set(sig, cnt);
+        if (cnt >= 3) {
+          toolResults.push({
+            tool_use_id: toolCall.id,
+            content: `⚠️ 检测到重复调用：\n同一个 ${toolCall.name} 调用（参数完全相同或高度相似）已出现 ${cnt} 次。\n`
+              + '这说明当前做法拿不到预期结果，**继续重试同一调用不会有新结果**。请立即换路径：\n'
+              + '①若是在做 RVA→文件偏移换算：不要手算，改用 `pefile.PE(path).get_offset_from_rva(rva)` 或 `pe.get_memory_mapped_image()[va]`（按虚拟地址直接索引，一次就对）；\n'
+              + '②若是在读常量表：先用 `ida_get_bytes(address)` 直接读（IDA 已加载，无需自己换算）；\n'
+              + '③若脚本反复报同一错误：先把该错误原文贴出来，分析根因再改，而不是换个写法重跑；\n'
+              + '④若确实无法推进：明确说明卡点并给出当前最优结论，不要空转。',
+            is_error: true
+          });
+          continue;   // 不再真正执行，省掉一次无意义的重复
+        }
 
         try {
           const result = await executeToolCall(toolCall.name, toolCall.input);

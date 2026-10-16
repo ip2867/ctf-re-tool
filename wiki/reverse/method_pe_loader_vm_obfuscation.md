@@ -1,0 +1,132 @@
+---
+title: PE 加载器 / 内嵌 PE / VM 解释器型逆向（含"魔改标准算法"识别）
+category: reverse-method
+vuln_type: pe-loader-vm-obfuscation
+difficulty: hard
+tags: [PE加载器, 内嵌PE, VM, 虚拟机保护, 魔改SM4, 花指令, 异或提取, 自解码, Disguise, xmctf, 密钥扩展, 识别标准算法]
+keywords: [PE loader, 内嵌PE, 手工映射, VirtualAlloc, XOR提取, 第二层, stage2, VM解释器, 取指译码执行, opcode, 轮函数, 魔改SM4, FK, CK, S盒, 轮密钥, 花指令, nop, 识别标准算法, 轮密钥逆序]
+one_liner: 三层伪装题的标准拆法——①第一层给假 flag（decoy 校验表解出 "fake flag" 字样，别当真）；②真逻辑在被 XOR/异或加密的 .data 段里（找循环里"按 DWORD 读、每 DWORD 只取低字节、XOR 常量、写新缓冲区"的提取器，dump 出内嵌 PE）；③stage2 的 VM 只是"取指-译码-执行"外壳，重点是**认出 VM 实现的是哪个标准算法**（对比系统参数 FK/CK/S盒/轮函数结构），发现是魔改 SM4 后直接套标准解密框架。
+attack_chain:
+- 识别第一层是 decoy：静态校验表解出 `This is a fake flag` 之类字样、且程序名/题面暗示伪装（Disguise）→ 不要在假 flag 上停；找真载体
+- 定位内嵌 PE 提取器：搜循环里"从 .data 固定地址按 DWORD 读 → 取低字节 → XOR 常量（如 7）→ 写新缓冲区"的代码（常配 VirtualAlloc/手工映射 SizeOfImage、拷贝 Sections）→ 这就是释放器
+- dump stage2：直接把提取逻辑用 Python 复现（pefile 读 .data，按同样步长/掩码/异或解码）→ 首字节 `4D 5A`(MZ) 即成功；写盘后按正常 PE 再分析
+- stage2 分型：若有 `while(1){ opcode=code[pc]; switch(opcode){...} }` 的取指-译码-执行结构 + 一片大内存当"寄存器/状态空间" → 是 VM 外壳（不是最终算法，别硬逆每条指令）
+- **关键一步：认出 VM 实现的标准算法**——列 VM 用到的所有常量表与结构，逐项对照标准算法：
+  · S 盒 256 字节表 → 对比 AES(首字节0x63)/SM4(0xD6)
+  · 系统参数/固定常量（SM4 的 FK={0xa3b1bac6,...}、CK 表）→ 命中即 SM4
+  · 轮结构：32 轮 + 轮函数 `X ^ X ^ X ^ rk` 形式 → SM4；10/12/14 轮 + SubBytes/ShiftRows/MixColumns → AES
+  · 密钥扩展：16 字节种子密钥展开成 32 个轮密钥 → 对称分组密码
+- 常量被换过 ≠ 不能解：**结构相同但 FK/CK/S盒被替换**的"魔改标准算法"，解密框架照抄标准实现，只把常量/轮密钥顺序换成题目的
+- 解密顺序：轮密钥逆序使用（`rk[31-i]`）、块间独立（ECB 语义，按 16 字节分块）、最后可能有一次块内字节反序（`[3][2][1][0]`）——对照加密端写逆序
+- 用 Python 复现正向加密验证：`enc(已知候选) == 密文` 成立才算对（块密码双射，正演验证=反演）
+- 花指令处理：`call $+5`-style 或跳进数据的花指令，用 IDA 把对应字节 nop 掉（如 0xC2B~0xC36），或改字节 patch 后重新反编译
+failed_attempts:
+- 在第一层"解出 fake flag"就收工 → 那是 decoy 校验表；题名/字符串/程序结构都在提示真逻辑在别处
+- 见到 VM 就逐条反汇编所有 opcode 语义（26 个 handler 全啃）→ 白烧预算；VM 只是外壳，先 identify 它实现的标准算法（看常量表最快）
+- S 盒首字节是 0xD6 就断言"标准 SM4"，直接用 gmssl 解 → 得到乱码，因为 FK/CK 被换成自定义值；必须用题目的常量表手写（或替换标准实现的常量）
+- 忽略"轮密钥顺序"与"最终字节反序" → 常量对、结构对，结果还是错；这两步是魔改题的常见坑
+- 花指令不处理硬反编译 → 反编译结果错乱，误判算法；先 nop 掉花指令再分析
+- 把"提取出的 stage2"当成普通 PE 直接跑（缺 Debug DLL 跑不起来）→ 静态读它自己的常量表，别依赖运行
+---
+
+# PE 加载器 / 内嵌 PE / VM 解释器型逆向（含"魔改标准算法"识别）
+
+> 实战来源：xmctf **Disguise**（花指令 + 文件隐藏 + VM 三层）。第一层给假 flag，真逻辑在内嵌 stage2 的 VM 里，VM 实现的是**魔改 SM4**。本页提炼"三层伪装题"的通用拆法。
+
+## 一、三层结构速览
+
+```
+Disguise.exe（第一层）
+├── 假校验：读输入 → 每字节 -= i → 与表 0x480CD4 比较 → 解出 "This is a fake flag"（decoy！）
+└── 真载体：.data 0x41C000 处 dword 数组，每 dword 取低字节 XOR 0x07 → 释放 stage2 PE（0x15000 字节）
+        ↓
+stage2.exe（第二层）——真校验程序
+└── 小型 VM（取指-译码-执行）→ **实际是魔改 SM4**：48 字节输入分 3 块，与 0x421018 的 12 dword 比较
+```
+
+## 二、第一层：识别 decoy + 提取内嵌 PE
+
+**decoy 特征**（不要停在这里）：
+- 静态校验表解出的内容是 `This is a fake flag` / `fake` / 提示性文字
+- 题名/字符串暗示伪装（Disguise）
+- 程序里有明显"加载器"特征（VirtualAlloc + 手工映射 / 大块 .data + 解码循环）
+
+**提取器特征码**（照这个找）：
+```c
+n = *(DWORD*)0x470000;          // 输出长度（0x15000）
+p = malloc(n);
+for (i = 0; i < n; i++)
+    p[i] = (*(DWORD*)(0x41C000 + i*4) ^ 0x07) & 0xff;   // 每 dword 取低字节 XOR 7
+```
+
+**Python 复现**：
+```python
+import pefile, struct
+pe = pefile.PE(r'Disguise.exe')
+data = pe.get_memory_mapped_image()          # 或 get_data(rva, size)
+n = struct.unpack('<I', data[0x470000:0x470004])[0]
+out = bytes(((struct.unpack('<I', data[0x41C000+i*4:0x41C004+i*4])[0]) ^ 7) & 0xff for i in range(n))
+open('stage2.exe','wb').write(out)           # 首两字节应为 4D 5A (MZ)
+```
+
+## 三、第二层：VM 外壳 → 认出标准算法（核心）
+
+**VM 外壳特征**：
+```c
+while (1) {
+    op = code[pc];            // 取指：code 是 dword 数组
+    switch (op) {             // 译码
+        case 0: ...           // 初始化
+        case 1..7: ...        // 算术（+= -= ^= 等）
+        case 9/10/26: ...     // 条件跳转 / 循环标记（标志寄存器 + 跳转目标）
+        case 16: goto end;    // 退出
+    }
+}
+```
+- 寄存器/状态空间 = 一大块内存（如 `dword_423A88[1010]`），S 盒/密钥/明文全放里面不同偏移
+- 操作数是**相对偏移量**（`mem[code[pc+1]]`）
+
+**不要逐条啃 26 个 handler** —— 直接列常量表对照标准算法：
+
+| VM 里的东西 | 对照结论 |
+|---|---|
+| S 盒 256 字节，首字节 `0xD6` | **SM4**（AES 是 `0x63`） |
+| 常量 `0xa3b1bac6 0x56aa3350 0x677d9197 0xb27022dc`（FK） | **SM4 铁证** |
+| 轮常量表（CK）32 个 | SM4 密钥扩展必需 |
+| 32 轮 + 轮函数 `A ^ B ^ C ^ rk` | SM4 分组结构 |
+| 16 字节种子密钥 → 32 个轮密钥 | 对称分组密码密钥扩展 |
+
+**Disguise 的实际情况**：VM 前半段是**轮密钥扩展**（16 字节 key 按大端拼 4 个 DWORD → 与 FK 异或 → 32 轮扩展），后半段是 **32 轮分组变换**；轮函数与标准 SM4 同构，但 **FK/CK/S 盒被换成自定义值**。
+
+## 四、魔改标准算法的解密（照抄标准框架，换常量）
+
+```python
+# 结构 = SM4；常量来自题目；轮密钥逆序用；最后块内字节反序
+def decrypt_block(ct_words, round_keys, sbox):
+    state = list(ct_words)
+    for i in range(32):
+        t = state[(i+1)&3] ^ state[(i+2)&3] ^ state[(i+3)&3] ^ round_keys[31 - i]
+        state[i & 3] ^= t_round(t, sbox)
+    return [state[3], state[2], state[1], state[0]]   # ← 最后的字节反序，别漏
+```
+
+**三个必查的坑**：
+1. **轮密钥逆序**（`rk[31-i]`）—— 加密正序、解密逆序
+2. **块内字节反序**（`[3][2][1][0]`）—— 魔改题常加
+3. **常量替换**（FK/CK/S 盒非标准）—— 不能用 gmssl 直接解
+
+## 五、验证（块密码必做）
+
+- 正向加密已知候选：`enc(candidate) == 密文` 成立才算对
+- 多块独立（ECB 语义）：每 16 字节块单独解
+- 别指望运行 stage2——Debug 版 PE 常缺 MSVCP140D 等 DLL，静态复现才是正路
+
+## 六、快速清单
+
+- [ ] 第一层解出的是不是 `fake flag` 字样？（是 → 继续找真载体）
+- [ ] 有没有"取低字节 + XOR 常量 + 写新缓冲区"的提取循环？
+- [ ] 内嵌文件首字节是 `4D 5A` 吗？
+- [ ] VM 的 S 盒首字节 0xD6（SM4）还是 0x63（AES）？
+- [ ] 有没有 FK/CK 常量表？（SM4 铁证）
+- [ ] 轮密钥逆序 & 块内字节反序，都对照了吗？
+- [ ] 正向 `enc(candidate)==密文` 验证过了吗？

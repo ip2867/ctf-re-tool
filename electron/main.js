@@ -3066,6 +3066,9 @@ function postClaudeStream(requestBody, onDelta) {
       let buf = '';
       const blocks = {};
       const message = { content: [], stop_reason: null };
+      // 流式推流过滤：若模型把工具调用当文本吐（<｜｜tool▁calls▁begin｜｜> 之类），
+      // 这些标记不该显示到聊天区（否则用户看到一堆乱码标记）。检测到即停推。
+      let streamDirty = false;
 
       const handleEvent = (ev) => {
         switch (ev.type) {
@@ -3084,7 +3087,11 @@ function postClaudeStream(requestBody, onDelta) {
             if (!b) break;
             if (d.type === 'text_delta') {
               b.text = (b.text || '') + (d.text || '');
-              if (onDelta) { try { onDelta(d.text || ''); } catch (e) {} }
+              if (onDelta && !streamDirty) {
+                // 一旦本流出现过工具调用标记，后续不再向 UI 推流（parseClaudeResult 会统一清理）
+                if (/tool[\u2581_ ]?calls[\u2581_ ]?begin/i.test(b.text)) streamDirty = true;
+                else { try { onDelta(d.text || ''); } catch (e) {} }
+              }
             } else if (d.type === 'input_json_delta') {
               b._json += d.partial_json || '';
             } else if (d.type === 'thinking_delta') {
@@ -3222,13 +3229,138 @@ function parseClaudeResult(resp) {
     text = thinkingParts.map(c => c.thinking || c.text || '').join('');
   }
 
+  // ── 兜底①：部分模型/代理把工具调用以"文本标记"输出，而不是标准的 tool_use 块 ──
+  // 实测（deepseek 类代理）会吐 `<｜｜tool▁calls▁begin｜｜>func(arg="v")` 这种沿用了训练期特殊
+  // token 的纯文本（<｜｜...｜｜> 为全角竖线，▁ 为 U+2581）。若不转换，工具调用**根本不会执行**：
+  // AI 拿不到真实数据，只能凭上下文空想 → 表现为"3 秒完成、绕圈子、结论全是幻觉"。
+  // 这里解析成标准 toolCalls，让后续循环正常执行。
+  let toolCalls = toolParts.map(c => ({ id: c.id, name: c.name, input: c.input }));
+  if (!toolCalls.length && text && /tool[\u2581_]?calls[\u2581_]?begin/i.test(text)) {
+    const parsed = parseTextToolCalls(text);
+    if (parsed.calls.length) {
+      toolCalls = parsed.calls;
+      text = parsed.cleanText;   // 剥掉标记与调用文本，只留叙述
+      console.log(`[Tool Use] 兜底解析出 ${toolCalls.length} 个文本格式工具调用: ${toolCalls.map(c => c.name).join(', ')}`);
+    }
+  }
+
   return {
     success: true,
     text,
     content,
-    toolCalls: toolParts.map(c => ({ id: c.id, name: c.name, input: c.input })),
+    toolCalls,
     stopReason
   };
+}
+
+// 解析"文本形态的工具调用"（非标准代理输出）。
+// 形态示例（实测）：
+//   <｜｜tool▁calls▁begin｜｜>start<｜｜tool▁calls▁begin｜｜>ida_list_functions()
+//   <｜｜tool▁calls▁begin｜｜>ida_find_strings(regex="flag|key")
+//   <｜｜tool▁calls▁begin｜｜>bash<｜｜tool▁calls▁begin｜｜>cd /e/x && dir
+//   <｜｜tool▁calls▁begin｜｜>read_file(path="E:\\a\\b")
+// 规则：标记是分隔符；紧随其后的标识符若是已知工具名 → 该名字本身即"调用开始"，
+// 其后到下一个标记/段末的内容是参数（形如 name(args) 或裸命令行）。
+function parseTextToolCalls(rawText) {
+  const KNOWN = new Set([
+    'read_file', 'write_file', 'bash', 'glob', 'grep',
+    'jeb_get_manifest', 'jeb_get_class_decompiled', 'jeb_get_method_decompiled',
+    'jeb_get_exported_activities', 'jeb_get_all_classes', 'jeb_get_class_methods',
+    'ida_decompile', 'ida_list_functions', 'ida_find_strings', 'ida_get_xrefs', 'ida_get_bytes',
+    'browser_search', 'browser_open', 'run_command', 'run_python', 'adb_command', 'frida_hook',
+    'read_skill', 'wiki_search', 'wiki_read', 'burp_get_history', 'burp_get_message', 'burp_call',
+    'switch_to_next_stage'
+  ]);
+  // 工具名 → 参数名映射（模型给裸参数时也能用；无参工具不在此表）
+  const MAP = {
+    bash: 'command', run_command: 'command', run_python: 'script', glob: 'pattern', grep: 'pattern',
+    read_file: 'path', write_file: 'path', read_skill: 'name', wiki_read: 'name', wiki_search: 'query',
+    browser_open: 'url', browser_search: 'query', ida_decompile: 'function_name', ida_get_xrefs: 'address',
+    ida_get_bytes: 'address', ida_find_strings: 'regex', frida_hook: 'script', adb_command: 'command'
+  };
+  // 标记：<｜｜tool▁calls▁begin｜｜> / <|tool_calls_begin|> / 变体（全角/半角竖线、▁/_ 分隔）
+  const MARK = /<\s*[|｜]\s*[|｜]?\s*tool[\u2581_ ]?calls[\u2581_ ]?begin\s*[|｜]?\s*[|｜]\s*>/gi;
+  const segs = String(rawText || '').split(MARK);
+  const calls = [];
+  let seq = 0;
+  // 段结构：seg0(前导叙述) [seg1, seg2, ...]；每段形如 "start"、"func(args)"、"bash"、"裸命令"
+  // 特例：模型可能把"工具名"与"参数"分成两段（"bash" / "ls -la"），此时裸名字段的参数取自下一段。
+  for (let i = 1; i < segs.length; i++) {
+    let seg = String(segs[i] || '').trim();
+    if (!seg) continue;
+    seg = seg.replace(/^start\b[：:\s]*/i, '').trim();   // 剥掉 "start" 控制词
+    if (!seg) continue;
+
+    let name = '', argsText = '';
+    // 形态 A：func(args) 或 func()（空参）
+    const mParen = seg.match(/^([a-z_][a-z0-9_]*)\s*\(([\s\S]*?)\)\s*(?=[A-Z一-龥]|$|\\n)/i)
+      || seg.match(/^([a-z_][a-z0-9_]*)\s*\(([\s\S]*)\)?\s*$/i);
+    if (mParen && KNOWN.has(mParen[1].toLowerCase())) {
+      name = mParen[1].toLowerCase();
+      argsText = mParen[2] || '';
+    } else {
+      // 形态 B：首 token 是工具名（可能无参，也可能后跟裸参数/换行参数）
+      const mTok = seg.match(/^([a-z_][a-z0-9_]*)/i);
+      if (mTok && KNOWN.has(mTok[1].toLowerCase())) {
+        name = mTok[1].toLowerCase();
+        argsText = seg.slice(mTok[1].length).trim();
+        // 形态 C：裸名字且本段无参数 → 参数在下一段（"bash" / "ls -la /tmp"）
+        if (!argsText && i + 1 < segs.length) {
+          const nxt = String(segs[i + 1] || '').trim();
+          // 下一段不是另一个工具名开头（避免把下一个调用当参数）
+          const nxtTok = (nxt.match(/^([a-z_][a-z0-9_]*)/i) || [])[1];
+          if (nxt && !(nxtTok && KNOWN.has(nxtTok.toLowerCase()))) {
+            argsText = nxt;
+            i++;   // 消费掉参数段
+          }
+        }
+      }
+    }
+    if (!name) continue;
+
+    // 组装 input
+    let input = {};
+    const at = argsText.replace(/^\s*\(\s*/, '').replace(/\)\s*$/, '').trim();
+    if (at) {
+      const kv = {}; let matched = false;
+      const re = /([a-z_][a-z0-9_]*)\s*=\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^,)]+)/gi;
+      let mm;
+      while ((mm = re.exec(at)) !== null) {
+        matched = true;
+        let v = mm[2].trim();
+        if (/^".*"$|^'.*'$/.test(v)) { try { v = JSON.parse(v.replace(/^'/, '"').replace(/'$/, '"')); } catch (e) { v = v.slice(1, -1); } }
+        else if (/^-?\d+$/.test(v)) v = parseInt(v, 10);
+        kv[mm[1]] = v;
+      }
+      if (matched) input = kv;
+      else {
+        // 裸参数：按工具语义映射。取到"下一个疑似调用/叙述边界"为止
+        let raw = at;
+        // 若工具是 bash/命令类，取到行尾或段末（命令可含空格与 &&）
+        const key = MAP[name];
+        if (key) input = { [key]: raw };
+        else input = { _raw: raw };
+      }
+    }
+    // 无参工具（如 ida_list_functions）允许空 input
+    const NO_ARG_OK = new Set(['ida_list_functions', 'burp_get_history']);
+    if (!Object.keys(input).length && !NO_ARG_OK.has(name)) {
+      // 无参数且非无参工具 → 跳过（避免空调用误执行）
+      continue;
+    }
+    calls.push({ id: 'textcall_' + (++seq) + '_' + Date.now(), name, input });
+  }
+  // cleanText：剥掉标记与"已识别的调用文本"，只留叙述
+  const cleanText = String(rawText || '').split(MARK).filter(s => s && s.trim())
+    .map(s => s.replace(/^start\b[：:\s]*/i, '').trim())
+    .filter(s => {
+      // 若该段整体是"已知工具名开头的调用"，则从叙述里去掉
+      const t = s.trim();
+      const mT = t.match(/^([a-z_][a-z0-9_]*)/i);
+      return !(mT && KNOWN.has(mT[1].toLowerCase()));
+    })
+    .join('\n').trim();
+  return { calls, cleanText };
 }
 
 // 全局语言约束：所有发往 AI 的请求统一在 system 头部注入。
@@ -3396,6 +3528,24 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
     if (response.toolCalls && response.toolCalls.length > 0) {
       // 限制工具调用数量
       const toolCalls = response.toolCalls.slice(0, 3);
+
+      // ── 多阶段接力：一旦出现 switch_to_next_stage，立即中断本阶段循环 ──
+      // 切换涉及 UI 状态 / CASE 目录 / 外部进程管理，必须由渲染层执行；
+      // 这里只把请求连同"本阶段已产出的全部文本"回传（stageSwitch 字段）。
+      const stageCall = toolCalls.find(tc => tc && tc.name === 'switch_to_next_stage');
+      if (stageCall) {
+        const inp = stageCall.input || {};
+        console.log('[阶段接力] AI 请求切换:', inp.path, '| 理由:', inp.reason);
+        return {
+          success: true,
+          text: collectedText || (lastResponse && lastResponse.text) || '（已请求切换到下一阶段）',
+          stageSwitch: {
+            path: String(inp.path || '').trim(),
+            reason: String(inp.reason || '').trim(),
+            carried: String(inp.carried || '').trim()
+          }
+        };
+      }
 
       // 执行工具调用
       const toolResults = [];
@@ -3798,6 +3948,19 @@ function getToolDefinitions() {
         },
         required: ["tool"]
       }
+    },
+    {
+      name: "switch_to_next_stage",
+      description: "多阶段题目接力：当你解出/提取出一个新的可执行文件（如壳解出的 stage2.exe、解密出的内嵌 PE/DEX/payload），调用本工具把分析切换到该文件。工具会：关闭当前 IDA/JEB 进程（释放端口）、保留你在本阶段的全部结论作为下一阶段的上下文、并以新文件建立新的分析上下文自动继续求解。层数上限 3 层。注意：同一文件不要重复接力；不确定是否有新阶段时不要调用。",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "新阶段文件的绝对路径（必须已存在于磁盘）" },
+          reason: { type: "string", description: "为什么判定这是下一阶段载体（如「stage1 XOR 7 解出内嵌 PE，MZ 头完整」）" },
+          carried: { type: "string", description: "可选：本阶段应传给下一阶段的关键结论摘要（已识别的算法/常量/密钥/decoy 提示/已排除的路）。不填则由工具自动从你的分析文本提炼。" }
+        },
+        required: ["path", "reason"]
+      }
     }
   ];
 }
@@ -3981,6 +4144,22 @@ print('BYTES '+data.hex())
       case 'burp_call':
         return await callBurpMcp(input.tool, input.args || {});
 
+      // ========== 多阶段接力（不在主进程执行，只发信号让渲染层切换）==========
+      // 渲染层收到 stageSwitch 后会：kill 旧 IDA/JEB → 保留结论 → analyzeFile(新文件) + autoAnalyze。
+      // 主进程这里只做存在性校验并回一个确认串（该串不会被 AI 看到——循环会立即中断）。
+      case 'switch_to_next_stage': {
+        const p = String(input.path || '').trim();
+        if (!p) return '阶段接力失败：path 为空';
+        try {
+          const st = fs.statSync(p);
+          if (!st.isFile()) return `阶段接力失败：不是文件 → ${p}`;
+          if (st.size === 0) return `阶段接力失败：文件为空 → ${p}`;
+          return `阶段接力已受理：${p}（${st.size} 字节）。工具将关闭当前反编译进程并以该文件继续分析。`;
+        } catch (e) {
+          return `阶段接力失败：文件不存在或不可读 → ${p}（${e.message}）`;
+        }
+      }
+
       default:
         return `未知工具: ${toolName}`;
     }
@@ -4129,12 +4308,16 @@ let currentWorkDir = null;
 // 执行命令
 async function execCommandAsync(command) {
   // 在"当前案件工作目录"下执行，避免模型反复用绝对路径试探；Windows 下走 cmd.exe
-  const opts = { timeout: 30000, maxBuffer: 10 * 1024 * 1024 };
+  // 超时 120s（旧值 30s 对编译/大脚本/批量处理不够；同样会误导 AI"命令失败"而换路）
+  const opts = { timeout: 120000, maxBuffer: 32 * 1024 * 1024 };
   if (currentWorkDir && fs.existsSync(currentWorkDir)) opts.cwd = currentWorkDir;
   return new Promise((resolve) => {
     exec(command, opts, (error, stdout, stderr) => {
       if (error) {
-        resolve(`命令执行失败: ${error.message}\n${truncateOutput(stderr)}`);
+        const timedOut = error.killed || /timed out|ETIMEDOUT/i.test(error.message || '');
+        resolve(timedOut
+          ? `命令执行超时（120s 上限，已终止）。请改用更省时的命令或拆分执行。\n${truncateOutput(stderr)}`
+          : `命令执行失败: ${error.message}\n${truncateOutput(stderr)}`);
       } else {
         resolve(stdout ? truncateOutput(stdout) : '命令执行成功（无输出）');
       }
@@ -4143,17 +4326,33 @@ async function execCommandAsync(command) {
 }
 
 // 执行Python脚本（唯一临时文件名，避免并发覆盖）
+// 超时可配置：Z3 求解 AES 变体、大规模爆破/枚举、Unicorn 模拟等常需数分钟，
+// 旧值 60s 会把"正在收敛的正确解法"误杀成"Python执行失败: timeout"，AI 误判方向后换路重试，
+// 60 轮预算被烧光（Disguise 实测：Z3 AES 求解反复超时 → 绕圈子）。
+// 默认提到 300s（5 分钟），可用环境变量 CTF_PY_TIMEOUT_MS 覆盖；超时上限 30 分钟防挂死。
+const PY_TIMEOUT_MS = Math.min(parseInt(process.env.CTF_PY_TIMEOUT_MS, 10) || 300000, 1800000);
 async function runPythonScript(script) {
   const tempFile = path.join(app.getPath('temp'), `ctf_script_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.py`);
   fs.writeFileSync(tempFile, script);
 
   return new Promise((resolve) => {
-    exec(`python "${tempFile}"`, { timeout: 60000, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
+    exec(`python "${tempFile}"`, { timeout: PY_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024 }, (error, stdout, stderr) => {
       // 清理临时文件
       try { fs.unlinkSync(tempFile); } catch (e) {}
 
       if (error) {
-        resolve(`Python执行失败: ${error.message}\n${truncateOutput(stderr)}`);
+        // 超时（被杀）时给出可行动提示：让 AI 知道"不是方法错，是算得久"
+        const timedOut = error.killed || /timed out|ETIMEDOUT/i.test(error.message || '');
+        if (timedOut) {
+          resolve(`Python执行超时（${Math.round(PY_TIMEOUT_MS / 1000)}s 上限，进程已被终止）。`
+            + `\n提示：这是"算得太久"而非"方法错误"。请改用更省时的策略：`
+            + `①缩小搜索空间（利用已知前缀/格式约束）；②先小规模验证再放大；`
+            + `③把长计算拆成多次短脚本（每次只解 1 个块/1 个字节）；`
+            + `④避免 Z3 对全 16 字节做符号执行（块密码用正向验证/枚举，别硬逆）。`
+            + `\n${truncateOutput(stderr)}`);
+        } else {
+          resolve(`Python执行失败: ${error.message}\n${truncateOutput(stderr)}`);
+        }
       } else {
         resolve(stdout ? truncateOutput(stdout) : 'Python执行成功（无输出）');
       }

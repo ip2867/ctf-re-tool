@@ -1291,25 +1291,31 @@ async function processUserMessage(message) {
   }
 
   // Windows PE 反调试脚本
-  if (lowerMessage.includes('windows') && (lowerMessage.includes('反调试') || lowerMessage.includes('bypass'))) {
+  if ((lowerMessage.includes('windows') || hasWord('pe')) &&
+      (lowerMessage.includes('反调试') || lowerMessage.includes('bypass')) &&
+      /(脚本|script|生成|写个?|给我)/.test(lowerMessage)) {
     await generateWindowsAntiDebugScript();
     return;
   }
 
   // APK 重打包签名
-  if (lowerMessage.includes('重打包') || lowerMessage.includes('repack') || lowerMessage.includes('回编') || lowerMessage.includes('签名')) {
+  if (/^(重打包|repack|回编|签名|重打包签名)$/i.test(lowerMessage.trim()) ||
+      /(重打包|repack).{0,6}(脚本|怎么|如何|方法)|(生成|写).{0,6}(重打包|签名)/.test(lowerMessage)) {
     await generateSmaliRepackScript();
     return;
   }
 
   // RC4 动态脚本
-  if (lowerMessage.includes('rc4') && (lowerMessage.includes('动态') || lowerMessage.includes('hook') || lowerMessage.includes('调试'))) {
+  if (lowerMessage.includes('rc4') &&
+      (lowerMessage.includes('动态') || lowerMessage.includes('hook') || lowerMessage.includes('调试')) &&
+      /(脚本|script|生成|写个?|hook起来|hook一下)/.test(lowerMessage)) {
     await generateRc4DynamicScript();
     return;
   }
 
-  // 生成脚本
-  if (lowerMessage.includes('脚本') || hasWord('script')) {
+  // 生成脚本（精确匹配：旧 includes('脚本') 会把"写个加密脚本思路"等正常提问拦死）
+  if (/^(生成脚本|脚本|script)$/i.test(lowerMessage.trim()) ||
+      /(生成.*脚本|写个.*脚本|写.*hook脚本|生成.*hook)/.test(lowerMessage)) {
     if (lowerMessage.includes('hook') || lowerMessage.includes('frida')) {
       await generateFridaScript();
     } else if (lowerMessage.includes('解密') || lowerMessage.includes('decrypt')) {
@@ -1323,7 +1329,8 @@ async function processUserMessage(message) {
   }
 
   // 反调试
-  if (lowerMessage.includes('反调试') || lowerMessage.includes('anti-debug')) {
+  if (/^(反调试|anti-?debug)$/i.test(lowerMessage.trim()) ||
+      /(生成|写个?|给我).{0,4}反调试.{0,4}脚本/.test(lowerMessage)) {
     await generateAntiDebugScript();
     return;
   }
@@ -1449,8 +1456,9 @@ async function processUserMessage(message) {
     return;
   }
 
-  // 决策树查询
-  if (lowerMessage.includes('决策树') || lowerMessage.includes('流程') || lowerMessage.includes('workflow')) {
+  // 决策树查询（精确匹配：旧 includes('流程') 会把"解题流程/分析流程"等正常提问拦死）
+  if (/^(决策树|流程|workflow|决策树查询)$/i.test(lowerMessage.trim()) ||
+      /(决策树|解题流程是什么|分析流程是什么)/.test(lowerMessage)) {
     addSystemMessage(`**ctf-agent 决策树**
 
 拿到逆向/Mobile题:
@@ -1478,7 +1486,7 @@ async function processUserMessage(message) {
   // hasWord 已在函数顶部声明（词边界匹配，避免 "open/type"→PE、"steal/team"→TEA 误伤）
 
   // APK分析流程
-  if (hasWord('apk') || lowerMessage.includes('android') || lowerMessage.includes('安卓')) {
+  if (/^(apk|android|安卓)$/i.test(lowerMessage.trim()) || lowerMessage.includes('apk逆向') || lowerMessage.includes('安卓逆向')) {
     addSystemMessage(`**Android APK 分析流程（ctf-agent）**
 
 **第1步：信息收集与查壳**
@@ -1505,7 +1513,7 @@ async function processUserMessage(message) {
   }
 
   // PE分析流程
-  if (hasWord('pe') || hasWord('exe') || lowerMessage.includes('windows')) {
+  if (/^(pe|exe|windows)$/i.test(lowerMessage.trim()) || lowerMessage.includes('pe结构') || lowerMessage.includes('windows逆向')) {
     addSystemMessage(`**Windows PE 分析流程（ctf-agent）**
 
 **第1步：DIE查壳**
@@ -1530,7 +1538,7 @@ async function processUserMessage(message) {
   }
 
   // ELF分析流程
-  if (hasWord('elf') || lowerMessage.includes('linux') || lowerMessage.includes('so文件')) {
+  if (/^(elf|linux|so文件)$/i.test(lowerMessage.trim()) || lowerMessage.includes('elf结构')) {
     addSystemMessage(`**ELF 分析流程（ctf-agent）**
 
 **第1步：IDA静态分析**
@@ -1558,7 +1566,7 @@ async function processUserMessage(message) {
   }
 
   // TEA算法 - 自动搜索更多信息
-  if (hasWord('tea') || lowerMessage.includes('0x9e3779b9')) {
+  if (/^(tea|tea算法|tea加解密)$/i.test(lowerMessage.trim()) || lowerMessage.includes('0x9e3779b9')) {
     addSystemMessage(`**TEA算法识别（ctf-agent）**
 
 **特征常量：** \`0x9E3779B9\` (delta)
@@ -1601,7 +1609,7 @@ def tea_decrypt(v0, v1, key, rounds=32):
   }
 
   // AES算法
-  if (hasWord('aes') || lowerMessage.includes('s盒') || lowerMessage.includes('sbox')) {
+  if (/^(aes|aes算法)$/i.test(lowerMessage.trim()) || lowerMessage.includes('s盒') || lowerMessage.includes('sbox')) {
     addSystemMessage(`**AES算法识别（ctf-agent）**
 
 **特征：** S盒起始值 \`0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5...\`
@@ -1632,7 +1640,7 @@ def aes_decrypt(encrypted, key, mode='ECB'):
   }
 
   // SM4算法
-  if (hasWord('sm4') || lowerMessage.includes('国密')) {
+  if (/^(sm4|sm4算法|国密)$/i.test(lowerMessage.trim()) || lowerMessage.includes('国密算法')) {
     addSystemMessage(`**SM4算法识别（ctf-agent）**
 
 **特征：** S盒 \`0xD6, 0x90, 0xE9, 0xFE, 0xCC, 0xE1, 0x3D, 0xB7...\`
@@ -1661,7 +1669,7 @@ def sm4_decrypt(encrypted, key):
   }
 
   // RC4算法
-  if (hasWord('rc4') || lowerMessage.includes('s盒初始化')) {
+  if (/^(rc4|rc4算法)$/i.test(lowerMessage.trim()) || lowerMessage.includes('s盒初始化')) {
     addSystemMessage(`**RC4算法识别（ctf-agent）**
 
 **特征：** 256字节S盒初始化（KSA）
@@ -1699,7 +1707,7 @@ def rc4_decrypt(data, key):
   }
 
   // MD5算法
-  if (hasWord('md5') || lowerMessage.includes('0x67452301')) {
+  if (/^(md5|md5算法)$/i.test(lowerMessage.trim()) || lowerMessage.includes('0x67452301')) {
     addSystemMessage(`**MD5算法识别（ctf-agent）**
 
 **特征：** 初始向量 \`0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476\`
@@ -1729,7 +1737,7 @@ def md5_hash(data):
   }
 
   // CRC32算法
-  if (hasWord('crc') || lowerMessage.includes('0xedb88320')) {
+  if (/^(crc|crc32)$/i.test(lowerMessage.trim()) || lowerMessage.includes('0xedb88320')) {
     addSystemMessage(`**CRC32算法识别（ctf-agent）**
 
 **特征：** 多项式 \`0xEDB88320\`（反转）
@@ -1763,8 +1771,9 @@ def crc32_bruteforce(target, length, charset='abcdefghijklmnopqrstuvwxyz'):
     return;
   }
 
-  // 输出规范
-  if (lowerMessage.includes('输出') || lowerMessage.includes('规范') || lowerMessage.includes('format')) {
+  // 输出规范（精确匹配：旧逻辑 includes('输出') 会把"输出语言用中文"等正常诉求拦死）
+  if (/^(输出规范|解题规范|报告规范|format)$/i.test(lowerMessage.trim()) ||
+      /(输出规范|解题报告要求)/.test(lowerMessage)) {
     addSystemMessage(`**ctf-agent 输出规范**
 
 **解题报告要求：**
@@ -1791,8 +1800,11 @@ def crc32_bruteforce(target, length, charset='abcdefghijklmnopqrstuvwxyz'):
     return;
   }
 
-  // 工具链查询
-  if (lowerMessage.includes('工具') || hasWord('tool')) {
+  // 工具链查询（精确匹配：仅"工具链/有哪些工具"这类提问才回固定清单）
+  // 旧逻辑用 lowerMessage.includes('工具') 做子串匹配 → "不要调用工具""用什么工具解"等
+  // 都命中并直接 return，用户消息根本到不了 AI（实测被此拦死）。改为精确短语匹配。
+  if (/^(工具链|工具列表|有哪些工具|可用工具|tool\s*list|list\s*tools)$/i.test(lowerMessage.trim()) ||
+      /(工具链|有哪些工具|可用工具)/.test(lowerMessage)) {
     addSystemMessage(`**ctf-agent 工具链**
 
 **静态分析：**

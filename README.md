@@ -1,4 +1,4 @@
-# CTF-RE-TOOL v1.5.0
+# CTF-RE-TOOL v1.5.1
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -307,6 +307,24 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 
 ## 更新日志
+
+### v1.5.1 (2026-10-16) — 修复消息路由误拦 + 全局中文输出
+
+实战反馈两个问题，均修复。
+
+**一、消息路由宽泛关键词误拦（严重：用户消息根本到不了 AI）**
+
+旧路由用 `lowerMessage.includes('工具')` 做子串匹配——只要消息里出现「工具」二字（如"不要调用工具"、"用什么工具解这题"），
+就直接返回一段固定的「ctf-agent 工具链」清单并 `return`，**AI 完全收不到消息**。同类宽泛拦截共 13 处（`输出`/`规范`/`脚本`/`流程`/`反调试`/`签名`/`重打包`，以及 `tea`/`aes`/`sm4`/`rc4`/`md5`/`crc`/`apk`/`pe`/`elf` 等算法与类型名），都会把正常提问误判为"查询知识卡片"。
+
+**修复**：全部改为**精确匹配**（`^工具链$` 这类整句命令，或"生成…脚本"这类明确意图短语），普通自然语言提问一律放行给 AI。
+
+**二、AI 输出中英混杂（用户要求全中文）**
+
+AI 的推理叙述常输出英文（"I'll start by analyzing this PE file…"），可读性差。
+
+**修复**：在主进程请求构造处（`sendClaudeRequest` / `sendClaudeRequestWithTools`）**单点注入**语言约束——所有 AI 调用路径（聊天、Tool-Use、分级快慢模型、复盘、题解、动态 Hook 决策）100% 覆盖。约束只针对自然语言叙述；代码、变量名、flag、路径、命令行、寄存器名保持原样不翻译。
+
 
 ### v1.5.0 (2026-10-15) — CTF² 平台 8 题实战打磨：验证闭环三修 + 新题型分流 + 题目隔离
 

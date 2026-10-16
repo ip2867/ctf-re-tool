@@ -1,7 +1,7 @@
 # CTF-RE-TOOL 项目框架总览（SSOT）
 
 > **用途**：本文件是项目的**单一事实来源（SSOT）**。新开对话时**先读本文件**即可掌握项目全貌，再按需深入具体文件。
-> **版本**：v1.5.0 ｜ **形态**：Electron 桌面应用（Windows）｜ **定位**：CTF 逆向 AI 解题工作台
+> **版本**：v1.5.1 ｜ **形态**：Electron 桌面应用（Windows）｜ **定位**：CTF 逆向 AI 解题工作台
 > **一句话**：把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成 AI 可自主驱动的流水线；通过 MCP 接入 IDA/JEB/Burp，内置 11 个方法论技能 + 54 页结构化知识库。
 
 ---
@@ -13,7 +13,7 @@
 技术栈     → Electron 35 + 原生 JS（无框架、无打包器）；主进程 Node，渲染层浏览器
 代码中心   → electron/main.js（主进程/全部外部能力） + src/js/app.js（渲染层/解题编排）
 两个仓库   → ctf-tool-v2（源码，本地无远程） → ctf-re-tool-publish（镜像） → GitHub ip2867/ctf-re-tool
-当前版本   → v1.5.0（已发 GitHub Release，exe 73.3MB normal 压缩）
+当前版本   → v1.5.1（已发 GitHub Release，exe 73.3MB normal 压缩）
 ```
 
 **新对话要做的第一件事**：确认改动落在哪个仓库。**源码仓 `ctf-tool-v2` 是唯一编辑点**；`ctf-re-tool-publish` 只是复制品，改完源码后同步过去再 push。

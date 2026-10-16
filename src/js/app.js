@@ -975,12 +975,15 @@ async function runStageHandoff(handoff, fromAiText) {
 
   // 6) 切换并继续（analyzeFile 建新 CASE + autoAnalyze 走完整求解流程）
   try {
+    state._inStageHandoff = true;   // 告知 autoAnalyze：这是接力内调用，勿重置接力态
     await analyzeFile(newPath, { isHandoff: true, stageContext: summary });
     await autoAnalyze();
     return { ok: true, note: 'handoff-done' };
   } catch (e) {
     addLog('error', '[阶段接力] 新阶段分析失败: ' + e.message);
     return { ok: false, note: 'handoff-error: ' + e.message };
+  } finally {
+    state._inStageHandoff = false;
   }
 }
 
@@ -1011,6 +1014,12 @@ function clearFile() {
   state.caseDir = null;
   state.caseName = null;
   state.findings = null;
+  // 多阶段接力态一并重置：否则残留的 stageVisitedMd5/stageDepth 会让"清空后分析新题"
+  // 的合法接力被误判为"已分析过"而拒绝，且深度预算被上一题预支。
+  state.stageContext = '';
+  state.stageDepth = 0;
+  state.stageVisitedMd5 = [];
+  state.stageOriginal = null;
 
   document.getElementById('file-drop-zone').style.display = 'block';
   document.getElementById('file-info-panel').style.display = 'none';
@@ -2102,6 +2111,17 @@ async function autoAnalyze() {
   if (!state.currentFile) {
     addLog('warning', '请先选择文件');
     return;
+  }
+
+  // 重跑即新一轮：重置多阶段接力态。否则上一轮接力留下的 stageVisitedMd5/stageDepth
+  // 会让本轮的合法接力被误判"已分析过"而拒绝，深度预算也被上一轮预支。
+  // （接力自身的递归调用走 runStageHandoff → analyzeFile(isHandoff) → autoAnalyze，
+  //  那里 depth 已由 runStageHandoff 递增，此处重置不会干扰接力链——因为接力时
+  //  是先 analyzeFile 再 autoAnalyze，重入时 currentFile 已换、且仅在用户直接重跑时重置。）
+  if (!state._inStageHandoff) {
+    state.stageDepth = 0;
+    state.stageContext = '';
+    state.stageVisitedMd5 = [];
   }
 
   addLog('info', '========================================');
@@ -7746,39 +7766,30 @@ def dec_sm4(d, k):
     c = CryptSM4(); c.set_key(k, SM4_DECRYPT)
     return c.crypt_ecb(d)
 
-def dec_sm4_cbc(d, k, iv):
-    """SM4-CBC：国密对称常考模式（ECB 之外）。iv 16 字节；缺失时枚举全零/密文首块。"""
+def _sm4_cbc_raw(d, k, mode, iv):
+    """CBC 单次解密（供 dec_cbc_multi 复用，签名与 dec_aes/dec_des 一致）。
+    注意 gmssl 各版本 crypt_cbc 签名不同：本机新版只接受 (iv, input_data)，无 pkcs7_unpadding 参数
+    → 不能传该 kwarg（传了会 TypeError 导致全部候选失败）。"""
     from gmssl.sm4 import CryptSM4, SM4_DECRYPT
-    ivs = []
-    if iv and len(iv) == 16:
-        ivs.append(iv)
-    # iv 缺失/长度不对 → 兜底候选（全零、密文首块）——与 AES-CBC 同策略，避免单契约必败
-    ivs.append(bytes(16))
-    if len(d) >= 16:
-        ivs.append(bytes(d[:16]))
-    last = None
-    for i in ivs:
-        try:
-            c = CryptSM4(); c.set_key(k, SM4_DECRYPT)
-            out = c.crypt_cbc(i, bytes(d))
-            # 命中可打印/flag 形态即返回（多候选择优）
-            t = printable(out)
-            if FLAG_RE.search(out) or (t and sum(1 for ch in t if ch.isprintable()) >= len(t) * 0.9):
-                return out
-            last = out
-        except Exception as e:
-            last = None
-    return last if last is not None else bytes(d)
+    c = CryptSM4(); c.set_key(k, SM4_DECRYPT)
+    try:
+        return bytes(c.crypt_cbc(bytes(iv), bytes(d)))
+    except TypeError:
+        # 老版本带 pkcs7_unpadding 形参时，显式关闭自动去填充（避免非 PKCS7 密文被误剥）
+        return bytes(c.crypt_cbc(bytes(iv), bytes(d), pkcs7_unpadding=False))
+
+def dec_sm4_cbc(d, k, ivb):
+    """SM4-CBC：复用通用多候选逻辑（全零IV/密文首块/前置IV + 回退 ECB），按 _pt_score 择优。
+    旧实现有两个真 bug：(1) 判据 "isprintable 占比>=0.9" 对 printable() 返回的 hex 恒真
+    → 永远只试第一个 IV，兜底候选是死代码；(2) 全候选失败时返回原密文 → run_one 里
+    _pt_score 对含 flag 形态的密文给 4 分 → 报出"输入当 flag"的假 [HIT]。"""
+    return dec_cbc_multi(d, k, ivb, _sm4_cbc_raw, 16, ecbfn=lambda dd, kk, m: dec_sm4(dd, kk))
 
 def dec_sm3(d, k=None):
-    """SM3 是哈希（不可逆）：'解密'语义下无法还原明文。
-    此处仅用于把密文当"消息"算 SM3 摘要，供"SM3(输入)==目标常量"时对比候选。"""
-    try:
-        from gmssl.sm3 import sm3_hash
-        return bytes.fromhex(sm3_hash(list(d)))
-    except Exception:
-        # 无 gmssl.sm3 时降级：返回原数据（上层会因无 flag 形态而不命中，不会误报）
-        return bytes(d)
+    """SM3 是哈希（不可逆），不能"解密"。此处返回 None 表示"该 algo 不产出明文"——
+    run_one 见到 None 会走 ERR 分支，绝不把它塞进 [HIT]（旧实现返回摘要/原数据，
+    会把 64 位 hex 摘要或输入的 flag 串当 flag 上报，是明确的假阳性通道）。"""
+    return None
 
 def dec_chacha20(d, k, nonce, counter=0, variant="chacha20"):
     """ChaCha20 stream cipher. nonce: 12B (IETF, 32-bit counter) or 8B (original, 64-bit counter).
@@ -8924,32 +8935,35 @@ async function prefetchKnowledge(haystack, fileType, extra = []) {
     // 教训（Disguise 实测）：魔改/VM 化的标准算法题，代码里**没有算法名字面量**（无 "sm4"/"aes"），
     // 只有 S 盒常量、FK/CK、轮结构。旧逻辑只按字面量选检索词 → 检索词退化为 "native"，
     // AI 每次都往 AES 猜，国密方法页完全没被用上。
-    // 注意两点（实测踩坑）：
-    //  ①数据表在 haystack 里是**十进制 int32 数组**（bytesToInt32LE），不是 hex 字面量，
-    //    所以 hex 正则（d690e9）永远失配 → 必须同时匹配十进制首值（S盒 d6=214 / 8e=142 等）。
-    //  ②魔改题的 S 盒/FK 常被换成自定义值 → 不能只认标准常量，要认**结构特征**
-    //    （"256 个 int32 的表"、"0x9E3779B9 十进制 2654435769"、"48 字节分 3 块"等）。
+    // 实测踩坑（两版都失败过，务必看清数据在 haystack 里的真实形态）：
+    //  ①数据表经 bytesToInt32LE 渲染成 **每 4 字节打包的有符号 int32**（如 [-18247466, ...]），
+    //    所以"单字节十进制"（214/142）和"无符号十进制"（2746333894）都**永远匹配不上**；
+    //  ②IDA get_bytes 兜底 / SO 数据段是**空格分隔 hex**（`d6 90 e9`），而 hex 直读是连续 hex（`d690e9`）
+    //    → 两种 hex 形态都要覆盖（上一版删了空格形态，造成对 hex-dump 的回归）。
+    // 结论：常量特征必须用「hex 双形态 + 4 字节小端 int32（含负数）」三种写法。
     const FEATURES = [
-      // 标准常量（hex 或十进制皆可命中）
-      [/d690e9|142, ?144|214, ?144|a3b1bac6|56aa3350|677d9197|b27022dc|2748778694|1439589584/, 'sm4 国密 非平衡feistel 轮函数 s盒'],
-      [/7380166f|4914b2b9|1934949231|1226232505/, 'sm3 国密 哈希 长度扩展'],
-      [/637c777b|1667452027/, 'aes s盒 密钥扩展'],
-      [/9e3779b9|2654435769|61c88647|1640531527/, 'tea xtea xxtea delta'],
-      [/428a2f98|1116352408|6a09e667|1779033703/, 'sha256'],
-      [/67452301|1732584193/, 'md5'],
-      // 结构特征（魔改题也适用）
+      // SM4：S 盒首 4 字节 / FK 系统参数（0xA3B1BAC6 小端 c6bab1a3 = -1548633402）
+      [/d6[\s,]{0,2}90[\s,]{0,2}e9|d690e9|8e[\s,]{0,2}2f[\s,]{0,2}03|a3b1bac6|56aa3350|677d9197|b27022dc|-1548633402|-1422884016|1751077783|-1297079588/,
+       'sm4 国密 非平衡feistel 轮函数 s盒 32轮'],
+      // SM3 IV 7380166F 小端 6f168073 = 1863254131
+      [/7380166f|4914b2b9|1863254131|1226093241|1937774191/, 'sm3 国密 哈希 长度扩展'],
+      // AES S 盒 637C777B 小端 7b777c63 = 2071956579
+      [/63[\s,]{0,2}7c[\s,]{0,2}77|637c777b|2071956579/, 'aes s盒 密钥扩展'],
+      [/9e3779b9|2654435769|61c88647|-1640531527|1640531527/, 'tea xtea xxtea delta'],
+      [/428a2f98|6a09e667|1116352408|1779033703/, 'sha256'],
+      [/67452301|efcdab89|1732584193|-272785855/, 'md5'],
+      // 结构特征（魔改题靠这些也适用）
       [/virtualalloc|sizeofimage/i, 'pe加载器 内嵌pe 手工映射'],
       [/opcode|\bdispatch\b|取指|解释器|轮函数/i, 'vm 虚拟机 opcode 分组密码 魔改算法识别'],
-      // 256 项 int32 的常量表 = S 盒候选（十进制数组里出现大量 0-255 值）
-      [/256 个 int32|共 256 个/, 's盒 分组密码 sm4 aes 查表'],
-      // 16 字节密钥 + 分组密码线索
-      [/We1c0me_t0|分组密码|16 字节块|每 16 字节/, '分组密码 魔改sm4 轮密钥 sm4 aes'],
+      // 大常量表 = S 盒候选（64 个 int32 ≈ 256 字节 S 盒；也接受 256 项的大表）
+      [/共 (64|128|256) 个/, 's盒 分组密码 sm4 aes 查表'],
+      [/分组密码|16 字节块|每 16 字节|轮密钥|round.?key/i, '分组密码 魔改sm4 轮密钥 sm4 aes'],
     ];
     // 特征反查词放最前（最高优先），其次算法/工具字面量命中，最后文件类型词
     const feats = [];
     for (const [re, terms] of FEATURES) { if (re.test(hay)) feats.push(terms); }
-    // 兜底：若一组 int32 表的值全在 0..255（典型 S 盒/字节表），也提示分组密码方向
-    if (!feats.length && /\bint32\[\] = \[/.test(haystack) && /\b(1[0-9]{2}|2[0-4][0-9]|25[0-5]),/.test(hay)) {
+    // 兜底：haystack 里有大块 int32 常量表（数据段高度疑似 crypto 表），且没有其他特征 → 提示分组密码方向
+    if (!feats.length && /int32\[\] = \[/.test(hay) && /共 \d{2,} 个/.test(hay)) {
       feats.push('s盒 分组密码 sm4 aes 查表 魔改');
     }
     const ft = String(fileType || '').toUpperCase();

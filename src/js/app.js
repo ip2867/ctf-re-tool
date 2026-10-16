@@ -6710,6 +6710,22 @@ async function autoSolveBinaryFlag(fileType) {
   // 4. 反编译其他关键函数（语义加权挑选，含 VM/派发/解释器类函数）
   if (analysisData.functions && Array.isArray(analysisData.functions)) {
     const keyFuncs = selectKeyFunctions(analysisData.functions, 6);
+    // thunk 兜底（加壳/混淆 PE 实测）：若入选者多为 j_xxx 跳转桩（说明函数表被 ILT 噪声占满），
+    // 追加"体积最大的 sub_* 主体函数"——真逻辑在这些无语义命名的函数里（Disguise：sub_415D00/sub_411401）。
+    const nameOfF = f => String((f && f.name) || f || '');
+    const sizeOfF = f => { const v = parseInt((f && (f.size ?? f.length)) ?? '', 10); return Number.isFinite(v) ? v : -1; };
+    const pickedThunkCount = keyFuncs.filter(f => /^j_/i.test(nameOfF(f)) || (sizeOfF(f) >= 0 && sizeOfF(f) <= 8)).length;
+    if (pickedThunkCount >= Math.ceil(keyFuncs.length / 2)) {
+      const subs = analysisData.functions
+        .filter(f => /^sub_[0-9a-f]+$/i.test(nameOfF(f)))
+        .sort((a, b) => sizeOfF(b) - sizeOfF(a))     // 体积大 → 更像真主体
+        .slice(0, 8)
+        .map(nameOfF);
+      const have = new Set(keyFuncs.map(nameOfF));
+      const extra = subs.filter(n => !have.has(n));
+      addLog('info', `[采集] 入选函数多为 thunk 桩（${pickedThunkCount}/${keyFuncs.length}），追加 ${extra.length} 个体积最大的 sub_* 主体函数`);
+      for (const n of extra) keyFuncs.push(n);
+    }
 
     for (const func of keyFuncs) {
       try {
@@ -9058,21 +9074,34 @@ function selectKeyFunctions(funcs, limit) {
   if (!Array.isArray(funcs)) return [];
   const max = limit || 5;
   const nameOf = f => String((f && f.name) || f || '');
+  const sizeOf = f => { const v = parseInt((f && (f.size ?? f.length)) ?? '', 10); return Number.isFinite(v) ? v : -1; };
   // 工具链/CRT 噪声：命名看着像加解密（__decode_pointer / ____w64_mingwthr_add_key_dtor
   // 含 decode、key），其实是运行时支撑代码，必须压权重，否则会把真正的题目函数挤出名额。
   const runtimeNoise = /mingw|_w64|w64|mingwthr|tls|tmain|crtstartup|_pre_c|exception|_lock|_unlock|atexit|_onexit|cxa|__gcc|security_cookie|findpesection|section_writable|invalidparameter|__dyn|__runtime|__main(_|$)|_p\.\d|pointer|_dtor|_ctor|__gnu|__mingw/i;
-  const score = n => {
+  // 跳转桩（ILT thunk）：加壳/混淆 PE 的函数列表里 90%+ 是 5 字节 j_xxx 桩，
+  // 真主体是 sub_xxxx 这种"有实际体积"的函数。实测（Disguise stage2）：固定清单全被
+  // thunk 占满 → AI 拿不到 sub_415D00/sub_411401 主体 → 报"只有 thunk 无实际逻辑、无解"。
+  const isThunk = (n, sz) => (/^j_/i.test(n) || /^nullsub/i.test(n)) || (sz >= 0 && sz <= 8);
+  const score = (n, sz) => {
     let s = 0;
     if (/encrypt|decrypt|encode|decode|crypt|cipher|flag|key|check|verify|hash|digest|md5|sha\d?|base64|rc4|tea|aes|sm4/i.test(n)) s += 4;
     if (/vm_|operad|operand|opcode|bytecode|dispatch|handler|interp|exec|eval|table|scramble|obfuscat|translat|transform/i.test(n)) s += 3;
     if (/^_*(win)?main(_?crtstartup)?(@\d+)?$/i.test(n) || /^_?start$/i.test(n)) s += 2;
     if (runtimeNoise.test(n)) s -= 5;
+    // thunk/极小函数：重罚（几乎不会被选中），让真正的主体函数浮上来
+    if (isThunk(n, sz)) s -= 100;
+    // sub_xxxx 这类无语义命名但"有体积"的函数：给基础分（它们才是题目逻辑所在）
+    else if (/^sub_[0-9a-f]+$/i.test(n)) {
+      s += 2;
+      if (sz >= 200) s += 2;        // 体积大的更可能是核心
+      else if (sz >= 60) s += 1;
+    }
     return s;
   };
   return funcs
     .slice()
     .filter(f => nameOf(f) && nameOf(f) !== '[object Object]')
-    .map(f => ({ f, s: score(nameOf(f)) }))
+    .map(f => ({ f, s: score(nameOf(f), sizeOf(f)) }))
     .sort((a, b) => b.s - a.s)
     .slice(0, max)
     .map(x => x.f);

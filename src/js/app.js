@@ -6683,15 +6683,26 @@ async function autoSolveBinaryFlag(fileType) {
   };
 
   // 1. 获取函数列表
+  // ⚠️ IDA 刚连上时自动分析可能尚未完成 → list_functions 只返回 2~3 个函数
+  //（Disguise 实测：初次采集只得 sub_413CB0/sub_413CD0/sub_414060 三个，导致后续
+  //  "选主体函数/读常量表"全部落空）。函数数过少时等待重试，给 IDA 分析时间。
   try {
-    const funcsResult = await window.electronAPI.idaMcpCall('list_functions', { queries: {} });
-    if (funcsResult.success) {
-      analysisData.functions = funcsResult.result;
-      addLog('success', '✅ 已获取函数列表');
+    let funcsResult = await window.electronAPI.idaMcpCall('list_functions', { queries: {} });
+    let funcs = (funcsResult && Array.isArray(funcsResult.result)) ? funcsResult.result : [];
+    for (let retry = 0; retry < 4 && funcs.length < 8; retry++) {
+      addLog('info', `函数列表仅 ${funcs.length} 个（IDA 可能仍在自动分析），等待 5s 后重试…`);
+      await new Promise(r => setTimeout(r, 5000));
+      const r2 = await window.electronAPI.idaMcpCall('list_functions', { queries: {} });
+      const f2 = (r2 && Array.isArray(r2.result)) ? r2.result : [];
+      if (f2.length > funcs.length) { funcs = f2; funcsResult = r2; }
+    }
+    if (funcsResult && funcsResult.success) {
+      analysisData.functions = funcs;
+      addLog('success', `✅ 已获取函数列表（${funcs.length} 个）`);
 
       // 识别关键函数（语义加权：加解密/编解码/校验/VM 派发等，避免漏掉 vm_operad 这类核心函数）
-      if (Array.isArray(funcsResult.result)) {
-        const keyFuncs = selectKeyFunctions(funcsResult.result, 10);
+      if (funcs.length) {
+        const keyFuncs = selectKeyFunctions(funcs, 10);
         addLog('info', `发现 ${keyFuncs.length} 个关键函数: ${keyFuncs.map(f => (f && f.name) || f).join(', ')}`);
       }
     }
@@ -6733,8 +6744,17 @@ async function autoSolveBinaryFlag(fileType) {
     // thunk 兜底（加壳/混淆 PE 实测）：若入选者多为 j_xxx 跳转桩（说明函数表被 ILT 噪声占满），
     // 追加"体积最大的 sub_* 主体函数"——真逻辑在这些无语义命名的函数里（Disguise：sub_415D00/sub_411401）。
     const nameOfF = f => String((f && f.name) || f || '');
-    const sizeOfF = f => { const v = parseInt((f && (f.size ?? f.length)) ?? '', 10); return Number.isFinite(v) ? v : -1; };
-    const pickedThunkCount = keyFuncs.filter(f => /^j_/i.test(nameOfF(f)) || (sizeOfF(f) >= 0 && sizeOfF(f) <= 8)).length;
+    // ⚠️ IDA MCP 的 size 是 **hex 字符串**（"0x21b"），用 parseInt(v,10) 会得到 0 →
+    // 所有函数都被误判为 thunk（size<=8），"按体积选主体"完全失效（Disguise 实测）。
+    // 必须识别 0x 前缀并按 16 进制解析。
+    const sizeOfF = f => {
+      const raw = (f && (f.size ?? f.length));
+      if (raw == null || raw === '') return -1;
+      const s = String(raw).trim();
+      const v = /^0x/i.test(s) ? parseInt(s, 16) : parseInt(s, 10);
+      return Number.isFinite(v) ? v : -1;
+    };
+    const pickedThunkCount = keyFuncs.filter(f => /^j_/i.test(nameOfF(f)) || (sizeOfF(f) >= 0 && sizeOfF(f) <= 12)).length;
     if (pickedThunkCount >= Math.ceil(keyFuncs.length / 2)) {
       const subs = analysisData.functions
         .filter(f => /^sub_[0-9a-f]+$/i.test(nameOfF(f)))
@@ -9132,14 +9152,21 @@ function selectKeyFunctions(funcs, limit) {
   if (!Array.isArray(funcs)) return [];
   const max = limit || 5;
   const nameOf = f => String((f && f.name) || f || '');
-  const sizeOf = f => { const v = parseInt((f && (f.size ?? f.length)) ?? '', 10); return Number.isFinite(v) ? v : -1; };
+  // IDA MCP 的 size 是 hex 字符串（"0x21b"）；parseInt(v,10) 会得 0 → 全体误判为 thunk。
+  const sizeOf = f => {
+    const raw = (f && (f.size ?? f.length));
+    if (raw == null || raw === '') return -1;
+    const s = String(raw).trim();
+    const v = /^0x/i.test(s) ? parseInt(s, 16) : parseInt(s, 10);
+    return Number.isFinite(v) ? v : -1;
+  };
   // 工具链/CRT 噪声：命名看着像加解密（__decode_pointer / ____w64_mingwthr_add_key_dtor
   // 含 decode、key），其实是运行时支撑代码，必须压权重，否则会把真正的题目函数挤出名额。
   const runtimeNoise = /mingw|_w64|w64|mingwthr|tls|tmain|crtstartup|_pre_c|exception|_lock|_unlock|atexit|_onexit|cxa|__gcc|security_cookie|findpesection|section_writable|invalidparameter|__dyn|__runtime|__main(_|$)|_p\.\d|pointer|_dtor|_ctor|__gnu|__mingw/i;
   // 跳转桩（ILT thunk）：加壳/混淆 PE 的函数列表里 90%+ 是 5 字节 j_xxx 桩，
   // 真主体是 sub_xxxx 这种"有实际体积"的函数。实测（Disguise stage2）：固定清单全被
   // thunk 占满 → AI 拿不到 sub_415D00/sub_411401 主体 → 报"只有 thunk 无实际逻辑、无解"。
-  const isThunk = (n, sz) => (/^j_/i.test(n) || /^nullsub/i.test(n)) || (sz >= 0 && sz <= 8);
+  const isThunk = (n, sz) => (/^j_/i.test(n) || /^nullsub/i.test(n)) || (sz >= 0 && sz <= 12);
   const score = (n, sz) => {
     let s = 0;
     if (/encrypt|decrypt|encode|decode|crypt|cipher|flag|key|check|verify|hash|digest|md5|sha\d?|base64|rc4|tea|aes|sm4/i.test(n)) s += 4;

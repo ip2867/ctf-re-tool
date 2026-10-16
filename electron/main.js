@@ -3528,10 +3528,13 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
         conversationHistory.push({ role: 'user', content: [{ type: 'text', text: '（输出被 max_tokens 截断。请从中断处继续：优先给出最终结论/flag，不要再展开新分析。）' }] });
         continue;
       }
-      // "只说不做"识别：文本里出现明确的"即将执行"意图，且尚未给结论
-      const wantsAction = /让我(先|来|现在)?\s*(精确)?\s*(dump|读|看|取|反编译|执行|跑|调用|写个?脚本|模拟)/.test(response.text)
-        || /(我(先|现在|接下来)|下一步|接下来我).{0,12}(dump|读取|反编译|执行|跑|写脚本|调用|模拟)/.test(response.text)
-        || /(let me|I'?ll now|next,? I).{0,20}(dump|read|decompile|run|execute|call|write a script|emulate)/i.test(response.text);
+      // "只说不做"识别：文本里出现明确的"即将执行"意图，且尚未给结论。
+      // 实测教训（Disguise）：AI 说 "Let me analyze with pefile"（analyze 不在原动词表）→ 未触发催促
+      // → 6.8 秒就"分析完成"返回半句英文。因此动词表要宽（analyze/look/check/examine/get/verify…），
+      // 且允许"意图 + up to 30 字符"的柔性匹配。
+      const wantsAction = /让我(先|来|现在|再)?\s*(精确|具体|仔细)?\s*(dump|读|看|查|取|跑|写|调用|反编译|分析|执行|模拟|验证|计算|试试|试一下)/.test(response.text)
+        || /(我(先|现在|接下来)|下一步|接下来我|继续).{0,16}(dump|读取|反编译|执行|跑|写脚本|调用|分析|模拟|验证)/.test(response.text)
+        || /\b(let me|I'?ll|I will|now I|next,? I|let'?s)\b[\s\S]{0,40}?\b(dump|read|look|check|examine|analyze|analyse|decompile|run|execute|call|invoke|write|try|scan|verify|extract|parse|load|inspect|get)\b/i.test(response.text);
       const gaveConclusion = /\[FLAG\]|\[VERIFY\]|\[HYPOTHESES\]|待人工验证/.test(response.text);
       if (wantsAction && !gaveConclusion && maxIterations > 1 && actionNudgeCount < 3) {
         actionNudgeCount++;

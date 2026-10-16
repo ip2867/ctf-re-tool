@@ -23,7 +23,12 @@ const state = {
   experience: '',      // 全局经验库（experience.md 内容，注入系统提示）
   flowAbortRequested: false, // 自动化流程（analyzeWebJS 轮询等）的中止标志
   platformBusy: false,  // CTF² 平台拉题流程进行中（防重入）
-  platformLoop: false   // CTF² 连续解题模式（true=平台判对后自动下一题；false=单题）
+  platformLoop: false,  // CTF² 连续解题模式（true=平台判对后自动下一题；false=单题）
+  // ── 多阶段接力（壳/packer 题：stage1 解出 stage2 后自动切过去继续分析）──
+  stageDepth: 0,            // 当前已接力层数（0=原始文件；上限 STAGE_MAX_DEPTH）
+  stageContext: '',         // 前序阶段结论摘要（注入下一阶段提示词）
+  stageVisitedMd5: [],      // 已分析过的文件 md5（防同一文件反复接力死循环）
+  stageOriginal: null       // 接力链的起始文件名（供报告/复盘）
 };
 
 // 新建 findings 结构
@@ -471,7 +476,9 @@ async function handleSelectFile() {
 }
 
 // 分析文件
-async function analyzeFile(filePath) {
+// opts.stageContext：多阶段接力时由上一阶段传入的结论摘要（注入下一阶段提示词）。
+// opts.isHandoff：true 表示这是接力来的新阶段（不清 stageContext、不改 stageDepth）。
+async function analyzeFile(filePath, opts = {}) {
   addLog('info', `正在分析文件: ${filePath}`);
 
   try {
@@ -509,6 +516,15 @@ async function analyzeFile(filePath) {
     state._platformChallenge = null;
     state._platformChallengeDesc = '';
     state._platformFiles = null;
+    // 多阶段接力：接力来的新阶段保留上一阶段摘要；非接力（拖入/选择/平台新题）则清空接力态。
+    if (opts.isHandoff) {
+      state.stageContext = String(opts.stageContext || state.stageContext || '');
+    } else {
+      state.stageContext = '';
+      state.stageDepth = 0;
+      state.stageVisitedMd5 = [];
+      state.stageOriginal = null;
+    }
 
     // 同步工作目录给主进程（AI 的 glob/grep 搜索根）
     try {
@@ -535,6 +551,15 @@ async function analyzeFile(filePath) {
     addLog('success', `文件识别成功: ${typeResult.fileType} - ${typeResult.description}`);
     addLog('info', `MD5: ${infoResult.md5}`);
     addLog('info', `SHA256: ${infoResult.sha256}`);
+
+    // 多阶段接力：登记已分析文件的 md5（防同一文件反复接力），接力时提示来源
+    if (infoResult.md5 && !state.stageVisitedMd5.includes(infoResult.md5)) {
+      state.stageVisitedMd5.push(infoResult.md5);
+    }
+    if (opts.isHandoff) {
+      addLog('info', `[阶段接力] 已切入第 ${state.stageDepth} 层：${infoResult.fileName}`);
+      addSystemMessage(`**🔄 阶段接力（第 ${state.stageDepth}/${STAGE_MAX_DEPTH} 层）**\n\n已从上一阶段切换到：\`${infoResult.fileName}\`\n\n- 类型: ${typeResult.fileType}（${typeResult.description}）\n- 上一阶段结论已保留并注入本题上下文`);
+    }
 
     // 添加AI分析消息
     addSystemMessage(`已识别文件类型: **${typeResult.fileType}** (${typeResult.description})
@@ -862,6 +887,101 @@ async function analyzeZipHandout(zipPath) {
   }
   await analyzeFile(main);
   await autoAnalyze();
+}
+
+// ========== 多阶段接力（壳/packer 题：AI 解出内嵌文件后自动切过去继续）==========
+// 背景（Disguise 题实测）：stage1 是 decoy，真逻辑在内嵌 stage2.exe 里。AI 明明已经
+// 解出并写出了 stage2 文件，却停在原地——因为工具没有"切换分析目标"的机制，换文件
+// 还会清空上一阶段结论、且 IDA 单实例（13337）无法同时开两个目标。
+// 本函数承载 AI 的 switch_to_next_stage 请求：校验 → 存证 → 提炼摘要 → kill 旧进程
+// → analyzeFile(新文件, isHandoff) → autoAnalyze 继续求解。
+const STAGE_MAX_DEPTH = 3;   // 最多接力层数（超出则停下交人工）
+
+// 从 AI 文本 + findings 提炼"给下一阶段用"的摘要（控制长度，信息密度优先）
+function buildStageSummary(aiText, handoff) {
+  const parts = [];
+  const st = state.fileInfo || {};
+  parts.push(`### 前序阶段（第 ${state.stageDepth} 层）：${st.fileName || '未知文件'}（${state.fileType || '?'}）`);
+  if (handoff && handoff.reason) parts.push(`**判定为下一阶段载体的理由**：${handoff.reason}`);
+  if (handoff && handoff.carried) parts.push(`**AI 明确要求沿用的结论**：\n${handoff.carried}`);
+  // 从 findings 提炼已识别算法/结论
+  const f = state.findings || {};
+  if (f.algorithms && f.algorithms.length) {
+    parts.push('**本阶段已识别的算法/结构**：' + f.algorithms.map(a => (a && a.text) || a).join('；'));
+  }
+  if (f.flags && f.flags.length) {
+    parts.push('**本阶段出现的 flag 候选（可能为诱饵）**：' + f.flags.map(x => x.flag + (x.verified ? '（已验证）' : '（未验证）')).join('；'));
+  }
+  // 求解结论（截断，只取要点）
+  const clean = String(aiText || '').replace(/\s+/g, ' ').trim();
+  if (clean) parts.push(`**本阶段分析结论（节选）**：\n${clean.slice(0, 2500)}`);
+  return parts.join('\n\n');
+}
+
+// 执行接力：返回 { ok, note }
+async function runStageHandoff(handoff, fromAiText) {
+  const newPath = String((handoff && handoff.path) || '').trim();
+  const reason = String((handoff && handoff.reason) || '').trim();
+  // 1) 深度上限
+  if (state.stageDepth >= STAGE_MAX_DEPTH) {
+    addLog('warning', `[阶段接力] 已达层数上限（${STAGE_MAX_DEPTH}），停止接力并交人工`);
+    addSystemMessage(`**⏹ 阶段接力已达上限（${STAGE_MAX_DEPTH} 层）**\n\n当前仍在分析：\`${(state.fileInfo && state.fileInfo.fileName) || '?'}\`\n\n如确需更深层，请人工拖入下一阶段文件继续。`);
+    return { ok: false, note: 'depth-exceeded' };
+  }
+  // 2) 文件有效性
+  let info = null;
+  try {
+    info = await window.electronAPI.getFileInfo(newPath);
+  } catch (e) { info = null; }
+  if (!info || !info.success) {
+    addLog('error', `[阶段接力] 新文件不可读：${newPath}`);
+    addSystemMessage(`**❌ 阶段接力失败**\n\n文件不可读：\`${newPath}\`\n\n（AI 给出的路径可能拼错，或文件已被删除。）`);
+    return { ok: false, note: 'bad-path' };
+  }
+  // 3) 防重复：同一 md5 已分析过则拒绝（否则 AI 可能反复提取同一文件造成空转）
+  if (info.md5 && state.stageVisitedMd5.includes(info.md5)) {
+    addLog('warning', `[阶段接力] 该文件已分析过（md5 ${info.md5.slice(0, 8)}…），拒绝重复接力`);
+    addSystemMessage(`**ℹ️ 跳过重复接力**\n\n\`${info.fileName}\` 已在本轮分析过（同一 md5），为避免空转已忽略本次接力请求。`);
+    return { ok: false, note: 'already-visited' };
+  }
+
+  // 4) 落盘本阶段结论 + 接力记录（证据）
+  try {
+    await caseAddEvidence('stage_handoff', `阶段接力：${(state.fileInfo && state.fileInfo.fileName) || '?'} → ${info.fileName}`, 
+      `理由：${reason}\n新文件：${newPath}\n新文件 MD5：${info.md5}\n\n--- 本阶段 AI 结论 ---\n${String(fromAiText || '').slice(0, 20000)}`, 'md');
+  } catch (e) { /* 证据失败不阻塞 */ }
+
+  // 4.5) 接力前先收割本阶段经验——否则 runStageHandoff 直接 return 会跳过 finalizeSolve，
+  //      导致本阶段的 [EXPERIENCE] 永久丢失（Disguise 实测：阶段1 的 thunk/CRT 识别经验没入库）。
+  //      这里只做经验入库（不做验证闭环——上一阶段已知未出 flag，不重复跑契约）。
+  try {
+    if (fromAiText) await harvestExperience(fromAiText, { autoSave: true });
+    addLog('info', '[阶段接力] 已收割本阶段经验（[EXPERIENCE] 入库）');
+  } catch (e) { addLog('warning', '[阶段接力] 经验收割失败（不阻塞）: ' + e.message); }
+
+  const summary = buildStageSummary(fromAiText, handoff);
+  state.stageDepth += 1;
+
+  addLog('info', `[阶段接力] ${state.stageDepth - 1}→${state.stageDepth}：${(state.fileInfo && state.fileInfo.fileName) || '?'} 解出 ${info.fileName}（理由：${reason || '未说明'}）`);
+
+  // 5) 关闭旧反编译进程（IDA 单实例占 13337；不清理则新阶段 IDA 起不来）
+  try {
+    const cl = await window.electronAPI.ctf2CleanupTools();
+    const killed = (cl && cl.killed && cl.killed.length) ? cl.killed.join(', ') : '（无运行中的）';
+    addLog('info', `[阶段接力] 已清理外部工具进程: ${killed}`);
+  } catch (e) { addLog('warning', '[阶段接力] 清理进程失败（不阻塞）: ' + e.message); }
+
+  addSystemMessage(`**🔄 阶段接力 ${state.stageDepth}/${STAGE_MAX_DEPTH}**\n\n- 从：\`${(state.fileInfo && state.fileInfo.fileName) || '?'}\`\n- 到：\`${info.fileName}\`（${info.sizeFormatted}）\n- 理由：${reason || '（未说明）'}\n\n已关闭上一阶段反编译进程、保留其结论，开始分析新阶段…`);
+
+  // 6) 切换并继续（analyzeFile 建新 CASE + autoAnalyze 走完整求解流程）
+  try {
+    await analyzeFile(newPath, { isHandoff: true, stageContext: summary });
+    await autoAnalyze();
+    return { ok: true, note: 'handoff-done' };
+  } catch (e) {
+    addLog('error', '[阶段接力] 新阶段分析失败: ' + e.message);
+    return { ok: false, note: 'handoff-error: ' + e.message };
+  }
 }
 
 // 更新文件信息UI
@@ -6332,8 +6452,13 @@ async function toolUseDeepSolve(analysisData, mainClass) {
   const classesList = (analysisData && Array.isArray(analysisData.classes))
     ? analysisData.classes.slice(0, 200).join('\n') : '（未获取）';
 
-  const deepPrompt = `我正在解一道 CTF APK 题，静态固定清单分析未能得出 flag。请你**使用工具**自主深入分析并求出 flag。
+  // 多阶段接力：上一层（如 APK 解包/壳解出）的结论摘要
+  const stageBlock = state.stageContext
+    ? `\n## ⚙️ 前序阶段上下文（本题是多阶段题目，第 ${state.stageDepth} 层）\n${String(state.stageContext).slice(0, 4000)}\n⚠️ 上面的结论来自上一层文件（已分析完），当前文件是它解出的下一阶段。请在已有结论基础上继续，不要重复上一层工作。\n`
+    : '';
 
+  const deepPrompt = `我正在解一道 CTF APK 题，静态固定清单分析未能得出 flag。请你**使用工具**自主深入分析并求出 flag。
+${stageBlock}
 文件路径：${state.currentFile}
 包名：${pkg || '未知'}
 主Activity：${mainClass || '未知'}
@@ -6367,6 +6492,9 @@ ${mcpCache.nativeIntel.globals && mcpCache.nativeIntel.globals.length ? `\n## SO
 **阶段③ 写求解脚本并本地验证**
 - 用 \`run_python\` 实现还原，**正反双向**验证（反推 key 后，正向加密要能对回目标密文常量）。
 - 需要爆破/约束/符号执行时用 Z3 / angr / Unicorn（见 ctf-reverse-tooling 技能）。
+- 如果识别为**分组密码/自定义 S 盒 AES 变体/微指令 VM 加密**：**不要硬逆**——写出正向加密模拟器，
+  用 \`enc(候选明文)==目标密文\` 验证（块密码双射，正演验证=反演且简单得多）；有格式/字典就正向枚举。
+  符号求解一次只解 1 个块、S 盒用常量数组 Select；单脚本超时就拆成多个短脚本。
 - **脚本必须真跑**，把输出贴出来；不要只给"我认为应该是"。
 - ⚠️ **多候选密文（变种题陷阱）**：native so 里常有多组常量（如 C++ 静态初始化一个
   \`std::array<std::string,N>\`，或 .rodata 里多条 hex）。**不要取第一条就下结论**——要先确认
@@ -6376,6 +6504,12 @@ ${mcpCache.nativeIntel.globals && mcpCache.nativeIntel.globals.length ? `\n## SO
 
 **阶段④ 出结论**
 - 有把握才给 flag；证据不足就明确写"待人工验证 + 还缺什么"，**不要猜**。
+
+**阶段④' 多阶段题目（壳/多阶段 APK）——解出新文件就接力**
+- 若解出/提取出一个**新的可执行文件**（脱壳后的 DEX、解密出的内嵌 APK/so/payload 等，写出到磁盘
+  且能识别出 DEX/ELF/MZ 头），或发现当前样本只是壳/loader 而真逻辑在另一文件里，
+  **直接调用 \`switch_to_next_stage\`**（path=新文件绝对路径, reason=判定理由, carried=要传下去的关键结论）。
+  工具会关闭当前反编译进程、保留你的结论、以新文件重建上下文并自动继续。层数上限 3，同一文件勿重复接力。
 
 **输出契约（必须遵守）：**
 1. 得到 flag：单独一行 \`[FLAG]flag内容[/FLAG]\`
@@ -6400,6 +6534,15 @@ ${mcpCache.nativeIntel.globals && mcpCache.nativeIntel.globals.length ? `\n## SO
     if (result.success && result.text) {
       state.lastAiText = result.text;
       addSolveNote('求解结果(Tool-Use)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
+
+      // ── 多阶段接力（APK 版）：AI 请求切换新阶段文件 ──
+      if (result.stageSwitch && result.stageSwitch.path) {
+        addLog('info', `[阶段接力] 收到 AI 接力请求 → ${result.stageSwitch.path}`);
+        const hr = await runStageHandoff(result.stageSwitch, result.text);
+        if (hr.ok) return true;
+        addLog('warning', '[阶段接力] 未切换（' + hr.note + '），按当前阶段正常收尾');
+      }
+
       // 验证闭环 + 解题成功则经验自动入库（统一走 finalizeSolve 三件套）
       await finalizeSolve(result.text, { source: 'ai-deep' });
 
@@ -6889,8 +7032,12 @@ async function toolUseDeepSolveBinary(analysisData, fileType) {
     : '';
   // 成长闭环③：本题历史失败档案注入——已排除的路先摆出来，AI 优先换路而非重蹈覆辙
   const failHint = state._platformChallenge ? await failureHintSection(state._platformChallenge.name) : '';
+  // 多阶段接力：上一阶段的结论摘要（壳/packer 题的 stage1 发现）注入本轮提示词
+  const stageBlock = state.stageContext
+    ? `\n## ⚙️ 前序阶段上下文（本题是多阶段题目，第 ${state.stageDepth} 层）\n${String(state.stageContext).slice(0, 4000)}\n⚠️ 上面的结论来自上一层文件（已分析完），当前文件是它解出的下一阶段。请**在已有结论基础上继续**，不要重复上一层的工作。\n`
+    : '';
   const prompt = `我在解一道 CTF ${fileType || '二进制'} 题，静态固定清单分析未得出 flag。请**使用工具**自主深入分析并求出 flag。
-${platDesc}${failHint}
+${platDesc}${failHint}${stageBlock}
 文件路径：${state.currentFile}
 ## 已获取的函数列表（节选）
 ${fnSummary}
@@ -6911,6 +7058,17 @@ ${sideFilesBlock}
    写清算法名 + 关键地址 + 输入输出形态。
 ③ **写脚本本地验证**：用 run_python 实现还原，正反双向验证（反推 key 后正向加密对回目标常量）；
    需要约束/符号执行/模拟执行时用 Z3 / angr / Unicorn。
+③'' **分组密码 / VM·AES 变体题（重要！别硬逆）**：若发现"16 字节输入 → 16 字节输出 + 多轮结构 +
+   S 盒查表 + 密钥常量"（典型：自定义 S 盒的 AES 变体、微指令 VM 解释器加密），**不要试图手工反演/硬逆
+   加密过程**（会烧光预算）：
+   - 首选**正向验证**：写出/复用正向加密模拟器（VM 解释器或 AES 结构），然后用
+     'enc(候选明文) == 目标密文' 做验证。**块密码是双射，"正演验证"与"反演"等价，且简单得多**。
+   - 有已知格式（xmctf{/flag{/dice{…）或字典 → 直接正向枚举候选、逐一验证。
+   - 若必须符号求解：**一次只解 1 个块（16 字节）**，且 S 盒查表用**常量数组 Select**而不是逐项 If 链；
+     分段多次短脚本 > 一次巨型脚本（单次 run_python 超时了就先拆小）。
+   - 反演顺序：若确认是标准轮结构（SubBytes/ShiftRows/MixColumns/AddRoundKey），可把自定义 S 盒换成逆 S 盒，
+     其余用标准 AES 解密框架。
+   ⚠️ 若 run_python 报"超时"，那是**算得久不是方法错**——按提示缩小搜索空间或拆分，不要换方法重头再来。
 ③' **运行型题目路径（重要！）**：若程序**没有**静态校验逻辑，而是"输入→处理→输出"的工具型程序
    （判断特征：getopt 命令行参数 / ifstream+ofstream / 线程池 / 计时输出；题目描述给出运行用法），
    先做 **10 秒分诊**（决定走哪条路，判错方向全盘皆输）：
@@ -6925,6 +7083,14 @@ ${sideFilesBlock}
    **分诊不中（输出与 flag 无字符关联）= 真运行型**：flag 在运行行为里（特定输入的输出/种子复现随机序列），
    才走 WSL（\`wsl --status\` 检测）/Unicorn/qiling 运行路线。
 ④ **结论**：有把握才给 flag；证据不足就写明"待人工验证 + 还缺什么"，不要猜。
+④' **多阶段题目（壳/packer）——解出新文件就接力**：若你在本阶段解出/提取出一个**新的可执行文件**
+   （壳解出的 stage2.exe、解密出的内嵌 PE/DEX/payload、从资源段 dump 的二进制等，写出到磁盘且能识别出
+   MZ/ELF/DEX 头），**不要试图在当前进程里硬啃它**（IDA/JEB 单实例、当前数据库绑的是旧文件）——
+   直接调用 \`switch_to_next_stage\`（参数 path=新文件绝对路径, reason=判定理由, carried=你要传下去的关键结论）。
+   工具会：关闭当前反编译进程 → 保留你的结论 → 以新文件重建分析上下文并自动继续。
+   ⚠️ 同一文件不要重复接力；不确定是否真有下一阶段时不要调用（层数上限 3）。
+   ⚠️ 若当前文件本身是 decoy（如校验表解出 "This is a fake flag"、程序是壳/loader），**必须**找真载体接力，
+   而不是报告"这是假 flag"就收工。
 
 ⏱ **预算纪律（必读）**：本轮你共有约 **60 次工具调用**（充足，但别挥霍）。
 - 收集阶段（反编译/读伴生文件/常量）：目标 **15 次内**完成。
@@ -6953,6 +7119,16 @@ ${sideFilesBlock}
     if (result.success && result.text) {
       state.lastAiText = result.text;
       addSolveNote('求解结果(Tool-Use)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000));
+
+      // ── 多阶段接力：AI 请求切换到新阶段文件（壳/packer 题）──
+      // 由本层承载切换（kill 旧进程 + 保留结论 + analyzeFile 新文件 + 递归 autoAnalyze）。
+      if (result.stageSwitch && result.stageSwitch.path) {
+        addLog('info', `[阶段接力] 收到 AI 接力请求 → ${result.stageSwitch.path}`);
+        const r = await runStageHandoff(result.stageSwitch, result.text);
+        if (r.ok) return true;   // 新阶段（含其内部递归）已跑完
+        addLog('warning', '[阶段接力] 未切换（' + r.note + '），按当前阶段正常收尾');
+      }
+
       // 验证闭环 + 解题成功则经验自动入库（统一走 finalizeSolve 三件套）
       await finalizeSolve(result.text, { source: 'ai-deep' });
       const vf = (state.findings ? state.findings.flags : []).filter(f => f.verified);

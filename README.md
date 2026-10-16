@@ -1,4 +1,4 @@
-# CTF-RE-TOOL v1.5.1
+# CTF-RE-TOOL v1.5.2
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -307,6 +307,34 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 
 ## 更新日志
+
+### v1.5.2 (2026-10-16) — 修复"模型文本形态工具调用未执行"（AI 空转绕圈根因）+ 多阶段接力 + 长任务超时
+
+**一、文本形态工具调用未被解析（严重：AI 全程空转）**
+
+部分模型/代理不返回标准 `tool_use` 块，而是把工具调用当**纯文本**吐出，形如
+`<｜｜tool▁calls▁begin｜｜>ida_find_strings(regex="flag")`（全角竖线 + U+2581 分隔符，训练期特殊 token）。
+原解析器只认 `content[].type==="tool_use"` → **工具一个都没执行**，AI 拿不到任何真实数据，只能凭上下文空想，
+表现为"3 秒完成、结论全是幻觉、反复绕圈子"（实测 Disguise 题 60 轮预算全废）。
+
+**修复**：`parseClaudeResult` 加兜底解析 `parseTextToolCalls`——识别该标记格式并转成真正的工具调用
+（支持 `func(args)`/裸名/`name` 与参数分行/单双竖线变体），同时清洗文本。流式推流处同步过滤，标记不再显示到聊天区。
+
+**二、多阶段接力（壳/packer 题自动续解）**
+
+新增 AI 工具 `switch_to_next_stage`：AI 解出内嵌新文件后自动接力——关闭当前 IDA/JEB 进程、
+保留本阶段结论（摘要注入下一阶段）、以新文件重建分析上下文继续求解。层数上限 3，同一 md5 不重复接力。
+
+**三、长任务超时放宽**
+
+`run_python` 60s → **300s**（Z3 求解 AES 变体、大规模枚举需数分钟；旧值会把"正在收敛的正确解法"误杀成超时，
+AI 误判方向后换路重试，烧光预算）；`bash` 30s → 120s。超时提示改为可行动指引（"算得久≠方法错"，建议缩小搜索空间/拆分脚本）。
+
+**四、提示词新增分组密码题分诊**
+
+识别为"16 字节分组 + S 盒查表 + 多轮"（AES 变体/微指令 VM 加密）时，**不硬逆**——写出正向模拟器用
+`enc(候选)==目标` 验证（块密码双射，正演验证等价且简单得多）；符号求解一次只解 1 个块、S 盒用常量数组。
+
 
 ### v1.5.1 (2026-10-16) — 修复消息路由误拦 + 全局中文输出
 

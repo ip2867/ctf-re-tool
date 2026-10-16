@@ -3442,6 +3442,9 @@ ipcMain.handle('claude-chat', async (event, messages, systemPrompt, opts) => {
 // IPC: 取消当前 AI 请求
 ipcMain.handle('claude-abort', async () => {
   claudeAborted = true;
+  // 同时终止正在跑的 python 子进程树——否则用户在 run_python 跑着时点取消，
+  // 脚本会一直跑到自然结束或自身超时（最长 30 分钟），表现为"点了停止没反应"。
+  try { killPythonTree(); } catch (e) { /* 忽略 */ }
   return { success: true };
 });
 
@@ -3580,12 +3583,17 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
 
         // ── 重复调用检测（防"原地打转"卡死）──
         // 实测（Disguise）：AI 把同一个"读 stage2 常量表"脚本跑了 30 次，每次都因手算 RVA→offset
-        // 换算错误拿不到数据，就换个写法再试，整个任务卡死。这里统计"工具名+参数签名"出现次数，
-        // 达阈值后不再照常执行，而是回报明确警告 + 换路建议（避免预算被同一动作烧光）。
-        const sig = toolCall.name + '|' + (() => { try { return JSON.stringify(toolCall.input || {}).slice(0, 400); } catch (e) { return String(toolCall.input); } })();
+        // 换算错误拿不到数据，就换个写法再试，整个任务卡死。
+        // ⚠️ 签名必须用**完整参数哈希**，不能截断——run_python 的脚本开头（import 段）常在 400 字符内
+        // 完全一样，截断签名会把"内容不同的新脚本"误判成重复并拦掉（恰好拦住最该允许的"换路重写"）。
+        const sig = toolCall.name + '|' + (() => {
+          try { return require('crypto').createHash('sha1').update(JSON.stringify(toolCall.input || {})).digest('hex'); }
+          catch (e) { return String(toolCall.input); }
+        })();
         const cnt = (dupCounter.get(sig) || 0) + 1;
         dupCounter.set(sig, cnt);
-        if (cnt >= 3) {
+        // 阈值放宽到 4（允许"读→改→再读"这类合理重复），且只拦**完全相同**的调用
+        if (cnt >= 4) {
           toolResults.push({
             tool_use_id: toolCall.id,
             content: `⚠️ 检测到重复调用：\n同一个 ${toolCall.name} 调用（参数完全相同或高度相似）已出现 ${cnt} 次。\n`
@@ -4388,32 +4396,71 @@ async function execCommandAsync(command) {
 // 超时可配置：Z3 求解 AES 变体、大规模爆破/枚举、Unicorn 模拟等常需数分钟，
 // 旧值 60s 会把"正在收敛的正确解法"误杀成"Python执行失败: timeout"，AI 误判方向后换路重试，
 // 60 轮预算被烧光（Disguise 实测：Z3 AES 求解反复超时 → 绕圈子）。
-// 默认提到 300s（5 分钟），可用环境变量 CTF_PY_TIMEOUT_MS 覆盖；超时上限 30 分钟防挂死。
-const PY_TIMEOUT_MS = Math.min(parseInt(process.env.CTF_PY_TIMEOUT_MS, 10) || 300000, 1800000);
+// 默认提到 300s（5 分钟），可用环境变量 CTF_PY_TIMEOUT_MS 覆盖；钳制到 [1s, 30min] 防负数/0 异常。
+const PY_TIMEOUT_MS = Math.min(Math.max(parseInt(process.env.CTF_PY_TIMEOUT_MS, 10) || 300000, 1000), 1800000);
+
+// 当前正在运行的 python 子进程（供 claude-abort 主动终止）。
+// 为什么需要：旧实现用 exec + shell:true → kill 只杀 cmd.exe，python 孙进程逃逸继续跑
+// （实测：超时 kill 后孙进程仍在写文件），且取消操作完全不响应 → 进程泄漏 + 卡住后续分析。
+let currentPythonChild = null;
+function killPythonTree() {
+  const ch = currentPythonChild;
+  if (!ch || ch.killed) return;
+  try {
+    if (process.platform === 'win32' && ch.pid) {
+      // Windows：按 PID 杀整棵进程树（cmd → python 及其后代）
+      require('child_process').execSync(`taskkill /PID ${ch.pid} /T /F`, { stdio: 'ignore', timeout: 8000 });
+    } else {
+      try { process.kill(-ch.pid, 'SIGKILL'); } catch (e) { ch.kill('SIGKILL'); }
+    }
+  } catch (e) { try { ch.kill('SIGKILL'); } catch (e2) {} }
+  currentPythonChild = null;
+}
+
 async function runPythonScript(script) {
   const tempFile = path.join(app.getPath('temp'), `ctf_script_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.py`);
   fs.writeFileSync(tempFile, script);
 
   return new Promise((resolve) => {
-    exec(`python "${tempFile}"`, { timeout: PY_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024 }, (error, stdout, stderr) => {
-      // 清理临时文件
-      try { fs.unlinkSync(tempFile); } catch (e) {}
+    // 用 spawn（shell:false）直接起 python：kill 能命中本体；Windows 上用 taskkill /T 杀树。
+    const child = spawn('python', [tempFile], { windowsHide: true });
+    currentPythonChild = child;
 
-      if (error) {
-        // 超时（被杀）时给出可行动提示：让 AI 知道"不是方法错，是算得久"
-        const timedOut = error.killed || /timed out|ETIMEDOUT/i.test(error.message || '');
-        if (timedOut) {
-          resolve(`Python执行超时（${Math.round(PY_TIMEOUT_MS / 1000)}s 上限，进程已被终止）。`
-            + `\n提示：这是"算得太久"而非"方法错误"。请改用更省时的策略：`
-            + `①缩小搜索空间（利用已知前缀/格式约束）；②先小规模验证再放大；`
-            + `③把长计算拆成多次短脚本（每次只解 1 个块/1 个字节）；`
-            + `④避免 Z3 对全 16 字节做符号执行（块密码用正向验证/枚举，别硬逆）。`
-            + `\n${truncateOutput(stderr)}`);
-        } else {
-          resolve(`Python执行失败: ${error.message}\n${truncateOutput(stderr)}`);
-        }
+    let stdout = '', stderr = '', total = 0;
+    let settled = false;
+    const MAXBUF = 32 * 1024 * 1024;
+    const finish = (text) => {
+      if (settled) return;
+      settled = true;
+      if (currentPythonChild === child) currentPythonChild = null;
+      try { fs.unlinkSync(tempFile); } catch (e) {}
+      resolve(text);
+    };
+    const timer = setTimeout(() => {
+      killPythonTree();
+      finish(`Python执行超时（${Math.round(PY_TIMEOUT_MS / 1000)}s 上限，进程树已被终止）。`
+        + `\n提示：这是"算得太久"而非"方法错误"。请改用更省时的策略：`
+        + `①缩小搜索空间（利用已知前缀/格式约束）；②先小规模验证再放大；`
+        + `③把长计算拆成多次短脚本（每次只解 1 个块/1 个字节）；`
+        + `④避免 Z3 对全 16 字节做符号执行（块密码用正向验证/枚举，别硬逆）。`
+        + `\n${truncateOutput(stderr)}`);
+    }, PY_TIMEOUT_MS);
+
+    child.stdout.on('data', (c) => { total += c.length; if (total > MAXBUF) { killPythonTree(); return; } stdout += c; });
+    child.stderr.on('data', (c) => { total += c.length; if (total > MAXBUF) { killPythonTree(); return; } stderr += c; });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      finish(`Python启动失败: ${err.message}（确认 python 在 PATH 中）`);
+    });
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      if (signal) {
+        finish(`Python被信号终止（${signal}）。\n${truncateOutput(stderr)}`);
+      } else if (code !== 0) {
+        // 只按"代码非零"报错——不再用 stderr 文本匹配 "timed out"（脚本自己打印该词会被误判）
+        finish(`Python执行失败(exit ${code}):\n${truncateOutput(stderr) || truncateOutput(stdout)}`);
       } else {
-        resolve(stdout ? truncateOutput(stdout) : 'Python执行成功（无输出）');
+        finish(stdout ? truncateOutput(stdout) : 'Python执行成功（无输出）');
       }
     });
   });

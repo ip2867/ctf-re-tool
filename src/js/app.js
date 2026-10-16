@@ -8908,16 +8908,34 @@ async function prefetchKnowledge(haystack, fileType, extra = []) {
       // Web/JS 逆向类
       'jsencrypt', 'cryptojs', 'sign', 'token', 'x-bogus', 'a_bogus', '_0x', 'sm2', 'sm3', 'wasm', 'jsvmp', '瑞数'];
     const hits = POOL.filter(t => hay.includes(t));
+    // ── 按"常量/结构特征"反查算法（关键增强）──
+    // 教训（Disguise 实测）：魔改/VM 化的标准算法题，代码里**没有算法名字面量**（无 "sm4"/"aes"），
+    // 只有 S 盒常量、FK/CK、轮结构。旧逻辑只按字面量选检索词 → 检索词退化为 "s-box vm"，
+    // 命中的是通用 VM 页/白盒 AES 页 → AI 每次都往 AES 猜，国密方法页完全没被用上。
+    // 这里按"特征常量"反查算法族，且**优先级高于字面量命中**（防被 slice 挤掉）。
+    const FEATURES = [
+      [/d690e9|d6 90 e9|a3b1bac6|56aa3350|677d9197|b27022dc/, 'sm4 国密 非平衡feistel 轮函数'],
+      [/7380166f|4914b2b9|172442d7/, 'sm3 国密 哈希 长度扩展'],
+      [/637c777b|63 7c 77 7b/, 'aes s盒 密钥扩展'],
+      [/9e3779b9|61c88647/, 'tea xtea xxtea delta'],
+      [/428a2f98|6a09e667/, 'sha256'],
+      [/67452301|efcdab89/, 'md5'],
+      [/virtualalloc|sizeofimage/i, 'pe加载器 内嵌pe 手工映射'],
+      [/\bopcode\b|dispatch|取指|解释器/, 'vm 虚拟机 opcode 轮函数'],
+    ];
+    // 特征反查词放最前（最高优先），其次算法/工具字面量命中，最后文件类型词
+    const feats = [];
+    for (const [re, terms] of FEATURES) { if (re.test(hay)) feats.push(terms); }
     const ft = String(fileType || '').toUpperCase();
     if (/APK/.test(ft)) hits.unshift('apk');
     else if (/DEX/.test(ft)) hits.unshift('apk', 'dex');
     else if (/JAR|JAVA|CLASS/.test(ft)) hits.unshift('java', 'jadx');
-    else if (/PE|ELF|EXE|BIN/.test(ft)) hits.unshift('native');
-    else if (/PYC/.test(ft)) hits.unshift('python');
-    else if (/MACHO/.test(ft)) hits.unshift('macho');
-    else if (/LUAC|LUA/.test(ft)) hits.unshift('lua');
-    else if (/JS|HTML/.test(ft)) hits.unshift('js 逆向', 'sign');
-    const terms = [...new Set([...extra, ...hits].map(s => String(s).trim()).filter(Boolean))].slice(0, 6);
+    else if (/PE|ELF|EXE|BIN/.test(ft)) hits.push('native');
+    else if (/PYC/.test(ft)) hits.push('python');
+    else if (/MACHO/.test(ft)) hits.push('macho');
+    else if (/LUAC|LUA/.test(ft)) hits.push('lua');
+    else if (/JS|HTML/.test(ft)) hits.push('js 逆向', 'sign');
+    const terms = [...new Set([...extra, ...feats, ...hits].map(s => String(s).trim()).filter(Boolean))].slice(0, 6);
     if (!terms.length) terms.push(ft || 'reverse');
     const r = await api.wikiSearch(terms.join(' '), 4);
     if (!r || !r.success || !r.result || /未找到与/.test(r.result)) return '';

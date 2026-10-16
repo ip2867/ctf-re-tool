@@ -52,6 +52,7 @@
 | 45 | [method_parallel_scan_inversion](method_parallel_scan_inversion.md) | CTF² Agent Arena | 2026 | method | 并行扫描/置换网络：Blelloch up/down-sweep 精确逆序；MPI 环形搬运=单位标签求置换 |
 | 46 | [method_excel_formula_verifier](method_excel_formula_verifier.md) | CTF² Agent Arena | 2026 | method | Excel 公式校验器：OOXML 解压，SUMPRODUCT=矩阵乘，stride 行号锚点反推，逐字符枚举 |
 | 47 | [method_short_ciphertext_triage](method_short_ciphertext_triage.md) | CTF² Agent Arena | 2026 | method | 短密文秒解（enc.txt类）：单字节 XOR/移位全扫、Caesar+前缀匹配；协议封装明文剥控制字符头 |
+| 48 | [method_gm_crypto](method_gm_crypto.md) | CTF² Agent Arena | 2026 | method | 国密三件套分型与打法：SM4(32轮Feistel+0xD6S盒,gmssl直接解)/SM3(哈希:爆破·长度扩展)/SM2(ECC:nonce复用·弱随机) |
 
 ## 关键词（tags 汇总）
 

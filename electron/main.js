@@ -3231,6 +3231,23 @@ function parseClaudeResult(resp) {
   };
 }
 
+// 全局语言约束：所有发往 AI 的请求统一在 system 头部注入。
+// 为什么放在主进程单点：AI 调用路径有十余处（聊天/Tool-Use/分级快慢模型/复盘/题解/动态 Hook 决策…），
+// 逐个改渲染层提示词既易漏又难维护；在请求构造处统一注入可 100% 覆盖。
+// 注意：只约束"叙述/结论/解释"用中文，代码、标识符、flag、命令、寄存器名等保持原样，
+// 且已有中文要求的提示词不受影响（叠加同义指令无副作用）。
+const ZH_INSTRUCTION = [
+  '【输出语言（最高优先级）】你的所有自然语言输出必须使用简体中文，包括思考过程、推理叙述、分析步骤、结论、经验总结、以及调用工具前后的说明文字。',
+  '不要用英文写解释性文字。以下内容保持原样不翻译：代码、变量名/函数名/类名、flag 原文、文件路径、命令行、寄存器与汇编助记符、API/库名称、报错原文。',
+  '即使是中间步骤（如"我先看一下 PE 头…"）也必须用中文。'
+].join('\n');
+
+function withChineseOutput(systemPrompt) {
+  const base = String(systemPrompt || '');
+  if (base.includes('【输出语言（最高优先级）】')) return base;   // 幂等：避免重复拼接
+  return base ? (ZH_INSTRUCTION + '\n\n' + base) : ZH_INSTRUCTION;
+}
+
 // 发送Claude API请求（无工具）。
 // GLM 等思考型模型可能在推理中途耗尽 max_tokens（stop_reason=max_tokens），
 // 此时自动把已生成正文回传并要求"继续"，最多续写 2 轮，拼接为完整结果。
@@ -3245,7 +3262,8 @@ async function sendClaudeRequest(messages, systemPrompt = '', onDelta, opts = {}
 
   for (let round = 0; round <= MAX_CONT_ROUNDS; round++) {
     const requestBody = { model: useModel, max_tokens: useMaxTokens, messages: history };
-    if (systemPrompt) requestBody.system = systemPrompt;
+    const sysWithZh = withChineseOutput(systemPrompt);
+    if (sysWithZh) requestBody.system = sysWithZh;
     // 续写轮不再向 UI 推流，避免聊天区内容重复
     const resp = await claudeTransport(requestBody, round === 0 ? onDelta : null);
     const parsed = parseClaudeResult(resp);
@@ -3256,7 +3274,7 @@ async function sendClaudeRequest(messages, systemPrompt = '', onDelta, opts = {}
     console.log(`[Claude Chat] 输出被 max_tokens 截断，自动续写（第 ${round + 1}/${MAX_CONT_ROUNDS} 轮）...`);
     history = history.concat([
       { role: 'assistant', content: [{ type: 'text', text: parsed.text }] },
-      { role: 'user', content: '继续，从中断处接着写。如已完成推理，请直接给出最终结论和 flag。' }
+      { role: 'user', content: '继续，从中断处接着写。如已完成推理，请直接给出最终结论和 flag。（继续用中文）' }
     ]);
   }
 
@@ -3793,7 +3811,9 @@ async function sendClaudeRequestWithTools(messages, systemPrompt, tools, onDelta
     messages: messages,
     tools: tools
   };
-  if (systemPrompt) requestBody.system = systemPrompt;
+  // 与 sendClaudeRequest 同一约束：Tool-Use 轮的推理叙述也必须中文
+  const sysWithZh = withChineseOutput(systemPrompt);
+  if (sysWithZh) requestBody.system = sysWithZh;
 
   const resp = await claudeTransport(requestBody, onDelta);
   return parseClaudeResult(resp);

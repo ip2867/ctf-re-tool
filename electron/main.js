@@ -3463,6 +3463,9 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
   let lastResponse = null;
   let collectedText = '';
   let sprintInjected = false;
+  // "只说不做"催促：模型输出行动意图却零工具调用时注入催促继续执行（最多 3 次，防死循环）
+  let actionNudged = false;
+  let actionNudgeCount = 0;
 
   while (maxIterations > 0) {
     maxIterations--;
@@ -3509,13 +3512,30 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
     }
 
     // 如果有文本响应且没有工具调用，直接返回。
-    // ⚠️ 例外：stop_reason === 'max_tokens' 时模型只是被截断（可能正要调工具/给结论），
+    // ⚠️ 例外①：stop_reason === 'max_tokens' 时模型只是被截断（可能正要调工具/给结论），
     // 直接返回会把"半截思考"当最终答案（not-baby-parallelism 三轮实测：95s 后文本断在半句）。
-    // 处理：截断时注入"继续"指令再走一轮（预算内），而非终止。
+    // ⚠️ 例外②：模型"只宣布计划不执行"——输出"让我 dump/读取/反编译 X"却没发出任何工具调用。
+    // 实测（Disguise stage2）：AI 完整推理出 VM 结构后停在"让我精确 dump 每轮 state"，
+    // 零工具调用就收尾 → 170 秒里没拿到任何新数据。此时注入催促，让它真正执行。
     if (response.text && (!response.toolCalls || response.toolCalls.length === 0)) {
       if (response.stopReason === 'max_tokens' && maxIterations > 1) {
         conversationHistory.push({ role: 'assistant', content: response.content && response.content.length ? response.content : [{ type: 'text', text: response.text }] });
         conversationHistory.push({ role: 'user', content: [{ type: 'text', text: '（输出被 max_tokens 截断。请从中断处继续：优先给出最终结论/flag，不要再展开新分析。）' }] });
+        continue;
+      }
+      // "只说不做"识别：文本里出现明确的"即将执行"意图，且尚未给结论
+      const wantsAction = /让我(先|来|现在)?\s*(精确)?\s*(dump|读|看|取|反编译|执行|跑|调用|写个?脚本|模拟)/.test(response.text)
+        || /(我(先|现在|接下来)|下一步|接下来我).{0,12}(dump|读取|反编译|执行|跑|写脚本|调用|模拟)/.test(response.text)
+        || /(let me|I'?ll now|next,? I).{0,20}(dump|read|decompile|run|execute|call|write a script|emulate)/i.test(response.text);
+      const gaveConclusion = /\[FLAG\]|\[VERIFY\]|\[HYPOTHESES\]|待人工验证/.test(response.text);
+      if (wantsAction && !gaveConclusion && maxIterations > 1 && actionNudgeCount < 3) {
+        actionNudgeCount++;
+        conversationHistory.push({ role: 'assistant', content: response.content && response.content.length ? response.content : [{ type: 'text', text: response.text }] });
+        conversationHistory.push({ role: 'user', content: [{ type: 'text', text:
+          '（检测到你只是"说明了要做什么"但没有真正调用工具。）请**立即用工具真正执行**上述动作——'
+          + '例如用 ida_get_bytes 读指定地址字节、run_python 跑脚本、bash 执行命令，'
+          + '拿到真实数据后再继续推理。不要只描述计划；也不要把工具调用写成文字。'
+          + '若本轮确实无法执行（工具不可用），就明确说明并给出当前最优结论。' }] });
         continue;
       }
       return {
@@ -3553,6 +3573,8 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
       for (const toolCall of toolCalls) {
         if (claudeAborted) break;
         console.log(`[Tool Use] 调用工具: ${toolCall.name}`, toolCall.input);
+        // 持久化工具调用日志（stdout 只在 npm 窗口可见，排查"工具到底执行没执行"时需要落盘证据）
+        try { logToolCall(toolCall.name, toolCall.input); } catch (e) {}
 
         try {
           const result = await executeToolCall(toolCall.name, toolCall.input);
@@ -3620,6 +3642,20 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
     success: true,
     text: collectedText || (lastResponse && lastResponse.text) || '分析完成（达到最大迭代次数）'
   };
+}
+
+// 工具调用落盘日志：写到 <userData>/toolcalls.jsonl，供排查"工具到底有没有被真正调用"。
+// 为什么需要：主进程 console.log 只在 npm 窗口可见，事后无法取证；实测遇到过
+// "AI 输出大量推理但零工具调用"的情况（模型只宣布计划不执行 / 工具调用被当文本输出），
+// 有这份日志就能立刻区分"模型没调"还是"调了但失败"。
+function logToolCall(name, input) {
+  try {
+    const dir = app.getPath('userData');
+    const file = path.join(dir, 'toolcalls.jsonl');
+    let brief = '';
+    try { brief = JSON.stringify(input || {}).slice(0, 500); } catch (e) { brief = String(input); }
+    fs.appendFileSync(file, JSON.stringify({ ts: new Date().toISOString(), tool: name, input: brief }) + '\n', 'utf8');
+  } catch (e) { /* 日志失败不影响主流程 */ }
 }
 
 // 获取工具定义（与终端Claude完全一致）

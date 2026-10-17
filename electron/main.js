@@ -158,6 +158,7 @@ const DEFAULT_CONFIG = {
 };
 
 let mainWindow;
+let isQuitting = false;   // 主动退出标记（quit-app IPC / before-quit）
 let config = { ...DEFAULT_CONFIG };
 
 // 深合并配置（避免浅合并覆盖掉 mcp/kali/emulator 等嵌套默认值）
@@ -495,6 +496,13 @@ ipcMain.handle('detect-file-type', async (event, filePath) => {
         fileType = 'ZIP';
         description = 'ZIP Archive';
       }
+    }
+    // RAR / 7z：BUUCTF 大量附件是这两种格式。之前没有分支 → 落进 UNKNOWN，
+    // 走 Kali file/binwalk/strings 白烧一轮（实测 reverse2/reverse3/相册 都是这样）。
+    // 统一标记为 ZIP 类型，复用 analyzeZipHandout（ctf2-unzip 已支持 rar/7z 解压）。
+    else if (ext === '.rar' || magic === '52617221' || ext === '.7z' || magic === '377ABCAF') {
+      fileType = 'ZIP';
+      description = (ext === '.rar' || magic === '52617221') ? 'RAR Archive' : '7z Archive';
     }
 
     // JS / HTML（扩展名判定，走 Web/JS 逆向流程）
@@ -3332,6 +3340,26 @@ ipcMain.handle('close-window', () => {
   mainWindow.close();
 });
 
+// 自动测试报告写入（主进程侧，路径可靠）。
+// 渲染层用 state.appPaths.userData 拼路径，但该值在 getAppPaths 失败时为空 →
+// report 静默不写、外部驱动只能等到超时（实测：第 3 题 20 秒就结束，驱动干等 10 分钟）。
+ipcMain.handle('autotest-report', async (event, data) => {
+  try {
+    const file = path.join(app.getPath('userData'), 'autotest-report.json');
+    fs.writeFileSync(file, typeof data === 'string' ? data : JSON.stringify(data, null, 2), 'utf8');
+    return { success: true, path: file };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+// 退出应用（自动测试脚本用：每题结束后关闭进程，避免多个实例抢 MCP 端口）..
+ipcMain.handle('quit-app', () => {
+  isQuitting = true;
+  app.quit();
+  return { success: true };
+});
+
 // 格式化文件大小
 function formatFileSize(bytes) {
   if (bytes === 0) return '0 Bytes';
@@ -4522,8 +4550,20 @@ async function ctf2McpCallTool(toolName, args) {
   try {
     return await doCall();
   } catch (err) {
+    // 平台限流：凭据页明确要求"Respect HTTP 429 and retry_after_ms"。
+    // 429 时按平台给的 retry_after_ms 等待后重试（最多 3 次），而不是立即失败。
+    const msg = String(err && err.message || '');
+    if (/429|rate.?limit|too many requests/i.test(msg)) {
+      const m = msg.match(/retry_after_ms["':\s]+(\d+)/i) || msg.match(/retry.?after["':\s]+(\d+)/i);
+      const waitMs = m ? Math.min(Number(m[1]) || 2000, 60000) : 2000;
+      for (let i = 0; i < 3; i++) {
+        await new Promise(r => setTimeout(r, waitMs * (i + 1)));
+        try { return await doCall(); } catch (e2) { /* 继续退避 */ }
+      }
+      throw err;
+    }
     // 会话失效/网络瞬断 → 重置重试一次；tools/call 超时不重试（可能已执行，非幂等）
-    if (/400|401|403|404|session|ECONN|socket|ETIMEDOUT|EAI_AGAIN/i.test(err.message) && !/timeout/i.test(err.message)) {
+    if (/400|401|403|404|session|ECONN|socket|ETIMEDOUT|EAI_AGAIN/i.test(msg) && !/timeout/i.test(msg)) {
       ctf2ResetConnection();
       try { return await doCall(); } catch (e2) { throw e2; }
     }
@@ -4669,6 +4709,44 @@ ipcMain.handle('ctf2-unzip', async (event, zipPath) => {
   const { execSync } = require('child_process');
   try {
     if (!fs.existsSync(zipPath)) return { success: false, error: '文件不存在: ' + zipPath };
+    // RAR/7z：BUUCTF 大量附件是 .rar（实测 reverse2/reverse3/相册 都只跑 file/binwalk 就结束，
+    // 因为原逻辑只认 ZIP，整道题等于没解压）。优先用 7-Zip / WinRAR / unrar 解。
+    if (/\.(rar|7z)$/i.test(zipPath)) {
+      const dirR = String(zipPath).replace(/\.[^.]+$/, '') + '_x';
+      try { fs.rmSync(dirR, { recursive: true, force: true }); } catch (e) { }
+      const tools = [
+        'C:\\Program Files\\7-Zip\\7z.exe',
+        'C:\\Program Files (x86)\\7-Zip\\7z.exe',
+        'C:\\Program Files\\WinRAR\\UnRAR.exe',
+        'C:\\Program Files\\WinRAR\\Rar.exe',
+        '7z', '7za', 'unrar',
+      ];
+      let ok = false, lastErr = '';
+      for (const t of tools) {
+        try {
+          if (t.includes('\\') && !fs.existsSync(t)) continue;
+          const isRar = /rar/i.test(t);
+          const cmd = (t === 'unrar' || isRar)
+            ? `"${t}" x -o+ -y "${zipPath}" "${dirR}\\"`
+            : `"${t}" x -y -o"${dirR}" "${zipPath}"`;
+          execSync(cmd, { timeout: 120000, stdio: 'ignore' });
+          ok = true;
+          break;
+        } catch (e) { lastErr = e.message; }
+      }
+      if (!ok) return { success: false, error: '未找到可用的解压工具（7-Zip/WinRAR/unrar）: ' + lastErr };
+      const filesR = [];
+      (function walk(d) {
+        let ents = [];
+        try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
+        for (const e of ents) {
+          const p = path.join(d, e.name);
+          if (e.isDirectory()) { if (!/^__MACOSX$/i.test(e.name)) walk(p); }
+          else if (!/[\\/]\._/.test(p) && !/\.DS_Store$/i.test(p)) filesR.push(p);
+        }
+      })(dirR);
+      return { success: true, dir: dirR, files: filesR };
+    }
     // ZIP 系列容器一律放行：.zip / .apk / .jar / .xlsx / .docx / .pptx / .aar / .ipa
     // （ExceLLM 实测：xlsx 附件被 "仅支持 .zip" 拒收 → 整轮 0 秒结束。OOXML 本质就是 zip）
     if (!/\.(zip|apk|jar|xlsx|xlsm|docx|pptx|aar|ipa|epub)$/i.test(zipPath)) {
@@ -4693,13 +4771,19 @@ ipcMain.handle('ctf2-unzip', async (event, zipPath) => {
     // 但解压目录本身就是证据（sharedStrings.xml 常藏字符串、xl/workbook.xml 有 sheet 清单），
     // 原样列出即可；真正"能跑"的优先级打分保持不变。
     const JUNK = /\.(til|id2|nam|id0|id1|i64|idb|bak)$/i;
+    // macOS 打包噪声：__MACOSX/ 目录与 ._ 前缀的 AppleDouble 文件是资源分支，
+    // 实测（equation 题）它们被当成"主文件"送进分析，白烧一整轮。
+    const isMacJunk = (p) => /[\\/]__MACOSX[\\/]/i.test(p) || /[\\/]\._[^\\/]*$/.test(p) || /[\\/]\.DS_Store$/i.test(p);
     const files = [];
     (function walk(d) {
       let ents = [];
       try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
       for (const e of ents) {
         const p = path.join(d, e.name);
-        if (e.isDirectory()) walk(p); else { if (!JUNK.test(p)) files.push(p); }
+        if (e.isDirectory()) {
+          if (/^__MACOSX$/i.test(e.name)) continue;   // 整个目录跳过
+          walk(p);
+        } else if (!JUNK.test(p) && !isMacJunk(p)) files.push(p);
       }
     })(dir);
     // 可分析优先级打分：ELF > PE > pyc > Mach-O/Class > 无扩展名 > .bin > 其他

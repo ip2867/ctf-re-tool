@@ -49,6 +49,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   minimizeWindow: () => ipcRenderer.invoke('minimize-window'),
   maximizeWindow: () => ipcRenderer.invoke('maximize-window'),
   closeWindow: () => ipcRenderer.invoke('close-window'),
+  // 退出应用（自动测试：每题结束后关闭，避免实例残留抢 MCP 端口）
+  quitApp: () => ipcRenderer.invoke('quit-app'),
+  // 自动测试报告（主进程写盘，避免渲染层 userData 路径为空导致静默丢失）
+  autotestReport: (data) => ipcRenderer.invoke('autotest-report', data),
 
   // 窗口状态变化监听
   onWindowStateChanged: (callback) => {

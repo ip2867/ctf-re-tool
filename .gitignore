@@ -67,3 +67,12 @@ sbox_S.bin
 tests/regression/*/*
 !tests/regression/*/expect.json
 !tests/regression/README.md
+
+# 自动测试运行期产物（日志/汇总，每次跑都变，不入库）
+autotest-logs/
+autotest-summary.json
+autotest-run.log
+
+# 自动测试：题目清单/尝试记录（运行期数据，不入库）
+_reverse_full.json
+autotest-attempted.json

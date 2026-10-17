@@ -23,7 +23,10 @@ const state = {
   experience: '',      // 全局经验库（experience.md 内容，注入系统提示）
   flowAbortRequested: false, // 自动化流程（analyzeWebJS 轮询等）的中止标志
   platformBusy: false,  // CTF² 平台拉题流程进行中（防重入）
-  platformLoop: false,  // CTF² 连续解题模式（true=平台判对后自动下一题；false=单题）
+  platformLoop: false,  // CTF² 连续解题模式（true=自动下一题）
+  platformAbort: false, // 平台循环中止标志（比 flowAbortRequested 更专一）
+  platformSkipOnFail: true,  // 解不出是否跳过继续（自动测试模式=true；严格模式=false）
+  platformLoopLimit: 50,     // 单轮最多尝试题数（防止无限循环）
   // ── 多阶段接力（壳/packer 题：stage1 解出 stage2 后自动切过去继续分析）──
   stageDepth: 0,            // 当前已接力层数（0=原始文件；上限 STAGE_MAX_DEPTH）
   stageContext: '',         // 前序阶段结论摘要（注入下一阶段提示词）
@@ -770,12 +773,22 @@ function ctf2IsSolved(ch) {
   return !!(ch.solved || ch.is_solved || ch.solve_status === 'solved' || ch.status === 'solved' || ch.passed);
 }
 
+// 平台笔记（凭据页规则要求：用 ctf2_agent_log_note 记录 plan/finding/result，
+// 供 owner 在平台侧回看解题回放）。失败不阻塞主流程。
+async function ctf2LogNote(kind, content) {
+  try {
+    const body = String(content || '').slice(0, 1800);   // note_max_chars=2000，留余量
+    if (!body.trim()) return;
+    await window.electronAPI.ctf2McpCall('ctf2_agent_log_note', { kind, content: body });
+  } catch (e) { /* 笔记失败不影响解题 */ }
+}
+
 // 主流程：拉一道未解逆向题 → 下载附件 → 解题 → 提交 flag
 // 平台真实契约（2026-10-14 实测 tools/list schema）：
 //   - 列题必须带 practice_ground_id；分类字段 category，逆向的值是 "REVERSE"（大写）
 //   - 附件参数是 file_id；提交必须带 confirmation:true
 // 返回 { ok, submitted, challenge, note }；ok=false 时 note 说明原因。
-async function solveOnePlatformRound() {
+async function solveOnePlatformRound(opts = {}) {
   const dlDir = (state.config && state.config.platform && state.config.platform.downloadDir) || 'E:\\ctf\\pratice';
   try {
     addLog('info', '========================================');
@@ -792,28 +805,87 @@ async function solveOnePlatformRound() {
     addLog('success', '✅ 平台连接成功（whoami 通过）');
 
     // 1) 发现练习场（列题必须带 practice_ground_id）
+    // ⚠️ 只取第一个场会漏掉绝大部分题：实测平台有 6 个场，逆向题主要分布在
+    // BUUCTF（537 道，Easy 居多）和日常练习场（8 道）；只查第一个场只剩 3 道。
     addLog('info', '[1/6] 发现练习场...');
-    const groundsRes = await window.electronAPI.ctf2McpCall('ctf2_list_practice_grounds', { limit: 20 });
+    const groundsRes = await window.electronAPI.ctf2McpCall('ctf2_list_practice_grounds', { limit: 50 });
     if (groundsRes && groundsRes.success === false) { addLog('error', '列练习场失败: ' + groundsRes.error); return { ok: false, note: 'grounds-failed' }; }
     const groundsRaw = (groundsRes && groundsRes.result !== undefined) ? groundsRes.result : groundsRes;
-    const grounds = ctf2ExtractList(groundsRaw);
-    if (!grounds.length) { addLog('error', '未发现任何练习场'); return { ok: false, note: 'no-grounds' }; }
-    const ground = grounds.find(g => g && g.is_active !== false) || grounds[0];
-    const groundId = ground.id;
-    addLog('info', `练习场: ${ground.name || groundId}（共 ${grounds.length} 个场，本题库约 ${ground.challenge_count || '?'} 道）`);
-
-    // 2) 列逆向未解题（category=REVERSE + unsolved_only）
-    addLog('info', '[2/6] 拉取逆向未解题列表...');
-    const listRes = await window.electronAPI.ctf2McpCall('ctf2_list_practice_challenges', {
-      practice_ground_id: groundId, category: 'REVERSE', unsolved_only: true, limit: 30
+    const allGrounds = ctf2ExtractList(groundsRaw).filter(g => g && g.is_active !== false);
+    if (!allGrounds.length) { addLog('error', '未发现任何练习场'); return { ok: false, note: 'no-grounds' }; }
+    // 练习场优先级：显式 preferGround > 题量降序（大题库 Easy 多，先跑能快速拿到成功率）
+    // ⚠️ 之前按"发现顺序"取第一个场 → 永远先跑 8 道题的日常场（全是 Medium/Hard），
+    // 500+ 的 BUUCTF Easy 题永远轮不到（实测：连续两轮都卡在 not-baby-parallelism）。
+    const preferName = (state.config && state.config.platform && state.config.platform.preferGround) || '';
+    const ordered = allGrounds.slice().sort((a, b) => {
+      if (preferName) {
+        const pa = String(a.name || '').includes(preferName) ? 1 : 0;
+        const pb = String(b.name || '').includes(preferName) ? 1 : 0;
+        if (pa !== pb) return pb - pa;
+      }
+      return (Number(b.challenge_count) || 0) - (Number(a.challenge_count) || 0);
     });
-    if (listRes && listRes.success === false) { addLog('error', '拉取列表失败: ' + listRes.error); return { ok: false, note: 'list-failed' }; }
-    const raw = ctf2ParsePayload((listRes && listRes.result !== undefined) ? listRes.result : listRes);
-    const all = ctf2ExtractList(raw);
+    addLog('info', `发现 ${allGrounds.length} 个练习场：${allGrounds.map(g => `${g.name}(${g.challenge_count || '?'})`).join('、')}`);
+
+    // 逐个练习场找一个有未解逆向题的（拉不到就换下一个）
+    let ground = null, groundId = null, listRaw = null, listTotal = 0;
+    for (const g of ordered) {
+      try {
+        const lr = await window.electronAPI.ctf2McpCall('ctf2_list_practice_challenges', {
+          practice_ground_id: g.id, category: 'REVERSE', unsolved_only: true, limit: 50, page: 1
+        });
+        if (lr && lr.success === false) continue;
+        const parsed = ctf2ParsePayload((lr && lr.result !== undefined) ? lr.result : lr);
+        const arr = ctf2ExtractList(parsed);
+        const cands = arr.filter(ch => ctf2IsReverse(ch) && !ctf2IsSolved(ch) && ch.has_attachments);
+        addLog('info', `  场「${g.name}」：返回 ${arr.length} 条（total=${parsed && parsed.total}），可解 ${cands.length} 道`);
+        if (cands.length) { ground = g; groundId = g.id; listRaw = parsed; listTotal = parsed && parsed.total; break; }
+      } catch (e) { /* 换下一个场 */ }
+    }
+    if (!ground) {
+      addSystemMessage('**所有练习场都没有带附件的逆向未解题**');
+      addLog('warning', '所有练习场均无候选');
+      return { ok: false, note: 'no-candidates' };
+    }
+    addLog('info', `选定练习场: ${ground.name}（共 ${listTotal || '?'} 道逆向题）`);
+
+    // 2) 列逆向未解题（已在上一步拉取；此处只做过滤）
+    addLog('info', '[2/6] 过滤可解题目...');
+    // 分页：单页固定 50 条，537 道要 11 页。只取第 1 页会永远卡在同样的 50 道题上
+    //（实测：BUUCTF 537 道逆向题，page=1 永远是 easyre 开头那 50 道）。
+    // 用"已尝试题数"推算该翻到第几页——外部驱动会持续累加这个集合。
+    let all = ctf2ExtractList(listRaw);
+    const excludeSetEarly = (opts && opts.exclude instanceof Set) ? opts.exclude : new Set();
+    const attemptedCount = excludeSetEarly.size;
+    if (attemptedCount > 0) {
+      const wantPage = Math.floor(attemptedCount / 50) + 1;
+      const maxPage = Math.ceil((listTotal || 0) / 50) || 1;
+      if (wantPage <= maxPage && wantPage > 1) {
+        try {
+          const pr = await window.electronAPI.ctf2McpCall('ctf2_list_practice_challenges', {
+            practice_ground_id: groundId, category: 'REVERSE', unsolved_only: true, limit: 50, page: wantPage
+          });
+          const parsed2 = ctf2ParsePayload((pr && pr.result !== undefined) ? pr.result : pr);
+          const arr2 = ctf2ExtractList(parsed2);
+          if (arr2.length) { all = arr2; addLog('info', `翻页到 page=${wantPage}（${arr2.length} 条，已尝试 ${attemptedCount}）`); }
+        } catch (e) { /* 翻页失败就用第 1 页 */ }
+      }
+    }
     // 跳过清单：本地已人工解出/不想自动跑的题（state.platformSkipSet，UI 或控制台预置）
     const skipSet = (state.platformSkipSet instanceof Set) ? state.platformSkipSet : new Set();
-    const candidates = all.filter(ch => ctf2IsReverse(ch) && !ctf2IsSolved(ch) && ch.has_attachments && !skipSet.has(String(ch.name)));
-    const skippedNote = skipSet.size ? `（已跳过 ${[...skipSet].join(', ')}）` : '';
+    // 本轮已尝试过的题（失败后加入）：避免解不出时无限拉同一道题
+    const excludeSet = (opts && opts.exclude instanceof Set) ? opts.exclude : new Set();
+    // ⚠️ 跨进程去重：自动测试每题重启工具，内存里的 exclude 会丢 → 同一题被反复拉取
+    //（实测：not-baby-parallelism 连续跑了两轮）。失败/已尝试的题写进 config 持久化，
+    // 下次启动仍然排除；解题成功或用户手动清空时才移除。
+    const persistedSkip = new Set(
+      ((state.config && state.config.platform && state.config.platform.skipChallenges) || []).map(String)
+    );
+    const candidates = all.filter(ch => ctf2IsReverse(ch) && !ctf2IsSolved(ch) && ch.has_attachments
+      && !skipSet.has(String(ch.name)) && !excludeSet.has(String(ch.name))
+      && !persistedSkip.has(String(ch.name)));
+    const allSkipped = [...new Set([...skipSet, ...excludeSet, ...persistedSkip])];
+    const skippedNote = allSkipped.length ? `（已跳过 ${allSkipped.join(', ')}）` : '';
     addLog('info', `平台返回 ${all.length} 道逆向未解题，其中带附件 ${candidates.length} 道${skippedNote}` + (candidates.length ? `：${candidates.map(c => c.name).join(', ')}` : ''));
     if (!candidates.length) {
       addSystemMessage(`**无带附件的逆向未解题**\n\n练习场「${ground.name || groundId}」返回 ${all.length} 道逆向未解题，但均无附件（可能需要靶机）。当前流水线只处理带附件的题。`);
@@ -825,6 +897,8 @@ async function solveOnePlatformRound() {
     const ch = candidates[0];
     const cid = ch.id;
     addLog('info', `[3/6] 选定题目: ${ch.name}（难度 ${ch.difficulty || '?'}，${ch.friendly_id || cid}）`);
+    // 平台笔记：记录"开始解这道题"（凭据页要求留下可回看的 plan）
+    ctf2LogNote('plan', `开始分析 ${ch.name}（${ch.difficulty || '?'}）· 文件类型待识别`);
     state._platformChallenge = ch;   // 供失败提示注入/复盘取题名
     const detailRes = await window.electronAPI.ctf2McpCall('ctf2_get_practice_challenge', { challenge_id: cid, practice_ground_id: groundId });
     if (detailRes && detailRes.success === false) { addLog('error', '取题目详情失败: ' + detailRes.error); return { ok: false, note: 'detail-failed', challenge: { id: cid, name: ch.name } }; }
@@ -883,16 +957,26 @@ async function solveOnePlatformRound() {
     if (downloaded.length > 1) {
       const typeWeight = (p) => {
         const ext = String(p).toLowerCase();
-        if (/\.(zip|apk|jar|xlsx|docx|pptx)$/.test(ext)) return 5;
-        if (/\.(pyc|dex|jar)$/.test(ext)) return 5;
+        if (/\.(zip|apk|jar|xlsx|docx|pptx|rar|7z)$/.test(ext)) return 5;
+        if (/\.(pyc|dex)$/.test(ext)) return 5;
         if (!/\.[a-z0-9]{1,5}$/.test(ext)) return 5;              // 无扩展名 = ELF/PE 常见
-        if (/\.(txt|enc|json|xml|log|md)$/.test(ext)) return 1;   // 文本 = 伴生密文/提示
+        // RSA/密码学题常见组合：flag.enc + pub.key / private.pem / cipher.txt。
+        // 主文件应是**可执行体或密文**，密钥是"辅助材料"——但两者都要给 AI。
+        if (/\.(pem|key|pub|crt|cer|der)$/.test(ext)) return 2;
+        if (/\.(txt|enc|bin|dat|json|xml|log|md)$/.test(ext)) return 3;
         return 3;
       };
       downloaded.sort((a, b) => typeWeight(b) - typeWeight(a));
       localFile = downloaded[0];
       addLog('info', `[多附件] 主文件: ${localFile.split('\\').pop()}，伴生: ${downloaded.slice(1).map(p => p.split('\\').pop()).join(', ')}`);
       state._platformFiles = downloaded.slice();                  // 全部登记（AI 可 read_file）
+      // 密码学类题（有 .enc/.key/.pem 而无二进制）：直接走 RSA/密码分析提示，而不是硬套 ELF/PE 流程
+      const hasCryptoPair = downloaded.some(p => /\.(enc|key|pem|pub|crt|cer|der)$/i.test(p))
+        && !downloaded.some(p => /\.(exe|dll|elf|so|apk|dex)$/i.test(p));
+      if (hasCryptoPair) {
+        addLog('info', '[多附件] 识别为密码学材料组合（密文+密钥），走 crypto 分析路径');
+        state._platformCryptoMaterials = downloaded.slice();
+      }
     }
 
     // 5) 走现有逆向解题流程（analyzeFile 识别类型 → autoAnalyze 分派 → finalizeSolve 验证）
@@ -922,6 +1006,8 @@ async function solveOnePlatformRound() {
       submitResult = { flag: f.flag, correct: ok, raw: s.slice(0, 400) };
       addLog(ok ? 'success' : 'warning', `提交 ${f.flag} → ${s.slice(0, 200)}`);
       addSolveNote('平台提交', `challenge=${ch.name} flag=${f.flag} result=${s.slice(0, 200)}`);
+      // 平台笔记：记录解题结果（凭据页要求 result 可回看）
+      ctf2LogNote('result', `${ch.name} · ${ok ? '解出并提交成功' : '提交未通过'} · flag=${f.flag}`);
       addSystemMessage(ok
         ? `**🎯 题目「${ch.name}」已解出并提交成功**\n\n\`${f.flag}\``
         : `**题目「${ch.name}」提交结果**\n\n\`${f.flag}\`\n\n平台返回: ${s.slice(0, 300)}`);
@@ -941,17 +1027,32 @@ async function solveOnePlatformRound() {
   }
 }
 
-// 循环模式：拉题 → 解题 → 提交 → （平台判对）→ 清理外部工具 → 下一题。
-// state.platformLoop 由 UI 开关置位；每轮之间检查 flowAbortRequested / platformLoop。
-// 「平台判对」是继续的必要条件：提交被判错或没解出来都会停（避免在同一难度上空转烧配额）。
+// 循环模式：拉题 → 解题 → 提交 → 清理外部工具 → 下一题。
+// 两种继续策略：
+//   · 默认（自动测试模式 state.platformSkipOnFail=true）：**解不出也继续下一题**，
+//     只把失败题加入本轮跳过集合，避免在同一题反复空转（用户明确要求"求解不出来的自动跳过"）。
+//   · 严格模式：只在平台判对后继续（避免空转烧配额）。
+// 每轮之间检查 flowAbortRequested / state.platformAbort。
 async function solveOneFromPlatform() {
   if (state.platformBusy) { addLog('warning', '平台拉题流程进行中，请稍候'); return; }
   state.platformBusy = true;
   const loopMode = !!state.platformLoop;
+  // 自动测试模式：失败继续；严格模式：失败即停
+  const skipOnFail = state.platformSkipOnFail !== false;
+  // 本轮已尝试过的题目（失败后加入，下一轮排除，防止无限拉同一道）
+  const attempted = new Set();
   try {
-    let total = 0, solved = 0;
+    let total = 0, solved = 0, skipped = 0;
+    const limit = Number(state.platformLoopLimit) || 50;
     do {
-      if (state.flowAbortRequested) { addLog('info', '[平台] 收到停止信号，结束循环'); break; }
+      if (state.flowAbortRequested || state.platformAbort) {
+        addLog('info', '[平台] 收到停止信号，结束循环');
+        break;
+      }
+      if (total >= limit) {
+        addLog('info', `[循环] 已达本轮上限 ${limit} 题，结束`);
+        break;
+      }
       // 每轮开始前强制清理外部工具（IDA/JEB/java）：上一题若未清（如本轮是循环首轮但用户之前
       // 手动跑过），旧 IDA 会占住 13337，新 IDA 实例连不上 MCP → 采集打到旧题目的库上。必须先清。
       try {
@@ -959,47 +1060,196 @@ async function solveOneFromPlatform() {
         if (cl0 && cl0.killed && cl0.killed.length) addLog('info', '[循环] 轮前清理外部工具: ' + cl0.killed.join(', '));
       } catch (e) { /* 清理失败不阻塞 */ }
       if (total > 0) {
-        addLog('info', `[循环] 等待 5 秒后开始下一题...`);
-        await new Promise(r => setTimeout(r, 5000));
+        addLog('info', `[循环] 等待 3 秒后开始下一题...`);
+        await new Promise(r => setTimeout(r, 3000));
       }
       state.flowAbortRequested = false;   // 每轮开始清零：停止信号只作用于"当前这轮的边界"
-      const r = await solveOnePlatformRound();
+      const r = await solveOnePlatformRound({ exclude: attempted });
       total++;
-      // 无论本题成败都清理（未解出也会走 break——清理放 break 之前）
+      const chName = (r && r.challenge && r.challenge.name) || 'unknown';
+      // 无论本题成败都清理（未解出也会走 skip/break——清理放前面）
       try {
         const cl = await window.electronAPI.ctf2CleanupTools();
         addLog('info', `[循环] 题后清理外部工具进程: ${(cl && cl.killed && cl.killed.length) ? cl.killed.join(', ') : '（无运行中的）'}`);
       } catch (e) { /* 清理失败不阻塞 */ }
       if (r && r.ok) {
         solved++;
-        addLog('success', `[循环] ✅ ${r.challenge.name} 已解出并提交成功（累计 ${solved}/${total}）`);
+        attempted.add(chName);
+        addLog('success', `[循环] ✅ ${chName} 已解出并提交成功（累计 ${solved}/${total}）`);
         // 成长闭环②：曾失败过的题解出 → 自动复盘证伪（清除被证伪的污染经验，沉淀复盘教训）
         if (state.lastAiText) {
-          try { await postSolveReview(r.challenge.name, state.lastAiText); } catch (e) { /* 复盘失败不阻塞 */ }
+          try { await postSolveReview(chName, state.lastAiText); } catch (e) { /* 复盘失败不阻塞 */ }
         }
       } else {
+        const note = (r && r.note) || 'unknown';
+        const structuralFail = ['no-attachment', 'no-candidates', 'no-grounds', 'connect-failed',
+          'grounds-failed', 'list-failed', 'detail-failed', 'download-failed'].includes(note);
         // 成长闭环①：失败存档（方向结论），下次拉到同题自动注入"已排除的路"。
-        // 仅当 AI 真正产出过分析（lastAiText 非空）才存档——no-attachment/download-failed
-        // 这类"结构性失败"没有方向结论可言，存档只会在复盘时误导 AI 判定。
-        const structuralFail = ['no-attachment', 'no-candidates', 'no-grounds', 'connect-failed', 'grounds-failed', 'list-failed', 'detail-failed', 'download-failed'].includes((r && r.note) || '');
+        // 仅当 AI 真正产出过分析（lastAiText 非空）才存档——结构性失败没有方向结论可言。
         if (!structuralFail && state.lastAiText) {
           try {
-            await recordFailure(r && r.challenge ? r.challenge.name : (state.fileInfo && state.fileInfo.fileName), state.lastAiText, (r && r.note) || '');
+            await recordFailure(chName, state.lastAiText, note);
           } catch (e) { /* 存档失败不阻塞 */ }
         }
-        addLog('warning', `[循环] 本题未解出（${(r && r.note) || 'unknown'}），循环模式在此停止`);
-        if (loopMode) addSystemMessage('**循环停止**\n\n本题未解出（提交判错或未得到已验证 flag）。连续模式只在"平台判对"后继续，避免卡在同一题空转。\n\n本题的失败方向已存档——下次再拉到它会自动注入"已排除的路"，并可发「复盘」对照官方题解证伪。');
-        break;
+        // 结构性失败（无题可拉）→ 直接结束，继续也没有意义
+        if (['no-candidates', 'no-grounds', 'connect-failed', 'grounds-failed', 'list-failed'].includes(note)) {
+          addLog('warning', `[循环] 无法继续拉题（${note}），结束`);
+          break;
+        }
+        if (!loopMode) {
+          addLog('warning', `[循环] 本题未解出（${note}）`);
+          break;
+        }
+        if (!skipOnFail) {
+          addLog('warning', `[循环] 本题未解出（${note}），严格模式下停止`);
+          addSystemMessage('**循环停止**\n\n本题未解出。严格模式只在"平台判对"后继续，避免卡在同一题空转。');
+          break;
+        }
+        // 自动测试模式：跳过本题，继续下一题
+        skipped++;
+        attempted.add(chName);
+        addLog('warning', `[循环] ⏭ ${chName} 未解出（${note}），已跳过，继续下一题（跳过 ${skipped}）`);
       }
     } while (loopMode);
     if (loopMode) {
-      addLog('info', `[循环] 结束：共尝试 ${total} 题，解出 ${solved} 题`);
-      addSystemMessage(`**循环解题结束**\n\n尝试 ${total} 题，解出 ${solved} 题。`);
+      addLog('info', `[循环] 结束：共尝试 ${total} 题，解出 ${solved} 题，跳过 ${skipped} 题`);
+      addSystemMessage(`**循环解题结束**\n\n尝试 ${total} 题，解出 **${solved}** 题，跳过 ${skipped} 题。`);
     }
+    state._lastPlatformRun = { total, solved, skipped, at: new Date().toISOString() };
   } finally {
     state.platformBusy = false;
+    state.platformAbort = false;
   }
 }
+
+// ============ 自动测试入口（控制台/自动化脚本调用）============
+// 用法（DevTools 控制台）：
+//   await window.__ctfAutoTest({ limit: 10, quitAfterEach: true })
+// 行为：逐题 拉取→分析→求解→提交；解不出自动跳过下一题；每题结束（含失败）后退出进程。
+// 为什么要每题退出：IDA/JEB 的 MCP 端口（13337/16161）在进程退出后不一定立刻释放，
+// 长时间连续跑会累积僵尸实例；每题重启一次最稳（代价 ~5s 启动时间）。
+async function __ctfAutoTest(opts = {}) {
+  const limit = Number(opts.limit) || 20;
+  const quitAfterEach = opts.quitAfterEach !== false;
+  const results = [];
+  state.platformLoop = true;
+  state.platformSkipOnFail = true;
+  state.platformLoopLimit = 1;          // 每轮只做一题，便于逐题退出
+  state.platformAbort = false;
+
+  // 外部驱动传入的"已尝试题名"（跨进程持久化）：500+ 题必须靠它做分页与去重，
+  // 否则每题重启后都从第 1 页第 1 道开始，永远在原地打转。
+  const seedExclude = Array.isArray(opts.exclude) ? opts.exclude.map(String) : [];
+  const attempted = new Set(seedExclude);
+
+  for (let i = 0; i < limit; i++) {
+    if (state.platformAbort) break;
+    const r = await (async () => {
+      // 直接复用单轮逻辑（内部已含清理与失败存档）
+      state.platformBusy = true;
+      try {
+        // 先传"本次运行产生的"排除集；种子排除集由 solveOnePlatformRound 内部读 config 处理，
+        // 这里把两者合并，保证翻页位置也对（attempted.size 决定 page）。
+        const round = await solveOnePlatformRound({ exclude: attempted });
+        return round || { ok: false, note: 'null-round' };
+      } catch (e) {
+        return { ok: false, note: 'exception: ' + e.message };
+      } finally {
+        state.platformBusy = false;
+      }
+    })();
+
+    const name = (r.challenge && r.challenge.name) || '(unknown)';
+    results.push({
+      name, ok: !!r.ok, note: r.note || '',
+      flag: (r.submitted && r.submitted.flag) || (r.verified_flags && r.verified_flags[0]) || '',
+      difficulty: (r.challenge && r.challenge.difficulty) || '',
+    });
+    addLog(r.ok ? 'success' : 'warning',
+      `[自动测试] ${i + 1}/${limit} ${name}: ${r.ok ? '解出' : '跳过（' + (r.note || '') + '）'}`);
+
+    // 结构性失败（无题可拉）→ 提前结束
+    if (['no-candidates', 'no-grounds', 'connect-failed', 'grounds-failed', 'list-failed'].includes(r.note)) break;
+
+    // 跨进程去重：把"本轮已尝试过"写进 config.platform.skipChallenges，
+    // 否则每题重启工具后 exclude 丢失 → 同一题被反复拉取（实测 not-baby-parallelism 连跑两轮）。
+    if (name && name !== '(unknown)') {
+      try {
+        const cur = ((state.config && state.config.platform && state.config.platform.skipChallenges) || []).slice();
+        if (!cur.includes(name)) {
+          cur.push(name);
+          state.config = state.config || {};
+          state.config.platform = state.config.platform || {};
+          state.config.platform.skipChallenges = cur;
+          state.platformSkipSet = new Set(cur.map(String));
+          if (window.electronAPI && window.electronAPI.saveConfig) {
+            await window.electronAPI.saveConfig({ platform: { skipChallenges: cur } });
+          }
+          addLog('info', `[自动测试] 已记录「${name}」到跳过清单（${cur.length} 条），下次启动不再重复拉取`);
+        }
+      } catch (e) { /* 记录失败不阻塞 */ }
+    }
+
+    // 存档本轮报告（供外部脚本读取）
+    // ⚠️ 改走主进程 IPC：渲染层 state.appPaths.userData 在 getAppPaths 失败时为空，
+    // 会导致 report 静默不写 → 外部驱动只能干等到超时（实测 20 秒结束的题等了 10 分钟）。
+    try {
+      const report = {
+        at: new Date().toISOString(),
+        total: results.length,
+        solved: results.filter(x => x.ok).length,
+        skipped: results.filter(x => !x.ok).length,
+        results,
+      };
+      if (window.electronAPI && window.electronAPI.autotestReport) {
+        await window.electronAPI.autotestReport(report);
+      } else if (window.electronAPI && window.electronAPI.writeFile) {
+        const dir = (state.appPaths && state.appPaths.userData) || '';
+        if (dir) await window.electronAPI.writeFile(dir + '/autotest-report.json', JSON.stringify(report, null, 2));
+      }
+    } catch (e) { /* 报告写失败不阻塞 */ }
+
+    // 每题结束都退出（quitAfterEach），由外部驱动重新拉起下一题。
+    // ⚠️ 旧实现写成 i < limit - 1，当 limit=1 时恒 false → 工具永不退出（实测卡住）。
+    // 外部驱动按"一次只跑一题"的方式调用，所以只要本函数结束就应退出。
+    if (quitAfterEach) {
+      addLog('info', '[自动测试] 本题结束，关闭工具进程...');
+      try {
+        await window.electronAPI.ctf2CleanupTools();
+      } catch (e) { }
+      // 先落盘最终报告（退出后外部驱动靠它读结果）
+      try {
+        const report = {
+          at: new Date().toISOString(),
+          total: results.length,
+          solved: results.filter(x => x.ok).length,
+          skipped: results.filter(x => !x.ok).length,
+          results,
+        };
+        const dir = (state.appPaths && state.appPaths.userData) || '';
+        if (dir && window.electronAPI.writeFile) {
+          await window.electronAPI.writeFile(dir + '/autotest-report.json', JSON.stringify(report, null, 2));
+        }
+      } catch (e) { }
+      try {
+        await window.electronAPI.quitApp();
+      } catch (e) { /* 退出失败则继续（外部脚本兜底 taskkill） */ }
+      return { finished: true, ...{ total: results.length, solved: results.filter(x => x.ok).length, skipped: results.filter(x => !x.ok).length, results } };
+    }
+  }
+
+  state.platformLoop = false;
+  const summary = {
+    at: new Date().toISOString(),
+    total: results.length,
+    solved: results.filter(x => x.ok).length,
+    skipped: results.filter(x => !x.ok).length,
+    results,
+  };
+  addLog('info', `[自动测试] 结束：共 ${summary.total} 题，解出 ${summary.solved}，跳过 ${summary.skipped}`);
+  return { finished: true, ...summary };
+}
+window.__ctfAutoTest = __ctfAutoTest;
 
 // MCP 返回的 content[].text 常是 JSON 字符串 → 先解一层
 function ctf2ParsePayload(x) {
@@ -1011,6 +1261,17 @@ function ctf2ParsePayload(x) {
 // → analyzeFile+autoAnalyze 继续流程。渲染层无 Node 能力：解压走 ctf2Unzip IPC，
 // 文件头魔数走 readFile 读 base64？——readFile 返回 utf8 文本，二进制会坏 → 魔数判定改在主进程做。
 async function analyzeZipHandout(zipPath) {
+  // 防无限循环（实测 CrackMe4：解压目录里又出现同名 zip → analyzeFile → 再解压 → 死循环，
+  // 8 分钟内 analyzeFile 被调用 69 次、解压 3 次，整轮批量卡死在这里）。
+  // 判据：同一路径最多解压一次；解压后主文件若仍是同一个 zip（自引用），直接放弃。
+  state._zipHandoutSeen = state._zipHandoutSeen || new Set();
+  const normZip = String(zipPath || '').toLowerCase();
+  if (state._zipHandoutSeen.has(normZip)) {
+    addLog('warning', '[zip手包] 同一压缩包已处理过，跳过（防循环）: ' + zipPath);
+    return;
+  }
+  state._zipHandoutSeen.add(normZip);
+
   addLog('info', '[zip手包] 解压: ' + zipPath);
   const r = await window.electronAPI.ctf2Unzip(zipPath);
   if (!r || !r.success) {
@@ -1023,6 +1284,13 @@ async function analyzeZipHandout(zipPath) {
   if (!files.length) { addLog('warning', '[zip手包] 解压后为空'); return; }
   // 主进程已按"可分析优先级"排好序（ctf2-unzip 返回 files[0] 即最佳候选）
   const main = files[0];
+  // 自引用防护：解压出来的"主文件"若又是同一个压缩包（或仍以 .zip 结尾且与源同名），
+  // 继续 analyzeFile 会再次进入本函数 → 无限递归。直接放弃，交给人工/上层处理。
+  if (String(main || '').toLowerCase() === normZip
+    || (/\.zip$/i.test(String(main)) && String(main).toLowerCase().includes(String(zipPath).toLowerCase().replace(/\.zip$/, '').split(/[\\/]/).pop()))) {
+    addLog('warning', '[zip手包] 解压结果是自引用压缩包，停止（防递归）: ' + main);
+    return;
+  }
   addLog('success', '[zip手包] 选定主文件: ' + String(main).split('\\').pop());
   // 同包其它文件（输入样例/数据/说明）登记到平台上下文，供提示词与 Tool-Use AI 取用
   // 教训（not-baby-parallelism）：flag.out/input.bin 这类伴生文件被无视，AI 明确要"配套输入输出"
@@ -3697,18 +3965,65 @@ async function analyzeJavaLike(fileType, fileLabel) {
   }
 
   if (!classes || !classes.length) {
-    // 降级：JEB 不可用 → 启动 jadx 给人工，但不走 AI（无数据时调 AI 只会臆测 flag）
-    addLog('warning', 'JEB MCP 未取得类列表，降级为 jadx 静态反编译（AI 求解跳过）');
-    addSystemMessage(`**${label} 分析：JEB 未就绪**
+    // 降级链：JEB MCP 不可用 → jadx **命令行**反编译出源码 → 交给 AI 求解。
+    // ⚠️ 旧实现只 `launchTool('jadx')` 打开 GUI 然后 return，等于"AI 求解跳过"——
+    // 实测批量里 10+ 道 JAR/APK 题因此 30 秒内草草结束（JEB 超时 → 直接放弃）。
+    addLog('warning', 'JEB MCP 未取得类列表，降级为 jadx 命令行反编译 + AI 求解');
+    try {
+      const jadxPath = (state.config && state.config.tools && state.config.tools.jadx) || '';
+      if (jadxPath) {
+        const outDir = (state.caseDir || (state.appPaths && state.appPaths.userData) || '.') + '/jadx_out';
+        addLog('info', `[jadx] 反编译到 ${outDir} ...`);
+        const jr = await window.electronAPI.runToolArgs([jadxPath, '-d', outDir, '--no-res', state.currentFile], { timeout: 300000 });
+        if (jr && jr.success) {
+          // 收集 .java 源码（限制总量，避免撑爆上下文）
+          let code = '';
+          try {
+            // 无 glob API：用 grep-in-dir 列出所有 class 声明所在文件（返回 "file:line: text" 字符串数组）
+            const gr = await window.electronAPI.grepInDir(outDir, '^\\s*(public\\s+)?(final\\s+)?class\\s+\\w+');
+            const files = [];
+            if (gr && gr.success && Array.isArray(gr.hits)) {
+              for (const h of gr.hits) {
+                const f = String(h).split(':')[0];
+                if (f && f.toLowerCase().endsWith('.java') && !files.includes(f)) files.push(f);
+              }
+            }
+            const picked = files.slice(0, 40);
+            for (const f of picked) {
+              const rf = await window.electronAPI.readFile(f);
+              if (rf && rf.success) {
+                code += `\n// ==== ${String(f).split(/[\\/]/).pop()} ====\n` + String(rf.content || '').slice(0, 6000);
+                if (code.length > 60000) break;
+              }
+            }
+          } catch (e) { /* 收集失败则只用 stdout */ }
+          if (!code && jr.stdout) code = String(jr.stdout).slice(0, 30000);
+          if (code.trim()) {
+            addLog('success', `[jadx] 已获取 ${code.length} 字符源码，交给 AI 分析`);
+            const prompt = `以下是 JADX 反编译出的 Java 源码（题目：${label}）。请找出 flag 的生成/校验逻辑并求解。\n\n\`\`\`java\n${code.slice(0, 60000)}\n\`\`\`\n\n输出契约：\n1. 得到 flag 单独一行 \`[FLAG]flag内容[/FLAG]\`\n2. 附 \`${VERIFY_CONTRACT}\`（工具会本地复现）\n3. 做不出要写清卡在哪一步、已排除哪些路线`;
+            beginStreamMessage();
+            const res = await window.electronAPI.claudeChat([{ role: 'user', content: prompt }], buildSystemPrompt());
+            endStreamMessage();
+            if (res && res.success && res.text) {
+              state.lastAiText = res.text;
+              await finalizeSolve(res.text, { source: 'ai-jadx' });
+              const vf = ((state.findings && state.findings.flags) || []).filter(f => f.verified);
+              if (vf.length) { addLog('success', `[jadx] ✅ 解出已验证 flag: ${vf[0].flag}`); return; }
+            }
+            addLog('warning', '[jadx] AI 未产出已验证 flag');
+            return;
+          }
+        }
+        addLog('warning', '[jadx] 反编译失败或无源码输出');
+      }
+    } catch (e) { addLog('warning', '[jadx] 降级流程异常: ' + e.message); }
 
-未能通过 JEB MCP 采集类列表（JEB 会自动拉起，首次约 1~2 分钟；也可在设置中确认 tools.jeb）。
+    // 最后兜底：打开 jadx GUI 供人工
+    addSystemMessage(`**${label} 分析：JEB/JADX 均不可用**
 
-已退回 **jadx** 静态反编译，请手动查看：
-- 搜索 \`flag\` / \`encrypt\` / \`password\` / \`key\`
-- 定位 main 与校验逻辑
-- 需要时输入"生成解密脚本"
+未能通过 JEB MCP 采集类列表，jadx 命令行反编译也未产出源码。
 
-> 提示：配好 JEB 后重试，可自动走"采集 → AI 求解 → 本地验证"闭环。`);
+请检查设置中的 tools.jeb / tools.jadx 路径。`);
     try { await window.electronAPI.launchTool('jadx', state.currentFile); } catch (e) { /* 忽略 */ }
     return;
   }
@@ -6256,7 +6571,15 @@ ${mcpCache.nativeIntel.decompiled && mcpCache.nativeIntel.decompiled.length ? '�
     } catch (e) { addLog('warning', '重生成异常: ' + e.message); }
   }
   const cryptoParams = pickCryptoParams();
-  const hookTargets = extractHookTargets(analysisData, packageName);
+  // ⚠️ analysisData 是 analyzeAPK 的局部变量，本函数（autoFridaStage）拿不到：
+  // 直接引用会抛 "analysisData is not defined"，把整个 APK 解题流程吞掉
+  //（实测：2 道 APK 题都因此报 exception 中断）。这里按可用的全局状态重建最小对象。
+  const fridaAnalysisCtx = {
+    packageName: packageName || null,
+    classes: (mcpCache && Array.isArray(mcpCache.classes)) ? mcpCache.classes : [],
+    manifest: (mcpCache && mcpCache.manifest) || null,
+  };
+  const hookTargets = extractHookTargets(fridaAnalysisCtx, packageName);
   if (!vres.ok) {
     // 语法失败 → 已经不在此处直接落"固定模板"了：上面的重试循环已带错误+情报重生成多次。
     // 仅当所有重试都失败，才用"情报增强版"兜底模板（会优先 hook 题目已知的类/方法/native）。
@@ -6845,7 +7168,19 @@ ${mcpCache.nativeIntel.globals && mcpCache.nativeIntel.globals.length ? `\n## SO
    \`${VERIFY_CONTRACT}\`
 3. 多个候选组合：\`[HYPOTHESES][{...},{...}][/HYPOTHESES]\`
 4. 回答最后输出 \`[EXPERIENCE]...[/EXPERIENCE]\`（每条一行，最多5条）
-不要臆造工具结果；工具失败时换一条路径继续，不要重复同一失败写法。`;
+不要臆造工具结果；工具失败时换一条路径继续，不要重复同一失败写法。
+
+**⚠️ 收工门槛（实测教训：上一轮 50 秒就收工、零验证数据，等于白跑）**
+在给出最终回答前，自检以下三条，**任一不满足就不许收工，继续调用工具**：
+1. 你**至少真正跑过一次**能产出 flag 的脚本（run_python/bash），并把真实输出贴出来；
+   只"阅读代码后推断"不算解出。
+2. 若已定位算法/密钥，必须给出 \`[VERIFY]\` 契约（哪怕 expected 只是 flag 前缀）；
+   给不出说明你还没真正验证过，继续分析。
+3. 若确实做不出来，必须写清**卡在哪一步**：
+   - 缺什么数据（哪个函数/表/偏移没拿到）
+   - 已排除哪些路线（算法×参数组合）
+   - 下一步该试什么
+   只写"未找到 flag"会被判为无效结论。`;
 
   try {
     state.aiBusy = true;
@@ -7064,14 +7399,21 @@ async function autoSolveBinaryFlag(fileType) {
     };
     const pickedThunkCount = keyFuncs.filter(f => /^j_/i.test(nameOfF(f)) || (sizeOfF(f) >= 0 && sizeOfF(f) <= 12)).length;
     if (pickedThunkCount >= Math.ceil(keyFuncs.length / 2)) {
-      const subs = analysisData.functions
-        .filter(f => /^sub_[0-9a-f]+$/i.test(nameOfF(f)))
-        .sort((a, b) => sizeOfF(b) - sizeOfF(a))     // 体积大 → 更像真主体
-        .slice(0, 8)
+      // ⚠️ 不能只认 sub_*：not-baby-parallelism 的题目逻辑是普通命名（如 main/函数指针回调），
+      // 用 sub_* 过滤会得到 0 个候选，AI 仍然拿不到主体。
+      // 改为"所有非库函数按体积降序"——体积大 = 逻辑多，这是跨编译器的通用判据。
+      const libNoise = /^(printf|scanf|malloc|calloc|realloc|free|memcpy|memmove|memset|strlen|strcmp|strcpy|strcat|puts|putchar|exit|abort|rand|srand|getopt|__|_IO_|_ZNS|_ZNSt|_ZSt)/;
+      const bodyCands = analysisData.functions
+        .filter(f => {
+          const n = nameOfF(f);
+          return n && !libNoise.test(n) && !/^j_/i.test(n) && sizeOfF(f) > 12;
+        })
+        .sort((a, b) => sizeOfF(b) - sizeOfF(a))
+        .slice(0, 10)
         .map(nameOfF);
       const have = new Set(keyFuncs.map(nameOfF));
-      const extra = subs.filter(n => !have.has(n));
-      addLog('info', `[采集] 入选函数多为 thunk 桩（${pickedThunkCount}/${keyFuncs.length}），追加 ${extra.length} 个体积最大的 sub_* 主体函数`);
+      const extra = bodyCands.filter(n => !have.has(n));
+      addLog('info', `[采集] 入选函数多为 thunk 桩（${pickedThunkCount}/${keyFuncs.length}），追加 ${extra.length} 个体积最大的主体函数`);
       for (const n of extra) keyFuncs.push(n);
     }
 
@@ -9632,7 +9974,24 @@ function attributeFailure(output, attempts) {
   if (errFails.length) {
     const byReason = {};
     for (const f of errFails) { const k = f.reason.split(':')[0]; byReason[k] = (byReason[k] || 0) + 1; }
-    hints.push(`解密阶段报错 ${errFails.length} 次（${Object.entries(byReason).map(([k, v]) => k + '×' + v).join(', ')}）→ 多为参数形态不匹配（key 长度/编码/函数签名），不是算法错`);
+    // 区分两类：
+    //   · **代码缺陷**（ZeroDivision/Index/Key/Type/Attribute/Name/UnboundLocal）——
+    //     AI 生成的脚本本身写错了，应该修代码，不是换算法。
+    //     实测（not-baby-parallelism）：`post//src if post%src==0`，src=0 直接崩。
+    //   · **参数形态不匹配**（ValueError，如 key 长度 8 字节、IV 非 16 字节）——
+    //     算法可能对，是喂进去的参数不对。
+    const codeBugs = errFails.filter(f => /ZeroDivisionError|IndexError|KeyError|TypeError|AttributeError|NameError|UnboundLocal/.test(f.reason));
+    const paramErrs = errFails.filter(f => !codeBugs.includes(f));
+    if (codeBugs.length) {
+      const kinds = [...new Set(codeBugs.map(f => f.reason.split(':')[0]))];
+      hints.push(`AI 生成的脚本有 Python 运行时缺陷 ${codeBugs.length} 次（${kinds.join(', ')}）→ **先修代码再重试**：`
+        + '检查除零/越界/空列表索引；对 `a/b`、`a%b` 先判 b!=0；对 `arr[i]` 先判边界；'
+        + '不要因为脚本崩溃就判定算法错。');
+    }
+    if (paramErrs.length) {
+      const kinds = [...new Set(paramErrs.map(f => f.reason.split(':')[0]))];
+      hints.push(`解密阶段报错 ${paramErrs.length} 次（${kinds.join(', ')}）→ 多为参数形态不匹配（key 长度/编码/函数签名），不是算法错`);
+    }
   }
   if (garbage > 0) hints.push(`解出乱码 ${garbage} 次 → 算法或 key/iv 选错（若全部乱码，优先换算法族而不是换 key）`);
   if (empty > 0) hints.push(`解出空串 ${empty} 次 → 密文/偏移取错，或该候选不是这条数据`);
@@ -10132,25 +10491,63 @@ function idaCollectRefAddrs(results) {
 // 反编译入口函数。入口名随工具链而异（mingw→_main、MSVC→main/_WinMainCRTStartup），
 // 逐个候选尝试，命中「有代码」即返回；全失败时退回函数表里形如 main 的符号。
 async function decompileEntryFunction(functionList) {
-  const candidates = ['main', '_main', '__main', 'wmain', '_wmain', 'WinMain', '_WinMain@16',
-    '_WinMainCRTStartup', '__tmainCRTStartup', '_mainCRTStartup', 'start', '_start'];
+  // ⚠️ 顺序很重要：`start`/`_start` 是 CRT 启动桩（只调 __libc_start_main 后转 main），
+  // 反编译它得到的是 508 字符的汇编壳，题目逻辑完全看不到。
+  // 实测（not-baby-parallelism）：只反编译到 start → AI 拿不到任何题目函数。
+  // 因此把真正的用户入口（main/_main/wmain…）排在前面，CRT 桩放最后兜底。
+  const candidates = ['main', '_main', '__main', 'wmain', '_wmain', 'WinMain', '_WinMain@16'];
   if (Array.isArray(functionList)) {
+    // 从函数表里找所有"像用户入口"的名字（含 main 但排除 CRT/运行时）
     for (const f of functionList) {
       const n = String((f && f.name) || '');
-      if (n && /^_*(win)?main(_?crtstartup)?@?\d*$/i.test(n) && !candidates.includes(n)) {
-        candidates.push(n);
-      }
+      if (!n) continue;
+      if (/^_*(win)?main(@\d+)?$/i.test(n) && !candidates.includes(n)) candidates.push(n);
     }
   }
+  // 最后才考虑 CRT 启动桩
+  candidates.push('_WinMainCRTStartup', '__tmainCRTStartup', '_mainCRTStartup', 'start', '_start');
+
   for (const name of candidates) {
     try {
       const r = await window.electronAPI.idaMcpCall('decompile', { address: name });
       if (r && r.success) {
         const code = idaPickCode(r.result);
-        if (code) return { name, code, raw: r.result };
+        // CRT 桩内容极短且只剩 __libc_start_main 调用时，继续找下一个候选
+        if (code) {
+          const looksLikeCrtStub = /__libc_start_main|__scrt_common_main/i.test(code) && code.length < 900;
+          if (looksLikeCrtStub) continue;
+          return { name, code, raw: r.result };
+        }
       }
     } catch (e) {
       // 换下一个候选名
+    }
+  }
+  // 所有候选都失败 → 退回"体积最大的非库函数"作为主体
+  if (Array.isArray(functionList) && functionList.length) {
+    const sizeOf = f => {
+      const raw = (f && (f.size ?? f.length));
+      if (raw == null || raw === '') return -1;
+      const s = String(raw).trim();
+      const v = /^0x/i.test(s) ? parseInt(s, 16) : parseInt(s, 10);
+      return Number.isFinite(v) ? v : -1;
+    };
+    const noise = /^(printf|scanf|malloc|free|memcpy|memset|strlen|strcmp|__|_IO_|printf|puts|exit|abort|rand|srand|getopt)/i;
+    const best = functionList
+      .filter(f => {
+        const n = String((f && f.name) || '');
+        return n && !noise.test(n) && sizeOf(f) > 0;
+      })
+      .sort((a, b) => sizeOf(b) - sizeOf(a))[0];
+    if (best) {
+      const n = String(best.name || best);
+      try {
+        const r = await window.electronAPI.idaMcpCall('decompile', { address: n });
+        if (r && r.success) {
+          const code = idaPickCode(r.result);
+          if (code) return { name: n + '（体积最大的非库函数，入口未识别）', code, raw: r.result };
+        }
+      } catch (e) { }
     }
   }
   return null;

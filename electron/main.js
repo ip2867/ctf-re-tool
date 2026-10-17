@@ -1311,23 +1311,26 @@ function findCiphertextCandidate(buf, size, hints) {
   keyLike.sort((a, b) => b.score - a.score);
   const tailCands = [];
   for (const k of keyLike.slice(0, 6)) {   // 只试最像口令的前 6 个 key（避免全文件噪声）
-    // 从 key 末尾往后 16..512 字节内找高熵块（跳过全零填充）。
-    // 长度**由数据决定**（连续高熵块的最大长度），不再假设 48/64/32 ——
-    // 这是此前的题目特解：那些数字恰好等于 Disguise 的密文长度。
-    for (let start = k.off + 16; start < Math.min(size - 32, k.off + 512); start += 4) {
-      // 跳过全零
-      let allZero = true;
-      for (let z = 0; z < 8; z++) if (buf[start + z] !== 0) { allZero = false; break; }
-      if (allZero) continue;
+    // 起点判据：**跳过 key 之后的连续零填充，第一个非零字节就是密文起点**。
+    // 这比"按 4/16 字节对齐"更可靠（实测两种布局都命中）：
+    //   · Disguise：key@0xfa00 → 8 字节零 → 密文@0xfa18（非 16 对齐）
+    //   · 合成样本：key@0x2190 → 32 字节零 → 密文@0x21c0（16 对齐）
+    // 之前两次踩坑都源于假设对齐：按 4 步进会取到零填充的最后一字节；强制 16 对齐会跳过
+    // 真实的 0xfa18。二者都会让整体偏移若干字节 → 解密必然失败。
+    const scanFrom = k.off + 16;
+    const scanTo = Math.min(size - 32, k.off + 512);
+    let start = scanFrom;
+    while (start < scanTo && buf[start] === 0) start++;   // 跳过零填充
+    if (start < scanTo) {
       const run = entropyRun(buf, size, start, 512);
-      if (run < 16) continue;
-      tailCands.push({ off: start, len: run, keyOff: k.off, key: k.s, dist: start - k.off, keyScore: k.score });
-      break;
+      if (run >= 16) {
+        tailCands.push({ off: start, len: run, keyOff: k.off, key: k.s, dist: start - k.off, keyScore: k.score, aligned: (start & 15) === 0 });
+      }
     }
   }
   if (tailCands.length) {
-    // 排序：① key 越"像口令"越优先（这是最强的信号，实测噪声 key 会污染邻近密文）
-    //       ② 距 key 越近
+    // 排序：① key 越"像口令"越优先（最强的信号）② 距 key 越近
+    // 注意：**不以对齐为主排序**——实测真实的密文可能不是 16 对齐（Disguise 就是 0xfa18）。
     tailCands.sort((a, b) => (b.keyScore - a.keyScore) || (a.dist - b.dist));
     // 去重（同一密文可能被多个重叠 key 命中）
     const uniq = [];
@@ -1363,6 +1366,13 @@ function findCiphertextCandidate(buf, size, hints) {
     for (let off = lo; off + 32 <= hi; off += 4) {
       // 跳过已知常量表内部的起点（否则 CK 表自身会被当成"密文"）
       if (off >= 0 && tables.some(t => off >= t.off && off < t.off + t.len)) continue;
+      // 分组密码的密文通常从**块边界**开始（16 字节对齐）。这不是题目特解，而是分组密码的
+      // 结构约束：常量数组通常按自然对齐存放。实测踩坑：不对齐的窗口会从零填充的最后一字节
+      // 起算，导致整体偏移 1~15 字节、解密必然失败。
+      // 保留未对齐候选作为兜底（有些编译器把常量塞在任意位置），但排在对齐候选之后。
+      const aligned = (off & 15) === 0;
+      // 起点首字节不能是零填充（真实密文几乎不以 0x00 开头）
+      if (buf[off] === 0) continue;
       // 长度由连续高熵区决定（不再枚举 48/64/32/128 这类固定值）
       const runLen = entropyRun(buf, size, off, 512);
       if (runLen < 32) continue;
@@ -1376,11 +1386,12 @@ function findCiphertextCandidate(buf, size, hints) {
       const he = isHighEntropy(off, capped);
       if (!he) continue;
       const center = centers.length ? centers.reduce((a, b) => a + b, 0) / centers.length : off;
-      cands2.push({ off, len: capped, dist: Math.abs(off - center), uniq: he.uniq });
+      cands2.push({ off, len: capped, dist: Math.abs(off - center), uniq: he.uniq, aligned });
     }
   }
   if (!cands2.length) return null;
-  cands2.sort((a, b) => (a.dist - b.dist) || (b.uniq - a.uniq));
+  // 排序：**优先 16 字节对齐**，再按距常量表远近。
+  cands2.sort((a, b) => (b.aligned - a.aligned) || (a.dist - b.dist) || (b.uniq - a.uniq));
   const out2 = [];
   for (const c of cands2) {
     if (out2.some(o => Math.abs(o.off - c.off) < 16)) continue;
@@ -1460,7 +1471,7 @@ def key_schedule(key_bytes, FK):
         rk.append(k[i + 4])
     return rk
 
-def decrypt_block(blk, rk, *, in_bswap, rk_rev, out_bswap):
+def decrypt_block(blk, rk, *, in_bswap, rk_rev, out_bswap, out_swap):
     b = blk
     if in_bswap:
         b = b"".join(b[i:i+4][::-1] for i in range(0, 16, 4))
@@ -1469,15 +1480,36 @@ def decrypt_block(blk, rk, *, in_bswap, rk_rev, out_bswap):
         kk = rk[31 - i] if rk_rev else rk[i]
         t = (x[1] ^ x[2] ^ x[3] ^ kk) & M
         x = [x[1], x[2], x[3], (x[0] ^ L(tau(t))) & M]
-    o = struct.pack(">4I", *x)
+    # 标准 SM4 的输出是 (X35,X34,X33,X32)，即与内部状态**反序**（out_swap=True）。
+    # 很多魔改实现保留原序，所以两种都要试。
+    words = [x[3], x[2], x[1], x[0]] if out_swap else x
+    o = struct.pack(">4I", *words)
     if out_bswap:
         o = b"".join(o[i:i+4][::-1] for i in range(0, 16, 4))
     return o
 
 FLAG_RE = ("xmctf{", "flag{", "ctf{", "dasctf{", "nssctf{", "sctf{", "iscc{", "hgame{")
+import re as _re
+# ⚠️ 正则里的花括号在 JS 模板字符串中会被当成转义序列吞掉（{{ }} → { }），
+#    因此这里用字符码拼出正则，避免生成出来的脚本拿到错误 pattern。
+_LB = chr(123)   # {
+_RB = chr(125)   # }
+_GENERIC_FLAG = _re.compile("[A-Za-z][A-Za-z0-9_]{2,24}" + _re.escape(_LB) + "[ -~]{3,120}" + _re.escape(_RB))
 def looks_flag(s):
+    # 先剥掉尾部零/空白填充：分组密码解密结果常按 16 字节块补齐，明文后跟零字节。
+    # 不剥离的话可打印比例会被拉低到 0.95 以下而误判为"非文本"（样本实测踩坑）。
+    # 注意：这里用 chr(0) 拼接，避免正则/字符串里的转义序列在跨语言模板中被提前解释。
+    _PAD = chr(0) + chr(13) + chr(10) + " " + chr(9)
+    s = s.rstrip(_PAD)
     low = s.lower()
-    return any(m in low for m in FLAG_RE)
+    if any(m in low for m in FLAG_RE):
+        return True
+    # 通用形态：prefix{可打印内容}。很多赛题前缀不在上面的列表里（如 synthetic{}/HTB{}/picoCTF{}）。
+    # 只在"整段几乎全可打印"时才认，避免把随机字节里的偶然 { } 当 flag。
+    printable = sum(1 for c in s if 32 <= ord(c) < 127)
+    if printable < len(s) * 0.95:
+        return False
+    return bool(_GENERIC_FLAG.search(s))
 
 def rev_words(b):
     out = []
@@ -1511,25 +1543,51 @@ def try_all_fk(fk_list, key_list, tag=""):
             FK = list(struct.unpack_from("<4I", d, fk_off))
             for key in key_list:
                 rk = key_schedule(key, FK)
-                # 廉价预筛：单块 + rk 逆序 + 输入反序；不通过就跳过整个 (ct,fk,key) 组合，
-                # 避免 8 种组合 × 3 种排列全跑（这是上千候选能跑完的关键）。
-                # 阈值 8/16 可打印：错误 FK 通常解出全乱码（可打印数 0~3），正确组合通常 10+。
-                probe = decrypt_block(blocks[0], rk, in_bswap=True, rk_rev=True, out_bswap=False)
-                ps = probe.decode("latin-1")
-                good = sum(1 for c in ps if 32 <= ord(c) < 127)
-                if good < 8 and not any(ch in ps for ch in "{}_"):
+                # 廉价预筛：只跑 2 个"最可能"的结构变体（标准输入序 + rk 逆序，输出状态反序的两种）。
+                # ⚠️ 预筛必须覆盖输入字节序的**两种**取值：标准 SM4 用 in_bswap=False，
+                #    而此前只试 True，导致正确组合被整体过滤掉（样本实测：264 组全跑完仍未命中）。
+                # 阈值 8/16 可打印。
+                probe_ok = False
+                for _ib in (False, True):
+                    probe = decrypt_block(blocks[0], rk, in_bswap=_ib, rk_rev=True, out_bswap=False, out_swap=True)
+                    ps = probe.decode("latin-1")
+                    good = sum(1 for c in ps if 32 <= ord(c) < 127)
+                    if good >= 8 or any(ch in ps for ch in "{}_"):
+                        probe_ok = True
+                        break
+                if not probe_ok:
                     continue
                 tried += 1
-                for in_bswap, rk_rev, out_bswap in itertools.product([False, True], repeat=3):
-                    pt = b"".join(decrypt_block(b, rk, in_bswap=in_bswap, rk_rev=rk_rev, out_bswap=out_bswap) for b in blocks)
+                # 4 个独立维度全枚举：输入字节序 / 轮密钥顺序 / 输出字节序 / 输出状态反序
+                # ⚠️ 命中判定分两级：**强命中**（已知 CTF 前缀，立即返回）与
+                #    **弱命中**（通用 xxx{...} 形态，先记下、继续找更强的）。
+                #    实测教训：字节重排错误时也会出现 xxx{...} 形态（如 e_t01c0mf{Wexmctf...），
+                #    若在弱命中上就退出，会漏掉后面 perm=rev_words 的正确结果。
+                weak_hit = None
+                for in_bswap, rk_rev, out_bswap, out_swap in itertools.product([False, True], repeat=4):
+                    pt = b"".join(decrypt_block(b, rk, in_bswap=in_bswap, rk_rev=rk_rev,
+                                                out_bswap=out_bswap, out_swap=out_swap) for b in blocks)
                     for perm_name, q in (("asis", pt), ("rev_words", rev_words(pt)), ("rev_bytes", rev_bytes(pt))):
                         s = q.decode("latin-1")
-                        if looks_flag(s):
-                            print("\\n*** FLAG 命中 ***")
-                            print("密文=0x%x len=%d FK=0x%x key=%r in_bswap=%s rk_rev=%s out_bswap=%s perm=%s"
-                                  % (ct_off, ct_len, fk_off, key, in_bswap, rk_rev, out_bswap, perm_name))
-                            print("FLAG:", s)
-                            sys.exit(0)
+                        strong = any(m in s.lower() for m in FLAG_RE)
+                        if strong or looks_flag(s):
+                            entry = (strong, ct_off, ct_len, fk_off, key, in_bswap, rk_rev, out_bswap, out_swap, perm_name, s)
+                            if strong:
+                                print("\\n*** FLAG 命中（强）***")
+                                print("密文=0x%x len=%d FK=0x%x key=%r in_bswap=%s rk_rev=%s out_bswap=%s out_swap=%s perm=%s"
+                                      % (ct_off, ct_len, fk_off, key, in_bswap, rk_rev, out_bswap, out_swap, perm_name))
+                                print("FLAG:", s.rstrip("\\x00"))
+                                sys.exit(0)
+                            if weak_hit is None:
+                                weak_hit = entry
+                if weak_hit is not None:
+                    _, c_o, c_l, f_o, kk, ib, rr_, ob, os_, pn, ss = weak_hit
+                    print("\\n*** FLAG 命中（弱：无已知前缀）***")
+                    print("密文=0x%x len=%d FK=0x%x key=%r in_bswap=%s rk_rev=%s out_bswap=%s out_swap=%s perm=%s"
+                          % (c_o, c_l, f_o, kk, ib, rr_, ob, os_, pn))
+                    print("FLAG:", ss.rstrip("\\x00"))
+                    print("（若内容看起来错位，说明块内排列还有别的形态，请检查 perm/字节序）")
+                    sys.exit(0)
 
 # 分层：先用"key 与 FK 的字节相似度"排序，最可能的排前面（同一组常量常由同一段代码初始化）
 # 分层执行：先用"最像口令的 3 个 key"跑全部 FK（多数题在这里就命中），

@@ -79,6 +79,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupEventListeners();
   setupWindowStateListener();
   setupStreamListener();
+  setupToolEventListener();
   addLog('info', `应用启动完成，已加载 ${state.skills.length} 个技能，等待文件输入...`);
 });
 
@@ -86,14 +87,157 @@ document.addEventListener('DOMContentLoaded', async () => {
 let streamBubble = null;   // 当前流式消息的 .message-text 元素
 let streamText = '';
 
+// ---------- 滚动跟随（stick-to-bottom）----------
+// 旧行为：**每个流式 token** 都执行 scrollTop = scrollHeight。用户往上滑一次，
+// 下一个 token 立刻把视口拽回底部 —— 表现就是"一直跳、根本不能向上滑"。
+// 现在逻辑收口到 js/scroll-follow.js（可单测）：只在贴底时跟随；上滑脱离；
+// 脱离后由"回到底部"悬浮按钮提示新内容。
+const SCROLL_STICK_PX = 48;          // 距底部 48px 内视为"贴底"
+
+function isNearBottom(el) {
+  if (window.ScrollFollow) return window.ScrollFollow.isNearBottom(el);
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= SCROLL_STICK_PX;
+}
+
+function followScroll(el) {
+  if (!el) return;
+  if (window.ScrollFollow) {
+    window.ScrollFollow.follow(el);
+    updateScrollFab(el);
+    return;
+  }
+  // 兜底（scroll-follow.js 未加载时保持旧语义，但只在不溢出的情况下滚）
+  if (el.scrollHeight - el.scrollTop - el.clientHeight > SCROLL_STICK_PX) return;
+  el.scrollTop = el.scrollHeight;
+}
+
+// 强制回到底部（用户自己发消息、或点了"回到底部"按钮时）
+function scrollToBottomEl(el) {
+  if (!el) return;
+  if (window.ScrollFollow) window.ScrollFollow.toBottom(el);
+  else el.scrollTop = el.scrollHeight;
+  updateScrollFab(el);
+}
+
+function attachStickScroll(el, onStateChange) {
+  if (!el) return;
+  if (window.ScrollFollow) window.ScrollFollow.attach(el, onStateChange);
+}
+
+// 底部的"回到底部"悬浮按钮：脱离跟随时出现，点击后恢复跟随
+function updateScrollFab(el) {
+  const fab = document.getElementById('btn-scroll-bottom');
+  if (!fab) return;
+  const chat = document.getElementById('chat-messages');
+  if (el !== chat) return;
+  const stick = window.ScrollFollow
+    ? window.ScrollFollow.isNearBottom(chat)
+    : isNearBottom(chat);
+  fab.classList.toggle('visible', !stick);
+}
+
 function setupStreamListener() {
+  // 日志面板也要绑定"贴底跟随"：addLog 是高频路径（工具每一步都刷），
+  // 不绑定的话用户往上看日志时会被持续追加拽回底部。
+  const logPanel = document.getElementById('category-log');
+  attachStickScroll(logPanel);
+
   if (!window.electronAPI.onClaudeStreamChunk) return;
+  const chatMessages = document.getElementById('chat-messages');
+  attachStickScroll(chatMessages, (el) => updateScrollFab(el));
+  setupScrollFab();
+
+  // 每帧最多渲染一次：原先每个 token 都重写整个 innerHTML 并强制滚动，
+  // 既卡顿又盖掉了用户的滚动位置。这里把 token 累积到下一帧统一渲染。
+  let pending = false;
   window.electronAPI.onClaudeStreamChunk((delta) => {
     if (!streamBubble || !delta) return;
     streamText += delta;
-    streamBubble.innerHTML = formatMessage(streamText) + '<span class="stream-cursor">▌</span>';
-    const chatMessages = document.getElementById('chat-messages');
-    chatMessages.scrollTop = chatMessages.scrollHeight;
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      if (!streamBubble) return;
+      streamBubble.innerHTML = formatMessage(streamText) + '<span class="stream-cursor">▌</span>';
+      followScroll(document.getElementById('chat-messages'));
+    });
+  });
+}
+
+function setupScrollFab() {
+  const fab = document.getElementById('btn-scroll-bottom');
+  if (!fab || fab._bound) return;
+  fab._bound = true;
+  fab.addEventListener('click', () => {
+    scrollToBottomEl(document.getElementById('chat-messages'));
+  });
+}
+
+// ---------- 工具执行步骤（AI 调用工具时可见的进度）----------
+// 为什么需要：长任务里 AI 可能连续跑 20+ 个工具、几分钟不出文字，
+// 旧 UI 只有一句"分析中"，用户无法判断是卡死还是在工作。
+// 现在每个工具调用渲染成一行：⏳ 正在反编译 main → ✅ 完成（3.2s）/ ❌ 失败。
+const toolRows = new Map();   // tool_use_id -> element
+
+function toolLabelOf(info) {
+  return info.label || info.tool || '工具';
+}
+
+function startToolRow(info) {
+  let container = document.getElementById('tool-steps');
+  if (!container) {
+    const chat = document.getElementById('chat-messages');
+    if (!chat) return;
+    container = document.createElement('div');
+    container.id = 'tool-steps';
+    container.className = 'tool-steps';
+    chat.appendChild(container);
+  }
+  const row = document.createElement('div');
+  row.className = 'tool-step tool-step-running';
+  row.innerHTML = `<span class="tool-step-icon"><i class="fas fa-spinner fa-spin"></i></span>`
+    + `<span class="tool-step-label"></span><span class="tool-step-meta"></span>`;
+  row.querySelector('.tool-step-label').textContent = toolLabelOf(info);
+  row._startedAt = Date.now();
+  container.appendChild(row);
+  if (info.id) toolRows.set(info.id, row);
+  followScroll(document.getElementById('chat-messages'));
+}
+
+function finishToolRow(info, failed) {
+  const row = info.id ? toolRows.get(info.id) : null;
+  if (!row) return;
+  const ms = Date.now() - (row._startedAt || Date.now());
+  row.classList.remove('tool-step-running');
+  row.classList.add(failed ? 'tool-step-error' : 'tool-step-done');
+  row.querySelector('.tool-step-icon').innerHTML = failed
+    ? '<i class="fas fa-circle-xmark"></i>'
+    : '<i class="fas fa-circle-check"></i>';
+  const meta = row.querySelector('.tool-step-meta');
+  if (failed) {
+    meta.textContent = String(info.error || '失败').slice(0, 120);
+    meta.title = String(info.error || '');
+  } else {
+    meta.textContent = (ms / 1000).toFixed(1) + 's'
+      + (info.chars ? ` · ${info.chars} 字符` : '');
+  }
+  toolRows.delete(info.id);
+  followScroll(document.getElementById('chat-messages'));
+}
+
+function resetToolSteps() {
+  const el = document.getElementById('tool-steps');
+  if (el) el.remove();
+  toolRows.clear();
+}
+
+function setupToolEventListener() {
+  if (!window.electronAPI.onClaudeToolEvent) return;
+  window.electronAPI.onClaudeToolEvent((info) => {
+    if (!info || !info.phase) return;
+    if (info.phase === 'start') startToolRow(info);
+    else if (info.phase === 'done') finishToolRow(info, false);
+    else if (info.phase === 'error') finishToolRow(info, true);
   });
 }
 
@@ -112,7 +256,8 @@ function beginStreamMessage() {
   chatMessages.appendChild(messageDiv);
   streamBubble = messageDiv.querySelector('.message-text');
   streamText = '';
-  chatMessages.scrollTop = chatMessages.scrollHeight;
+  // 新的回答开始：用户通常想看到它（若正在读历史，按钮仍提示，不强拽）
+  followScroll(chatMessages);
 }
 
 function endStreamMessage() {
@@ -4916,7 +5061,7 @@ function addLog(type, message) {
   logLine.querySelector('.log-text').textContent = String(message);
 
   logOutput.appendChild(logLine);
-  logOutput.scrollTop = logOutput.scrollHeight;
+  followScroll(logOutput);
 
   // 时间线持久化（尽力而为，失败静默）
   if (state.caseDir && window.electronAPI.appendFile) {
@@ -4950,7 +5095,8 @@ function addUserMessage(message) {
   `;
 
   chatMessages.appendChild(messageDiv);
-  chatMessages.scrollTop = chatMessages.scrollHeight;
+  // 用户自己发消息 → 强制回到底部（这是唯一应该强制跟随时机）
+  scrollToBottomEl(chatMessages);
 }
 
 // 添加系统消息
@@ -4969,7 +5115,8 @@ function addSystemMessage(message) {
   `;
 
   chatMessages.appendChild(messageDiv);
-  chatMessages.scrollTop = chatMessages.scrollHeight;
+  // 系统消息（阶段汇报/工具结果）不抢滚动：用户若在翻历史就停在原处
+  followScroll(chatMessages);
 }
 
 // 格式化消息（支持简单Markdown；先做 HTML 转义再替换标记，防止 AI/工具输出注入）

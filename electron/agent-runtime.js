@@ -386,6 +386,28 @@ function rankExperience(expText, keywords, opts = {}) {
   return out.join('\n');
 }
 
+// 目录保留策略：只保留最近 keep 个文件（按修改时间），避免长期使用后磁盘无限增长。
+// 注意：只删**超过保留数**的旧文件；当前会话刚写的文件 mtime 最新，不会被删。
+function pruneDir(dir, keep, ext) {
+  try {
+    if (!fs.existsSync(dir)) return 0;
+    const files = fs.readdirSync(dir)
+      .filter((f) => !ext || f.endsWith(ext))
+      .map((f) => {
+        const full = path.join(dir, f);
+        try { return { full, mtime: fs.statSync(full).mtimeMs }; }
+        catch (e) { return null; }
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.mtime - a.mtime);
+    let removed = 0;
+    for (const f of files.slice(Math.max(0, keep))) {
+      try { fs.unlinkSync(f.full); removed++; } catch (e) { /* 被占用则跳过 */ }
+    }
+    return removed;
+  } catch (e) { return 0; }
+}
+
 module.exports = {
   headTailPreview,
   persistToolResult,
@@ -400,6 +422,7 @@ module.exports = {
   parseExperienceLine,
   rankExperience,
   compactHistoryDeterministic,
+  pruneDir,
   CLEARED,
   COMPACTABLE_TOOLS,
 };
@@ -426,8 +449,16 @@ function isFactLine(line) {
 function compactHistoryDeterministic(history, keepRecent = 10) {
   if (!Array.isArray(history) || history.length <= keepRecent + 2) return null;
   const head = history.slice(0, 1);
-  const recent = history.slice(-keepRecent);
-  const middle = history.slice(1, history.length - keepRecent);
+
+  // ⚠️ 截断点必须落在"安全的轮次边界"上：如果 recent 段的第一条是 user
+  // 且内容里有 tool_result，说明它对应的 assistant/tool_use 被切掉了 →
+  // API 会因"找不到对应的 tool_use"直接 400。向前多保留到配对完整为止。
+  let start = history.length - keepRecent;
+  if (start <= 1) return null;
+  start = alignToToolPair(history, start);
+  const recent = history.slice(start);
+  const middle = history.slice(1, start);
+  if (!recent.length || !middle.length) return null;
 
   const facts = [];
   const seen = new Set();
@@ -461,4 +492,18 @@ function compactHistoryDeterministic(history, keepRecent = 10) {
     }],
   };
   return [...head, summary, ...recent];
+}
+
+// 把切分点向前调整，直到它不是一条"带 tool_result 的 user 消息"的开头
+// （即保证 recent 段从 assistant 的 tool_use 或普通文本消息开始）。
+function alignToToolPair(history, start) {
+  let s = start;
+  while (s > 1) {
+    const m = history[s];
+    const hasToolResult = m && m.role === 'user' && Array.isArray(m.content)
+      && m.content.some((b) => b && b.type === 'tool_result');
+    if (!hasToolResult) break;
+    s--;
+  }
+  return s;
 }

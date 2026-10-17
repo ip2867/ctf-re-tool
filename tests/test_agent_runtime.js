@@ -149,6 +149,35 @@ console.log('\nA3) 确定性压缩：保留硬事实，缩短历史');
   ok(R.compactHistoryDeterministic([{ role: 'user', content: 'x' }], 6) === null, '短历史不压缩');
 }
 
+console.log('\nA3b) 压缩后消息结构必须合法（tool_use / tool_result 配对完整）');
+{
+  // 构造：切分点恰好落在"带 tool_result 的 user 消息"上——这是真实崩溃场景。
+  // 缩略截断会丢掉对应的 assistant.tool_use，API 直接 400。
+  const history = [{ role: 'user', content: [{ type: 'text', text: '任务' }] }];
+  for (let i = 0; i < 20; i++) {
+    history.push({ role: 'assistant', content: [{ type: 'tool_use', id: 'u' + i, name: 'read_file', input: { path: 'p' } }] });
+    history.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'u' + i, content: 'r' + i }] });
+  }
+  for (let keep = 2; keep <= 8; keep++) {
+    const out = R.compactHistoryDeterministic(history, keep);
+    if (!out) continue;
+    let okPair = true;
+    for (let i = 0; i < out.length; i++) {
+      const m = out[i];
+      if (m.role === 'user' && Array.isArray(m.content)) {
+        const trs = m.content.filter((b) => b && b.type === 'tool_result');
+        if (trs.length) {
+          const prev = out[i - 1];
+          const uses = (prev && prev.role === 'assistant' && Array.isArray(prev.content))
+            ? prev.content.filter((b) => b && b.type === 'tool_use').map((b) => b.id) : [];
+          if (!trs.every((t) => uses.includes(t.tool_use_id))) okPair = false;
+        }
+      }
+    }
+    ok(okPair, `keepRecent=${keep} 时 tool_use/tool_result 全部配对`);
+  }
+}
+
 console.log('\nC1) 经验检索：结构化条目按标签命中');
 {
   const exp = [
@@ -173,6 +202,25 @@ console.log('\nC1) 经验检索：结构化条目按标签命中');
 
   const parsed = R.parseExperienceLine('- [technique] applies_to=SM4 | Rule: r | Why: w | How: h');
   ok(parsed.kind === 'technique' && parsed.tags[0] === 'SM4' && parsed.rule === 'r', 'frontmatter 式条目解析正确');
+}
+
+console.log('\nD1b) 目录保留策略：只删旧文件，不删最新的');
+{
+  const dir = p.join(tmp, 'prune');
+  fs.mkdirSync(dir, { recursive: true });
+  for (let i = 0; i < 10; i++) {
+    const f = p.join(dir, `f${i}.txt`);
+    fs.writeFileSync(f, 'x');
+    // 显式设置 mtime，保证排序确定
+    const t = new Date(Date.now() - (10 - i) * 1000);
+    fs.utimesSync(f, t, t);
+  }
+  const removed = R.pruneDir(dir, 3, '.txt');
+  ok(removed === 7, `删除了 7 个旧文件（实际 ${removed}）`);
+  const left = fs.readdirSync(dir).sort();
+  ok(left.length === 3, `保留 3 个（实际 ${left.length}）`);
+  ok(left.includes('f7.txt') && left.includes('f9.txt'), '保留的是最新文件');
+  ok(R.pruneDir(p.join(tmp, 'not-exist'), 3) === 0, '目录不存在时安全返回 0');
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

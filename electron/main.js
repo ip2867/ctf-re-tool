@@ -9,7 +9,7 @@ const { Client: SshClient } = require('ssh2');
 // Agent 运行时（上下文压缩/重复调用护栏/会话持久化），详见 electron/agent-runtime.js
 const {
   persistToolResult, microcompact, DoomLoopGuard, FailureLoopGuard,
-  estimateTokens, SessionLog, sanitizeHistoryForResume, compactHistoryDeterministic,
+  estimateTokens, SessionLog, sanitizeHistoryForResume, compactHistoryDeterministic, pruneDir,
 } = require('./agent-runtime');
 
 // ============ 全局异常兜底（防闪退） ============
@@ -3013,10 +3013,27 @@ function toolLabel(name, input) {
     case 'extract_payload': return '提取载荷';
     case 'analyze_structure': return '分析密码结构';
     case 'gen_block_cipher_solver': case 'gen_sm4_solver': return '生成解密脚本';
-    case 'ida_decompile': return 'IDA 反编译 ' + short(i.function || i.address, 40);
+    case 'ida_decompile': return 'IDA 反编译 ' + short(i.function_name || i.address, 40);
     case 'ida_get_bytes': return 'IDA 读取字节 ' + short(i.address, 30);
     case 'ida_list_functions': return 'IDA 列出函数';
-    case 'ida_xrefs': return 'IDA 交叉引用 ' + short(i.address || i.name, 30);
+    case 'ida_find_strings': return 'IDA 查找字符串 ' + short(i.keyword || i.pattern || '', 30);
+    case 'ida_get_xrefs': return 'IDA 交叉引用 ' + short(i.address || i.function_name || i.name, 30);
+    case 'jeb_get_manifest': return 'JEB 读取 Manifest';
+    case 'jeb_get_class_decompiled': return 'JEB 反编译 ' + short(i.class_name, 36);
+    case 'jeb_get_method_decompiled': return 'JEB 反编译方法 ' + short(i.class_name + '::' + (i.method_name || ''), 36);
+    case 'jeb_get_all_classes': return 'JEB 列出类';
+    case 'jeb_get_exported_activities': return 'JEB 读导出组件';
+    case 'jeb_get_class_methods': return 'JEB 列出方法';
+    case 'browser_search': return '联网搜索 ' + short(i.query, 36);
+    case 'browser_open': return '打开网页 ' + short(i.url, 40);
+    case 'adb_command': return 'ADB ' + short(i.command || i.args, 40);
+    case 'frida_hook': return 'Frida Hook ' + short(i.script ? '脚本' : (i.target || ''), 30);
+    case 'read_skill': return '读取技能 ' + short(i.name, 30);
+    case 'wiki_search': return '检索知识库 ' + short(i.query, 36);
+    case 'wiki_read': return '读取知识库 ' + short(i.path || i.name, 36);
+    case 'burp_get_history': return 'Burp 读取历史';
+    case 'burp_get_message': return 'Burp 读取报文';
+    case 'burp_call': return '调用 Burp';
     case 'switch_to_next_stage': return '切换到下一阶段';
     default: return name;
   }
@@ -5613,8 +5630,12 @@ ipcMain.handle('session-load', async (event, id) => {
 // 目的：模型收到"失败"两个字只能瞎猜；给出候选/正确写法才能让它一轮改对。
 function precheckToolCall(name, input) {
   const i = input || {};
-  const needPath = ['read_file', 'write_file', 'scan_crypto', 'extract_payload', 'analyze_structure',
-    'gen_block_cipher_solver', 'gen_sm4_solver', 'run_python', 'ida_decompile'];
+  // ⚠️ 只包含 schema 里**真正有 path 字段**的工具。
+  // run_python 的参数是 script、ida_decompile 是 function_name——
+  // 早期版本把两者误列进来，导致所有 Python 脚本/反编译请求都被判成
+  // "缺少必填参数 path" 而直接拒绝（工具彻底不可用）。
+  const needPath = ['read_file', 'write_file', 'scan_crypto', 'extract_payload',
+    'analyze_structure', 'gen_block_cipher_solver', 'gen_sm4_solver'];
   if (needPath.includes(name)) {
     const p = i.path;
     if (!p || !String(p).trim()) return `缺少必填参数 path。请传入目标文件的绝对路径后重试。`;
@@ -5646,14 +5667,19 @@ function precheckToolCall(name, input) {
     if (!i.path || !String(i.path).trim()) return '缺少必填参数 path。';
     if (i.content === undefined || i.content === null) return '缺少必填参数 content。';
   }
-  if (name === 'read_file' || name === 'grep') {
-    if (!i.path) return '缺少必填参数 path。';
-  }
+  if (name === 'read_file' && !i.path) return '缺少必填参数 path。';
+  // grep 的 path 是**可选**的（不传则在当前工作目录搜索），只在缺 pattern 时才拦。
   if (name === 'grep' && !i.pattern) return '缺少必填参数 pattern。';
   if (name === 'glob' && !i.pattern) return '缺少必填参数 pattern。';
-  if ((name === 'ida_decompile' || name === 'ida_get_bytes') && !i.address && !i.function) {
-    return '缺少 address 或 function 参数。IDA 需要明确的函数名或地址；'
+  // ida_decompile 的参数名是 function_name（schema 如此），不是 function/address；
+  // ida_get_bytes 用的是 address。早期版本按 function/address 判断，会把合法的
+  // function_name 调用误判为"缺少参数"。
+  if (name === 'ida_decompile' && !i.function_name && !i.address) {
+    return '缺少 function_name 参数。IDA 需要明确的函数名；'
       + '若不确定，先调 ida_list_functions 列出函数，或 ida_xrefs 定位。';
+  }
+  if (name === 'ida_get_bytes' && !i.address) {
+    return '缺少 address 参数。请传入虚拟地址（如 0x41C000）；不确定时可先用 ida_list_functions 定位。';
   }
   return null;
 }
@@ -5714,8 +5740,13 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
   // 会话日志：追加式 JSONL，崩溃/关窗后可续跑
   let sessionLog = null;
   try {
-    sessionLog = new SessionLog(path.join(app.getPath('userData'), 'sessions'));
+    const sessionDir = path.join(app.getPath('userData'), 'sessions');
+    sessionLog = new SessionLog(sessionDir);
     sessionLog.append('user', messages && messages.length ? messages[messages.length - 1].content : '');
+    // 保留最近 50 个会话（长期使用不无限增长；当前会话刚创建，不会被删）
+    pruneDir(sessionDir, 50, '.jsonl');
+    // 工具输出落盘目录保留最近 200 个文件
+    pruneDir(path.join(app.getPath('userData'), 'tool-results'), 200, '.txt');
   } catch (e) { /* 日志失败不影响解题 */ }
 
   // 上下文预算：DeepSeek 128k 窗口，按 70% 触发摘要压缩（openclaude: 窗口 - 30k buffer）
@@ -5938,11 +5969,14 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
         //     模型现在只收到"失败"两个字时只能瞎猜，预检直接给出候选/正确写法。
         const precheck = precheckToolCall(toolCall.name, toolCall.input);
         if (precheck) {
-          toolResults.push({ tool_use_id: toolCall.id, content: precheck, is_error: true });
-          emitToolEvent('error', { error: precheck.split('\n')[0] });
+          // ⚠️ 一个 tool_use 只能对应**一个** tool_result，且 id 必须是真实 id。
+          // 早期版本额外 push 了 id+'-adv' 的"建议"结果——API 会因为找不到对应的
+          // tool_use 直接 400，整轮求解中断。附加建议一律并入同一条 content。
           failGuard.recordFailure(toolCall.name, precheck, toolCall.input && toolCall.input.path);
-          const adv = failGuard.takeAdvisories();
-          if (adv.length) toolResults.push({ tool_use_id: toolCall.id + '-adv', content: '💡 ' + adv.join('\n'), is_error: false });
+          const advisories = failGuard.takeAdvisories();
+          const body = advisories.length ? precheck + '\n\n💡 ' + advisories.join('\n') : precheck;
+          toolResults.push({ tool_use_id: toolCall.id, content: body, is_error: true });
+          emitToolEvent('error', { error: precheck.split('\n')[0] });
           continue;
         }
 
@@ -5965,22 +5999,19 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
           doomGuard.reset();   // 成功且有状态变化 → 重置连续计数
         } catch (err) {
           const errMsg = `工具调用失败: ${err.message}`;
+          emitToolEvent('error', { error: err.message });
+          // B2) 跨轮失败环：按 (工具, 错误类别) / 类别 / 路径累计。
+          // 同样不能为"判定"另造一个 tool_use_id——提示并入同一条结果。
+          const fr = failGuard.recordFailure(toolCall.name, errMsg, toolCall.input && toolCall.input.path);
+          const body = fr.tripped
+            ? errMsg + `\n\n🛑 ${toolCall.name} 已连续 ${fr.count} 次同类失败（${fr.category}）。`
+              + '这条路走不通了：请换工具、换假设，或先说明卡点并给出当前最优结论。'
+            : errMsg;
           toolResults.push({
             tool_use_id: toolCall.id,
-            content: errMsg,
-            is_error: true
+            content: body,
+            is_error: true,
           });
-          emitToolEvent('error', { error: err.message });
-          // B2) 跨轮失败环：按 (工具, 错误类别) / 类别 / 路径累计
-          const fr = failGuard.recordFailure(toolCall.name, errMsg, toolCall.input && toolCall.input.path);
-          if (fr.tripped) {
-            toolResults.push({
-              tool_use_id: toolCall.id + '-loop',
-              content: `🛑 ${toolCall.name} 已连续 ${fr.count} 次同类失败（${fr.category}）。`
-                + '这条路走不通了：请换工具、换假设，或先说明卡点并给出当前最优结论。',
-              is_error: true,
-            });
-          }
         }
       }
 

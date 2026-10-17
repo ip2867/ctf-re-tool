@@ -90,6 +90,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onClaudeToolEvent: (callback) => {
     ipcRenderer.on('claude-tool-event', (event, info) => callback(info));
   },
+  // 会话恢复（D1）：列出可续跑的会话 / 读取并清洗后的消息
+  sessionsList: () => ipcRenderer.invoke('sessions-list'),
+  sessionLoad: (id) => ipcRenderer.invoke('session-load', id),
 
   // 工作目录 / 应用路径 / 设备就绪
   setWorkdir: (dir) => ipcRenderer.invoke('set-workdir', dir),

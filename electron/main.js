@@ -1003,93 +1003,168 @@ function payloadDescription(p, count) {
 //   2) 在 S 盒附近搜索"32 项 dword 表"（SM4 轮常量 CK 的形态），与标准 CK 比差分
 //   3) 在附近搜索 16 字节 FK 候选，与标准 FK 比差分
 //   4) 报告字节序线索（表项是按 dword 还是 byte 存放、是否每 4 字节反序）
-const STD_SM4_SBOX = [
-  0xd6,0x90,0xe9,0xfe,0xcc,0xe1,0x3d,0xb7,0x16,0xb6,0x14,0xc2,0x28,0xfb,0x2c,0x05,
-  0x2b,0x67,0x9a,0x76,0x2a,0xbe,0x04,0xc3,0xaa,0x44,0x13,0x26,0x49,0x86,0x06,0x99,
-  0x9c,0x42,0x50,0xf4,0x91,0xef,0x98,0x7a,0x33,0x54,0x0b,0x43,0xed,0xcf,0xac,0x62,
-  0xe4,0xb3,0x1c,0xa9,0xc9,0x08,0xe8,0x95,0x80,0xdf,0x94,0xfa,0x75,0x8f,0x3f,0xa6,
-  0x47,0x07,0xa7,0xfc,0xf3,0x73,0x17,0xba,0x83,0x59,0x3c,0x19,0xe6,0x85,0x4f,0xa8,
-  0x68,0x6b,0x81,0xb2,0x71,0x64,0xda,0x8b,0xf8,0xeb,0x0f,0x4b,0x70,0x56,0x9d,0x35,
-  0x1e,0x24,0x0e,0x5e,0x63,0x58,0xd1,0xa2,0x25,0x22,0x7c,0x3b,0x01,0x21,0x78,0x87,
-  0xd4,0x00,0x46,0x57,0x9f,0xd3,0x27,0x52,0x4c,0x36,0x02,0xe7,0xa0,0xc4,0xc8,0x9e,
-  0xea,0xbf,0x8a,0xd2,0x40,0xc7,0x38,0xb5,0xa3,0xf7,0xf2,0xce,0xf9,0x61,0x15,0xa1,
-  0xe0,0xae,0x5d,0xa4,0x9b,0x34,0x1a,0x55,0xad,0x93,0x32,0x30,0xf5,0x8c,0xb1,0xe3,
-  0x1d,0xf6,0xe2,0x2e,0x82,0x66,0xca,0x60,0xc0,0x29,0x23,0xab,0x0d,0x53,0x4e,0x6f,
-  0xd5,0xdb,0x37,0x45,0xde,0xfd,0x8e,0x2f,0x03,0xff,0x6a,0x72,0x6d,0x6c,0x5b,0x51,
-  0x8d,0x1b,0xaf,0x92,0xbb,0xdd,0xbc,0x7f,0x11,0xd9,0x5c,0x41,0x1f,0x10,0x5a,0xd8,
-  0x0a,0xc1,0x31,0x88,0xa5,0xcd,0x7b,0xbd,0x2d,0x74,0xd0,0x12,0xb8,0xe5,0xb4,0xb0,
-  0x89,0x69,0x97,0x4a,0x0c,0x96,0x77,0x7e,0x65,0xb9,0xf1,0x09,0xc5,0x6e,0xc6,0x84,
-  0x18,0xf0,0x7d,0xec,0x3a,0xdc,0x4d,0x20,0x79,0xee,0x5f,0x3e,0xd7,0xcb,0x39,0x48,
-];
-const STD_AES_SBOX = (() => {
-  // 由 GF(2^8) 逆 + 仿射变换即时生成，避免硬编码 256 项出错
-  const mul = (a, b) => {
-    let p = 0;
-    for (let i = 0; i < 8; i++) {
-      if (b & 1) p ^= a;
-      const hi = a & 0x80;
-      a = (a << 1) & 0xff;
-      if (hi) a ^= 0x1b;
-      b >>= 1;
-    }
-    return p;
-  };
-  const inv = new Array(256).fill(0);
-  for (let a = 1; a < 256; a++) for (let b = 1; b < 256; b++) if (mul(a, b) === 1) { inv[a] = b; break; }
-  const rot = (x, n) => ((x << n) | (x >>> (8 - n))) & 0xff;
-  const out = [];
-  for (let i = 0; i < 256; i++) {
-    const x = inv[i];
-    out.push((x ^ rot(x, 1) ^ rot(x, 2) ^ rot(x, 3) ^ rot(x, 4) ^ 0x63) & 0xff);
-  }
-  return out;
-})();
-const STD_SM4_FK = [0xa3b1bac6, 0x56aa3350, 0x677d9197, 0xb27022dc];
-const STD_SM4_CK = (() => {
-  const out = [];
-  for (let i = 0; i < 32; i++) {
-    const b = [0, 1, 2, 3].map(j => ((4 * i + j) * 7) & 0xff);
-    out.push(((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0);
-  }
-  return out;
-})();
+// 标准常量表统一来自 electron/crypto-tables.js（单一事实来源，测试可直接校验）。
+// 这里保留旧变量名以兼容既有代码，全部指向同一份数据。
+const {
+  AES_SBOX: STD_AES_SBOX,
+  AES_INV_SBOX: STD_AES_INV_SBOX,
+  SM4_SBOX: STD_SM4_SBOX,
+  SM4_FK: STD_SM4_FK,
+  SM4_CK: STD_SM4_CK,
+  AES_RCON: STD_AES_RCON,
+  CIPHERS, BYTE_SBOXES,
+} = require('./crypto-tables');
+// 结构推理用的简写（与上方同一份数据）
+const T_SM4 = { CK: STD_SM4_CK };
+const T_AES = { RCON: STD_AES_RCON };
 const bswap32 = (x) => (((x & 0xff) << 24) | (((x >>> 8) & 0xff) << 16) | (((x >>> 16) & 0xff) << 8) | ((x >>> 24) & 0xff)) >>> 0;
+
+// ============ S 盒「变体判定」核心 ============
+// 目标：不只回答"这是不是标准表"，而是回答"它和哪个标准算法是什么关系、能不能精确还原"。
+//
+// 三级判定（越来越强，也越能定位变体）：
+//   ① 精确相等         → 标准算法
+//   ② 逐项 XOR / ADD 常量 → 表被整体平移（可逆，能还原标准表）
+//   ③ GF(2) 仿射关系    → custom[i] = A·std[i] ⊕ c（A 为 8×8 位矩阵，可逆时能精确还原）
+// ③ 是重点：AES/SM4 的变体常对 S 盒做线性/仿射混淆，只有解出 A 才知道怎么还原。
+function gf2AffineFit(custom, std) {
+  // 求解 custom[i] = A·std[i] ⊕ c 中的 A（8 列）与 c（8 位常量）
+  // 逐输出位独立：对第 b 位，custom[i] 的第 b 位 = (A_b · std[i]) ⊕ c_b
+  // 用高斯消元在 GF(2) 上解 8 个未知数（A_b 的 8 位）+ 1 个常量位
+  const solveBit = (bitIdx) => {
+    // 构造 9 列（8 个矩阵位 + 1 个常量位）的增广矩阵，256 行
+    // 行：[std[i] 的 8 位, 1] | [custom[i] 的第 bitIdx 位]
+    const rows = [];
+    for (let i = 0; i < 256; i++) {
+      const x = std[i];
+      const bits = [];
+      for (let k = 0; k < 8; k++) bits.push((x >>> k) & 1);
+      bits.push(1);                                   // 常量位
+      const rhs = (custom[i] >>> bitIdx) & 1;
+      rows.push({ coeff: bits, rhs });
+    }
+    // 高斯消元（GF(2)）
+    const n = 9;
+    let pivotRow = 0;
+    const pivots = new Array(n).fill(-1);
+    for (let col = 0; col < n && pivotRow < rows.length; col++) {
+      let sel = -1;
+      for (let r = pivotRow; r < rows.length; r++) if (rows[r].coeff[col]) { sel = r; break; }
+      if (sel < 0) continue;
+      [rows[pivotRow], rows[sel]] = [rows[sel], rows[pivotRow]];
+      for (let r = 0; r < rows.length; r++) {
+        if (r === pivotRow || !rows[r].coeff[col]) continue;
+        for (let k = 0; k < n; k++) rows[r].coeff[k] ^= rows[pivotRow].coeff[k];
+        rows[r].rhs ^= rows[pivotRow].rhs;
+      }
+      pivots[col] = pivotRow;
+      pivotRow++;
+    }
+    // 检查一致性：全零系数但 rhs=1 → 无解
+    for (const row of rows) {
+      if (row.coeff.every(c => c === 0) && row.rhs === 1) return null;
+    }
+    // 取一组解（自由变量置 0）
+    const sol = new Array(n).fill(0);
+    for (let col = 0; col < n; col++) if (pivots[col] >= 0) sol[col] = rows[pivots[col]].rhs;
+    return sol;
+  };
+
+  const cols = [];   // 8 个输出位的解，每个解含 8 个矩阵位 + 常量位
+  for (let b = 0; b < 8; b++) {
+    const s = solveBit(b);
+    if (!s) return null;
+    cols.push(s);
+  }
+  // 回代验证 256 项（防止自由变量取值导致解不唯一但恰好不满足）
+  const apply = (x) => {
+    let out = 0;
+    for (let b = 0; b < 8; b++) {
+      const s = cols[b];
+      let v = s[8];                          // 常量位
+      for (let k = 0; k < 8; k++) if ((x >>> k) & 1) v ^= s[k];
+      out |= (v & 1) << b;
+    }
+    return out;
+  };
+  for (let i = 0; i < 256; i++) if (apply(std[i]) !== custom[i]) return null;
+  // 判断矩阵是否可逆（决定"能否精确还原标准表"）
+  const inv = (() => {
+    // 把 A 表示为 8 个 8 位列向量，做 GF(2) 求逆
+    const mat = Array.from({ length: 8 }, (_, r) => Array.from({ length: 8 }, (_, c) => cols[c][r]));
+    const aug = mat.map((row, r) => row.concat(Array.from({ length: 8 }, (_, c) => (r === c ? 1 : 0))));
+    let pr = 0;
+    for (let col = 0; col < 8; col++) {
+      let sel = -1;
+      for (let r = pr; r < 8; r++) if (aug[r][col]) { sel = r; break; }
+      if (sel < 0) return null;
+      [aug[pr], aug[sel]] = [aug[sel], aug[pr]];
+      for (let r = 0; r < 8; r++) {
+        if (r === pr || !aug[r][col]) continue;
+        for (let k = 0; k < 16; k++) aug[r][k] ^= aug[pr][k];
+      }
+      pr++;
+    }
+    return aug.map(row => row.slice(8));
+  })();
+  return { cols, invertible: !!inv, identity: cols.every((s, b) =>
+    s[8] === 0 && s.every((v, k) => k === 8 ? v === 0 : v === (k === b ? 1 : 0))) };
+}
+
+// 对给定表，找出与哪个标准表最接近，并给出精确关系描述
+function classifySbox(table) {
+  const results = [];
+  for (const { name, table: std } of BYTE_SBOXES) {
+    let same = 0;
+    const xorSet = new Set();
+    let addConsistent = true, firstAdd = null;
+    for (let i = 0; i < 256; i++) {
+      if (table[i] === std[i]) same++;
+      xorSet.add(table[i] ^ std[i]);
+      const a = (table[i] - std[i]) & 0xff;
+      if (firstAdd === null) firstAdd = a; else if (a !== firstAdd) addConsistent = false;
+    }
+    let relation = null;
+    if (same === 256) relation = { kind: 'exact', desc: `与标准 ${name} 完全相同` };
+    else if (xorSet.size === 1) {
+      const x = [...xorSet][0];
+      relation = { kind: 'xor', key: x, desc: `与标准 ${name} 逐项 XOR 0x${x.toString(16).padStart(2, '0')}（可精确还原）` };
+    } else if (addConsistent) {
+      relation = { kind: 'add', key: firstAdd, desc: `与标准 ${name} 逐项 +0x${firstAdd.toString(16).padStart(2, '0')} mod 256（可精确还原）` };
+    } else {
+      const aff = gf2AffineFit(table, std);
+      if (aff) {
+        relation = aff.identity
+          ? { kind: 'affine-identity', desc: `与标准 ${name} 为恒等仿射（等价）` }
+          : { kind: 'affine', invertible: aff.invertible,
+              desc: `与标准 ${name} 满足 GF(2) 仿射关系（8×8 可逆矩阵${aff.invertible ? '，可精确还原' : '不可逆，只能正向计算'}）` };
+      }
+    }
+    results.push({ name, same, relation });
+  }
+  // 排序：有关系 > 相同项数多
+  results.sort((a, b) => (b.relation ? 1 : 0) - (a.relation ? 1 : 0) || b.same - a.same);
+  return results;
+}
 
 function analyzeCustomBlockConstants(buf, size, sboxOff, sboxStride) {
   const notes = [];
   const table = [];
   for (let i = 0; i < 256; i++) table.push(buf[sboxOff + i * sboxStride] & 0xff);
 
-  // ---- 1) S 盒与标准算法表的关系 ----
-  const cmp = (std, name) => {
-    let same = 0;
-    for (let i = 0; i < 256; i++) if (table[i] === std[i]) same++;
-    if (same) notes.push(`S 盒与标准 ${name} 有 ${same}/256 项相同`);
-    return same;
-  };
-  const sameSm4 = cmp(STD_SM4_SBOX, 'SM4');
-  const sameAes = cmp(STD_AES_SBOX, 'AES');
-  // 注意：随机双射与任一固定表的"偶然相同项数"期望值约为 1，判据不能用"相同项数>0"。
-  // 真正的分界是"是否整体可还原"（下面 tryAffine 判断），所以这里只做弱提示。
-  if (sameSm4 < 32 && sameAes < 32) {
-    notes.push('S 盒与标准 SM4/AES 表**没有实质相同**（仅个别项偶然重合，属随机双射的正常现象）');
+  // ---- 1) S 盒与标准算法表的关系（精确 / XOR / ADD / GF(2) 仿射）----
+  // 这是"变体识别"的核心：不只回答"像不像"，而是回答"能不能精确还原、怎么还原"。
+  const cls = classifySbox(table);
+  const related = cls.filter(c => c.relation);
+  for (const c of related) {
+    notes.push(`S 盒关系：${c.relation.desc}`);
   }
-  // 是否为标准表的逐项线性变换（x -> x + c / x ^ c）
-  const tryAffine = (std, name) => {
-    const xorSet = new Set(); let addConsistent = true; let firstAdd = null;
-    for (let i = 0; i < 256; i++) {
-      xorSet.add(table[i] ^ std[i]);
-      const a = (table[i] - std[i]) & 0xff;
-      if (firstAdd === null) firstAdd = a; else if (a !== firstAdd) addConsistent = false;
-    }
-    if (xorSet.size === 1) return `${name} 的每项 XOR 0x${[...xorSet][0].toString(16)}`;
-    if (addConsistent) return `${name} 的每项 + 0x${firstAdd.toString(16)}`;
-    return null;
-  };
-  const affSm4 = tryAffine(STD_SM4_SBOX, 'SM4');
-  const affAes = tryAffine(STD_AES_SBOX, 'AES');
-  if (affSm4) notes.push('可精确还原：' + affSm4);
-  if (affAes) notes.push('可精确还原：' + affAes);
+  if (!related.length) {
+    const top = cls[0];
+    notes.push(`S 盒与标准 SM4/AES 表**无任何可还原关系**（最多 ${top.name} 偶然重合 ${top.same}/256 项，属随机双射的正常现象）`);
+    notes.push('→ 这是全新 S 盒：无法从标准表推导，必须直接从文件读表使用（轮结构仍可能是 SM4/AES 骨架）');
+  }
+  const sboxRelation = related.length ? related[0] : null;
 
   // ---- 2) 在 S 盒附近搜 32 项 dword 表（SM4 CK 形态）----
   // 搜索范围：S 盒前后 0x4000 字节，按 4 字节对齐
@@ -1242,12 +1317,101 @@ function analyzeCustomBlockConstants(buf, size, sboxOff, sboxStride) {
   return {
     sboxFileOffset: '0x' + sboxOff.toString(16),
     sboxStride,
-    sameSm4, sameAes,
+    // S 盒与标准算法的关系（exact/xor/add/affine/无）；AI 据此决定"还原标准表"还是"直接用题目表"
+    sboxRelation: sboxRelation ? {
+      relatedTo: sboxRelation.name,
+      kind: sboxRelation.relation.kind,
+      same: sboxRelation.same,
+      desc: sboxRelation.relation.desc,
+    } : { relatedTo: null, kind: 'custom', same: cls[0] ? cls[0].same : 0, desc: '全新 S 盒，无法从标准表推导' },
+    sboxClassification: cls.map(c => ({ name: c.name, same: c.same, relation: c.relation ? c.relation.desc : null })),
     ckFileOffset: ckOff >= 0 ? '0x' + ckOff.toString(16) : null,
     fkFileOffset: fkOff >= 0 ? '0x' + fkOff.toString(16) : null,
     fkCandidates: fkOffList.map(x => '0x' + x.toString(16)),
     notes,
   };
+}
+
+// ============ 结构推理（Phase B 最小版）============
+// 目标：从文件字节推断"这是哪个分组密码骨架"，给 AI 一个**带置信度的假设**，
+// 让 AI 决定用什么路线（而不是工具替它定案）。
+//
+// 推理证据（全部确定性）：
+//   ① 轮常量表形态：
+//      · 32 项 dword 且与标准 SM4 CK 存在固定差分 → SM4 骨架（极强证据）
+//      · 10 项单字节（Rcon 形态）+ 256B S 盒 → AES 骨架
+//   ② S 盒身份：classifySbox 判定与标准表的关系（exact/xor/add/affine/custom）
+//   ③ 密文/明文长度对齐：16 字节块（AES/SM4）vs 8 字节块（DES/Blowfish）
+// 输出：候选骨架列表（按证据强度排序），每项附证据与建议。
+function inferCipherStructure(buf, size, ca) {
+  const out = [];
+  const has = (v) => !!v;
+  const sboxRel = ca && ca.sboxRelation;
+  const ckOff = ca && ca.ckFileOffset ? parseInt(ca.ckFileOffset, 16) : -1;
+
+  // --- SM4 骨架证据 ---
+  if (ckOff >= 0) {
+    const ck = [];
+    for (let i = 0; i < 32; i++) ck.push(buf.readUInt32LE(ckOff + i * 4));
+    const d0 = (ck[0] - T_SM4.CK[0]) >>> 0;
+    const fixedWord = ck.every((v, i) => (((v - T_SM4.CK[i]) >>> 0) === d0));
+    // 每字节固定差
+    let perByte = true;
+    const pb = [];
+    for (let k = 0; k < 4 && perByte; k++) {
+      const d = (((ck[0] >>> (k * 8)) & 0xff) - ((T_SM4.CK[0] >>> (k * 8)) & 0xff) + 256) & 0xff;
+      pb.push(d);
+      for (let i = 1; i < 32; i++) {
+        const want = ((((T_SM4.CK[i] >>> (k * 8)) & 0xff) + d) & 0xff);
+        if (((ck[i] >>> (k * 8)) & 0xff) !== want) { perByte = false; break; }
+      }
+    }
+    if (fixedWord || perByte) {
+      out.push({
+        skeleton: 'SM4',
+        confidence: 'high',
+        evidence: `轮常量表 @0x${ckOff.toString(16)} 与标准 SM4 CK 存在固定差分（${fixedWord ? '整字 0x' + d0.toString(16) : '每字节 +[' + pb.map(x => '0x' + x.toString(16)).join(',') + ']'}）` +
+          (sboxRel && sboxRel.relatedTo === 'SM4' ? '；S 盒' + sboxRel.desc : '；S 盒为自定义（无法从标准表推导）'),
+        advice: '按 SM4 结构照抄：32 轮 + X^X^X^rk + 4 字节并行 S 盒。可用 gen_sm4_solver 生成全组合解密脚本。',
+      });
+    }
+  }
+
+  // --- AES 骨架证据 ---
+  if (sboxRel && (sboxRel.relatedTo === 'AES')) {
+    // 找 Rcon：10 个单字节 01 02 04 08 10 20 40 80 1b 36（可整体 XOR 偏移）
+    let rconOff = -1, rconXor = 0;
+    const lo = Math.max(0, (ca.sboxFileOffset ? parseInt(ca.sboxFileOffset, 16) : 0) - 0x4000);
+    const hi = Math.min(size, lo + 0x8000);
+    for (let off = lo; off + 10 <= hi; off++) {
+      const d = buf[off] ^ T_AES.RCON[0];
+      let ok = true;
+      for (let i = 0; i < 10; i++) if ((buf[off + i] ^ d) !== T_AES.RCON[i]) { ok = false; break; }
+      if (ok) { rconOff = off; rconXor = d; break; }
+    }
+    out.push({
+      skeleton: 'AES',
+      confidence: rconOff >= 0 ? 'high' : 'medium',
+      evidence: `S 盒${sboxRel.desc}` +
+        (rconOff >= 0 ? `；轮常量 Rcon @0x${rconOff.toString(16)}（${rconXor ? 'XOR 0x' + rconXor.toString(16) : '原样'}）——AES 密钥扩展铁证` : '；未找到 Rcon（可能被替换或不在扫描范围）'),
+      advice: '按 AES 结构照抄：SubBytes/ShiftRows/MixColumns/AddRoundKey。轮数看 key 长度（16→10、24→12、32→14）；' +
+        'S 盒' + (sboxRel.kind === 'exact' ? '为标准' : '需按关系还原或直接用题目表') + '。' +
+        '⚠️ 目前 gen_sm4_solver 不适用，需按 AES 结构另写实现（可让 AI 生成）。',
+    });
+  }
+
+  // --- 8 字节块骨架（DES/Blowfish）---
+  // 最小版只做占位提示（正确率依赖形状扫描，留待 Phase C）
+  if (!out.length) {
+    out.push({
+      skeleton: '未知',
+      confidence: 'low',
+      evidence: '未找到 SM4 CK 形态表，S 盒与标准 AES/SM4 也无可还原关系',
+      advice: '可能是：①全新 S 盒的 SM4/AES 变体（轮结构仍标准）②DES/Blowfish 变体 ③完全自定义算法。' +
+        '建议：反编译找轮循环与 S 盒查表方式，确认骨架后再写实现。',
+    });
+  }
+  return out;
 }
 
 // ============ SM4 变体解密脚本生成器（通用）============
@@ -1931,7 +2095,17 @@ function scanCryptoFingerprints(filePath) {
         + caText + scriptText
     });
   }
-  if (has('AES-SBOX') && !summary.some(s => /AES/.test(s.algo))) summary.push({ algo: 'AES', confidence: 'high', evidence: 'AES 标准 S 盒', note: '按 AES 解（注意 key 长度 16/24/32）。' });
+  // AES 判定来源有两处：①连续字节的 AES-SBOX 常量 ②双射扫描发现 stride 形态的标准 AES 表
+  // （dword 数组存放的标准 AES 表只会走②，此前被漏判 → summary 报"未发现"，实际表就在那）
+  if (!summary.some(s => /AES/.test(s.algo)) &&
+      (has('AES-SBOX') || out.some(o => o.fp === 'SBOX-256' && o.algo === 'AES'))) {
+    const viaSbox = out.find(o => o.fp === 'SBOX-256' && o.algo === 'AES');
+    summary.push({
+      algo: 'AES', confidence: 'high',
+      evidence: viaSbox ? `AES 标准 S 盒 @${viaSbox.offset}${viaSbox.stride > 1 ? `（${viaSbox.stride} 字节步长存放）` : ''}` : 'AES 标准 S 盒（连续字节）',
+      note: '按 AES 解（注意 key 长度 16/24/32；轮数由 key 长度决定 10/12/14）。',
+    });
+  }
   if (has('SM3-IV')) summary.push({ algo: 'SM3', confidence: 'high', evidence: 'SM3 IV（铁证）', note: '哈希不可逆：按"SM3(候选)==目标"爆破/长度扩展。' });
   if (has('TEA-DELTA') || has('TEA-DELTA-INV')) summary.push({ algo: 'TEA/XTEA/XXTEA', confidence: 'high', evidence: 'TEA delta 常量', note: `按 TEA 族解；delta 大小端/正负见偏移。` });
   if (has('MD5-IV')) summary.push({ algo: 'MD5', confidence: 'medium', evidence: 'MD5 IV', note: '哈希：爆破/碰撞/截断比较。' });
@@ -5543,6 +5717,76 @@ function getToolDefinitions() {
         },
         required: ["path", "reason"]
       }
+    },
+    // ========== 确定性分析能力（AI 主动调用）==========
+    // 为什么把这些暴露成工具：此前它们只作为"工具在提示词里喂给 AI 的结论"，
+    // AI 无法在解题过程中主动复查/追问（例如换了一个提取出的新文件、或想确认某段字节里有什么）。
+    {
+      name: "scan_crypto",
+      description:
+        "【确定性算法指纹扫描】直接读文件字节，返回：①已知算法常量命中（SM4 FK/S盒、AES、SM3、TEA、CRC32…）" +
+        "②自定义分组密码的常量差分分析（S 盒与标准表的关系、轮常量表位置与精确差分如「标准 CK 每字节+0x1」、FK 候选、字节序线索）" +
+        "③编码存储的内嵌载荷（XOR/ADD/旋转/Base64/Hex 文本/ELF/DEX/shellcode，含可直接运行的提取脚本）" +
+        "④高熵常量块。不依赖 IDA，可在任何时刻对任何文件调用（包括你刚提取出的新文件）。" +
+        "用途：在写脚本之前先拿到确定性结论，避免凭猜测试算法。",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "要扫描的文件绝对路径" }
+        },
+        required: ["path"]
+      }
+    },
+    {
+      name: "extract_payload",
+      description:
+        "【内嵌载荷提取】按 scan_crypto 报告的编码参数（offset/编码方式/步长/密钥/长度）解码并写出文件，" +
+        "自动校验头部魔数（MZ/ELF/DEX）。适合多阶段题提取下一层。若不传参数，则自动选用 scan_crypto 的最佳候选。",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "载体文件绝对路径" },
+          out: { type: "string", description: "输出文件路径（默认写到临时目录）" },
+          offset: { type: "number", description: "可选：载荷起始文件偏移（十六进制可写 0x...）" },
+          length: { type: "number", description: "可选：要解码的字节数" },
+          kind: { type: "string", description: "可选：编码方式 xor|add|periodic-xor|rolling-xor|rolling-add|base64|hex|none" },
+          key: { type: "string", description: "可选：密钥（单字节填数字，周期编码填逗号分隔）" },
+          stride: { type: "number", description: "可选：表项步长 1|2|4" }
+        },
+        required: ["path"]
+      }
+    },
+    {
+      name: "gen_sm4_solver",
+      description:
+        "【SM4 变体解密脚本生成】当 scan_crypto 确认存在「自定义 S 盒 + SM4 形态轮常量表」时调用。" +
+        "生成一个可直接运行的 Python 脚本：枚举 密文候选 × FK 候选 × key 候选 × 16 种字节序/状态组合 × 3 种块内排列，命中即输出 FLAG。" +
+        "脚本已覆盖标准 SM4 与常见魔改（轮密钥逆序、块内反序、状态反序）。" +
+        "注意：只适用于 SM4 骨架；若结构是 AES（SubBytes/ShiftRows/MixColumns）或其它分组密码，本脚本不适用。",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "含该密码结构的文件绝对路径" },
+          out: { type: "string", description: "可选：脚本输出路径（默认写到临时目录）" }
+        },
+        required: ["path"]
+      }
+    },
+    {
+      name: "analyze_structure",
+      description:
+        "【分组密码结构推理】基于 scan_crypto 的常量分析结果，推断" +
+        "「这是哪个分组密码骨架」（SM4 / AES / 未知）并给出置信度与证据：" +
+        "轮常量表形态（SM4 CK 固定差分 / AES Rcon）、S 盒与标准表的关系、字节序线索。" +
+        "输出的是**假设**（按证据强度排序），最终路线由你决定。" +
+        "前置：先对该文件调用过 scan_crypto。",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "文件绝对路径（应已做过 scan_crypto）" }
+        },
+        required: ["path"]
+      }
     }
   ];
 }
@@ -5725,6 +5969,160 @@ print('BYTES '+data.hex())
 
       case 'burp_call':
         return await callBurpMcp(input.tool, input.args || {});
+
+      // ========== 确定性分析能力（供 AI 主动调用）==========
+      case 'scan_crypto': {
+        const f = String(input.path || '').trim();
+        if (!f) return '参数错误：path 为空';
+        if (!fs.existsSync(f)) return `文件不存在: ${f}`;
+        const r = scanCryptoFingerprints(f);
+        if (!r.success) return `扫描失败: ${r.error}`;
+        // 输出为结构化文本，便于 AI 直接阅读；不放原始 JSON（token 更省、重点更突出）
+        const lines = [];
+        lines.push(`文件: ${f}  (${r.size} 字节)`);
+        lines.push('');
+        lines.push('## 主结论');
+        for (const s of (r.summary || [])) {
+          lines.push(`- 【${s.algo}】置信度 ${s.confidence}`);
+          if (s.evidence) lines.push(`  证据: ${s.evidence}`);
+          if (s.note) lines.push(`  建议: ${String(s.note).replace(/\n/g, '\n        ')}`);
+        }
+        if ((r.payloads || []).length) {
+          lines.push('');
+          lines.push('## 内嵌载荷（可用 extract_payload 提取）');
+          for (const p of r.payloads) {
+            const e = p.encode || {};
+            lines.push(`- ${String(p.type).toUpperCase()} @0x${p.offset.toString(16)}` +
+              ` 编码=${e.kind || 'none'}${e.key != null ? ' key=0x' + Number(e.key).toString(16) : ''}` +
+              `${e.stride ? ' stride=' + e.stride : ''}${p.length ? ' len=' + p.length : ''}` +
+              ` 置信度=${p.confidence || 'high'}`);
+          }
+        }
+        const ca = (r.fingerprints || []).map(x => x.constantAnalysis).filter(Boolean);
+        if (ca.length) {
+          lines.push('');
+          lines.push('## 常量差分分析（确定性推导）');
+          for (const c of ca) {
+            for (const n of (c.notes || [])) lines.push(`- ${n}`);
+            if (c.decryptScript) {
+              lines.push(`- 已生成 SM4 变体解密脚本（可用 gen_sm4_solver 取用）`);
+              lines.push(`  密文候选: ${(c.decryptScript.ciphertextCandidates || []).map(x => x.offset + '(' + x.length + 'B)').join('、')}`);
+            }
+          }
+          // 结构推理（Phase B）：给 AI 一个"骨架假设 + 置信度"，由 AI 决定路线
+          const structs = inferCipherStructure(buf, size, ca[0]);
+          if (structs.length) {
+            lines.push('');
+            lines.push('## 结构推理（假设，按证据强度排序——最终判断由你做）');
+            for (const st of structs) {
+              lines.push(`- 【${st.skeleton} 骨架】置信度 ${st.confidence}`);
+              lines.push(`  证据: ${st.evidence}`);
+              lines.push(`  建议: ${st.advice}`);
+            }
+          }
+        }
+        if ((r.fingerprints || []).length) {
+          lines.push('');
+          lines.push('## 原始命中（前 20）');
+          lines.push((r.fingerprints || []).slice(0, 20).map(x => `${x.fp || x.algo}@${x.offset}${x.stride ? '(stride' + x.stride + ')' : ''}`).join('  '));
+        }
+        if ((r.highEntropy || []).length) {
+          lines.push('');
+          lines.push('## 高熵常量块（疑似 key/密文）');
+          lines.push((r.highEntropy || []).map(h => `${h.offset}(${h.len}B) ${h.hex}`).join('\n'));
+        }
+        return lines.join('\n');
+      }
+
+      case 'extract_payload': {
+        const f = String(input.path || '').trim();
+        if (!f) return '参数错误：path 为空';
+        if (!fs.existsSync(f)) return `文件不存在: ${f}`;
+        // 未给参数时自动选 scan_crypto 的最佳候选
+        let spec = null;
+        if (input.offset != null || input.kind) {
+          const normNum = (v) => typeof v === 'string' ? Number(v) : Number(v);
+          spec = {
+            type: 'payload',
+            offset: normNum(input.offset || 0),
+            length: input.length != null ? normNum(input.length) : 0,
+            encode: {
+              kind: input.kind || 'none',
+              key: input.key == null ? null
+                : (String(input.key).includes(',') ? String(input.key).split(',').map(x => normNum(x.trim()))
+                  : normNum(input.key)),
+              stride: input.stride ? normNum(input.stride) : 1,
+              period: 1,
+            },
+          };
+        } else {
+          const sc = scanCryptoFingerprints(f);
+          const best = (sc && sc.payloads || []).find(p => ['pe', 'elf', 'dex'].includes(p.type));
+          if (!best) return '未在文件中找到可提取的载荷。请先用 scan_crypto 查看，或显式提供 offset/kind。';
+          spec = best;
+        }
+        const buf = fs.readFileSync(f);
+        const py = buildPayloadExtractPython(spec);
+        if (!py) return `不支持的编码方式: ${spec.encode && spec.encode.kind}（支持 xor/add/periodic-xor/rolling-xor/rolling-add/base64/hex/none）`;
+        const outPath = String(input.out || '').trim() || path.join(app.getPath('temp'), `payload_${spec.offset.toString(16)}.bin`);
+        const scriptPath = path.join(app.getPath('temp'), `extract_${Date.now().toString(36)}.py`);
+        fs.writeFileSync(scriptPath, py, 'utf8');
+        const rr = spawnSync('python', [scriptPath, f, outPath], { encoding: 'utf8', timeout: 120000 });
+        const out = ((rr.stdout || '') + (rr.stderr ? '\n' + rr.stderr : '')).trim();
+        try { fs.unlinkSync(scriptPath); } catch (e) { /* 忽略 */ }
+        if (!/^OK\b/m.test(out)) return `提取失败:\n${out.slice(0, 1000)}`;
+        const head = (() => { try { return fs.readFileSync(outPath).slice(0, 4).toString('hex'); } catch (e) { return '?'; } })();
+        const magicOk = head.startsWith('4d5a') || head.startsWith('7f454c46') || head.startsWith('6465780a');
+        return `提取成功\n- 输出: ${outPath}\n- 首 4 字节: ${head}${magicOk ? '  ✓ 魔数正确' : '  ⚠️ 魔数不符，请核对 offset/编码'}\n- ${out.split('\n')[0]}` +
+          (magicOk ? `\n\n下一步建议：对该新文件调用 scan_crypto 重新扫描，再决定分析路线。` : '');
+      }
+
+      case 'gen_sm4_solver': {
+        const f = String(input.path || '').trim();
+        if (!f) return '参数错误：path 为空';
+        if (!fs.existsSync(f)) return `文件不存在: ${f}`;
+        const sc = scanCryptoFingerprints(f);
+        const ca = (sc && sc.fingerprints || []).map(x => x.constantAnalysis).find(c => c && c.decryptScript);
+        if (!ca) {
+          return '未生成 SM4 解密脚本。原因通常是：\n' +
+            '· 没找到「与标准 SM4 CK 存在固定差分的 32 项轮常量表」→ 本文件可能不是 SM4 骨架（可能是 AES/其它分组密码）；\n' +
+            '· 或没有找到可用密文候选。\n' +
+            '建议：先调用 scan_crypto 查看实际识别结果，按对应结构（如 AES 的 SubBytes/ShiftRows/MixColumns）自行实现。';
+        }
+        const outPath = String(input.out || '').trim() || path.join(app.getPath('temp'), 'sm4_solver.py');
+        fs.writeFileSync(outPath, ca.decryptScript.script, 'utf8');
+        return `已生成 SM4 变体解密脚本: ${outPath}\n` +
+          `- 密文候选: ${(ca.decryptScript.ciphertextCandidates || []).map(x => x.offset + '(' + x.length + 'B)').join('、')}\n` +
+          `- FK 候选数: ${(ca.decryptScript.fkCandidates || []).length}  key 提示数: ${(ca.decryptScript.keyHints || []).length}\n` +
+          `- 覆盖: 4 维 × 16 种字节序/状态组合 + 3 种块内排列（标准 SM4 与常见魔改）\n` +
+          `用法: python "${outPath}" "${f}"\n` +
+          `⚠️ 只适用 SM4 骨架；若未命中不代表算法认错，可能是 AES 或其它结构。`;
+      }
+
+      case 'analyze_structure': {
+        const f = String(input.path || '').trim();
+        if (!f) return '参数错误：path 为空';
+        if (!fs.existsSync(f)) return `文件不存在: ${f}`;
+        const sc = scanCryptoFingerprints(f);
+        const ca = (sc && sc.fingerprints || []).map(x => x.constantAnalysis).find(Boolean);
+        if (!ca) {
+          return '无结构推理输入：该文件没有识别出 256 项双射 S 盒（custom 分组密码）。\n' +
+            '若文件是标准 AES/SM4，scan_crypto 已直接给出算法判定，无需结构推理；\n' +
+            '若是其它形态，请先用 ida_decompile 分析轮循环。';
+        }
+        const structs = inferCipherStructure(fs.readFileSync(f), sc.size, ca);
+        const lines = [`文件: ${f}`, ''];
+        lines.push('## 骨架假设（按证据强度排序——最终判断由你做）');
+        for (const st of structs) {
+          lines.push(`- 【${st.skeleton} 骨架】置信度 ${st.confidence}`);
+          lines.push(`  证据: ${st.evidence}`);
+          lines.push(`  建议: ${st.advice}`);
+        }
+        lines.push('');
+        lines.push('## 支撑事实');
+        for (const n of (ca.notes || [])) lines.push(`- ${n}`);
+        return lines.join('\n');
+      }
 
       // ========== 多阶段接力（不在主进程执行，只发信号让渲染层切换）==========
       // 渲染层收到 stageSwitch 后会：kill 旧 IDA/JEB → 保留结论 → analyzeFile(新文件) + autoAnalyze。

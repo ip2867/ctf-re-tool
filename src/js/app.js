@@ -7112,8 +7112,14 @@ async function autoSolveBinaryFlag(fileType) {
         return;   // 已解出，无需再烧 AI 预算
       }
       // 未命中：必须明确"这不等于算法认错"——脚本只覆盖 SM4 骨架，换骨架就不适用。
+      // 同时把"已尝试过什么"记进上下文，避免 AI 重复跑同一套枚举（浪费预算）。
       addLog('info', `[自主求解] SM4 骨架脚本未命中（**不代表算法认错**），交回 AI。输出尾部：${outTxt.slice(-300).replace(/\s+/g, ' ')}`);
       addSolveNote('自主求解', 'SM4 骨架脚本未命中 → 需按实际轮结构（可能是 AES/其它）另写实现');
+      state._autoSm4Tried = {
+        script: pyPath,
+        ctCandidates: (ca.decryptScript.ciphertextCandidates || []).map(x => x.offset),
+        summary: outTxt.slice(-500),
+      };
     }
   } catch (e) { addLog('warning', '[自主求解] 自动脚本执行失败（不阻塞）: ' + e.message); }
 
@@ -7446,6 +7452,12 @@ ${constraint}`;
   } catch (e) { /* 扫描失败不阻塞 */ }
   const prompt = `我在解一道 CTF ${fileType || '二进制'} 题，静态固定清单分析未得出 flag。请**使用工具**自主深入分析并求出 flag。
 ${algHint}${platDesc}${failHint}${excludedHint}${stageBlock}
+${state._autoSm4Tried ? `\n## ⚠️ 工具已替你试过的路线（不要原样重复）
+工具已按 SM4 骨架跑过全组合枚举脚本（${state._autoSm4Tried.script}），未命中。
+已覆盖：密文候选 ${state._autoSm4Tried.ctCandidates.join('、')} × 全部 FK 候选 × key 候选 × 16 种字节序/状态组合 × 3 种块内排列。
+这不代表算法认错——**很可能实际结构不是 SM4 骨架**（如 AES 的 SubBytes/ShiftRows/MixColumns），
+或密文/key 不在工具假设的位置。请换一条路线，而不是再跑一遍同样的枚举。
+` : ''}
 文件路径：${state.currentFile}
 ## 已获取的函数列表（节选）
 ${fnSummary}
@@ -7455,6 +7467,20 @@ ${analysisData.strings ? `\n## 关键字符串\n${typeof analysisData.strings ==
 ${sideFilesBlock}
 
 ## 你必须严格按 4 阶段推进（每阶段先出证据）
+
+0) **⚡ 先做确定性扫描（省最多预算，务必第一步做）**
+   在反编译任何函数之前，先调用 \`scan_crypto\`（参数 path=当前文件绝对路径）。它直接读字节，**不依赖 IDA**，
+   一次性告诉你：
+   - 已知算法常量（SM4 FK/S 盒、AES、SM3、TEA、CRC32…）
+   - **自定义分组密码的常量差分**（S 盒与标准表关系、轮常量表位置与精确差分、FK 候选、字节序线索）
+   - **编码存储的内嵌载荷**（XOR/ADD/旋转/Base64/Hex/ELF/DEX/shellcode，含提取配方）
+   - 高熵常量块（疑似 key/密文）
+   ⚠️ 这些是**确定性结论**，优先采信，别再用反编译去反复验证同一件事。
+   - 若报告了内嵌载荷 → 调 \`extract_payload\`（不传参数即自动用最佳候选）提取下一层，再对**新文件**重新 \`scan_crypto\`。
+   - 若报告「自定义 S 盒 + SM4 形态轮常量表」→ 调 \`gen_sm4_solver\` 拿到可跑脚本（覆盖标准 SM4 与常见魔改），
+     先跑它；**未命中不代表算法认错**（可能其实是 AES 骨架）。
+   - 分析过程中**任何时刻**都可以重新调用（例如换到提取出的新文件、或怀疑前面的结论）。
+
 ① **收集（代码+数据缺一不可）**：用 \`ida_decompile\` 反编译入口与关键函数；**务必**用
    \`ida_get_bytes\`（读任意地址原始字节，hex+ASCII）+ \`ida_list_globals\` 取出被引用的**常量表/vtable 内容**
    （密钥/密文/S盒/VM字节码/函数指针表都在 .data/.rodata）；

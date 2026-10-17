@@ -23,7 +23,7 @@ console.log('A) 脚本生成：关键要素齐全');
   ok(/0x10a10/.test(script), 'FK 候选写入');
   ok(/0xfa18, 48/.test(script), '密文候选写入');
   ok(/We1c0me_t0_xmctf/.test(script), 'key 提示写入');
-  ok(/itertools\.product\(\[False, True\], repeat=3\)/.test(script), '枚举 8 种字节序组合');
+  ok(/itertools\.product\(\[False, True\], repeat=4\)/.test(script), '枚举 16 种字节序/状态组合');
   ok(/def rev_words/.test(script) && /def rev_bytes/.test(script), '包含块内排列的 3 种变体');
 }
 

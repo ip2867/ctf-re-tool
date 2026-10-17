@@ -1,4 +1,4 @@
-# CTF-RE-TOOL v1.6.0
+# CTF-RE-TOOL v1.7.3
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -116,6 +116,38 @@
 - **手法专题**：`wiki/frida/`（多阶段 Hook、进程内解密出 flag、Native 密钥反演、参数/IV 编码坑、环境排障、native 定位+RegisterNatives+反检测+脱壳）、`wiki/firmware/`（固件解包/QEMU 仿真踩坑）
 - **两处可放页**：应用内置 `wiki/`（随 exe 分发）+ `%APPDATA%/ctf-reverse-tool/wiki/`（用户自加，重启即生效）；系统提示只注入页面索引，不占固定上下文
 - 设计参考 Des-CTF-Knowledge 知识库的「结构化 meta + attack_chain + 分段索引」范式（**仅借鉴设计思路，纯文本条目，零样本落地**）
+
+### 12. 分组密码识别与变体求解（v1.7 新增）
+- **S 盒知识库**（`electron/crypto-tables.js`）：AES / AES 逆 / SM4 完整 S 盒、AES Rcon、SM4 FK/CK/旋转常量全部固化，扫描器不再散落硬编码
+- **S 盒三级关系判定**：`classifySbox()` 逐个比对标准表，报出 `exact`（完全相同）/ 逐项 `XOR·ADD` / **GF(2) 仿射**（高斯消元求 8×8 可逆矩阵 + 回代验证 256 项），并给出能否精确还原
+- **非线性度指标**：Walsh 谱计算（标定值 AES/SM4 = 112，随机置换 90~96）。**只描述设计强度，不据此劝退**——CTF 大量题目用随机置换当 S 盒，照样能解
+- **结构推理** `inferCipherStructure()`：SM4 CK 固定差分 → SM4 骨架；AES S 盒关系 + Rcon → AES 骨架；未知结构明确说"未知"而不是硬猜
+- **多骨架解密器**：
+  - SM4：枚举 密文 × FK × key × 16 种字节序/状态组合 × 3 种块内排列
+  - AES：pycryptodome 主路径，枚举 key 长度 16/24/32（轮数 10/12/14）× 字节序 × 状态排列
+  - DES/Blowfish：**明确不支持**，不假装能解
+- **诚实边界**：轮数被改 / MixColumns 矩阵被替换的变体不支持，未命中时明确提示"不代表算法认错"
+
+### 13. AI Agent 运行时（v1.7.3 新增）
+借鉴开源项目 openclaude 的上下文管理与可靠性设计（`electron/agent-runtime.js`，参数逐项对照其源码标定）：
+
+| 能力 | 机制 |
+|---|---|
+| **大输出落盘** | 超过 24k 字符的工具输出写盘，回传 **60% 头 + 40% 尾**预览（错误堆栈/flag 常在尾部）。旧实现只截头会丢关键信息 |
+| **旧结果微压缩** | 每轮把旧 `tool_result` 替换为占位串，只保留最近 6 条；**绝不清 `is_error`**（错误是模型纠错的依据） |
+| **确定性上下文压缩** | 超 90k token 触发，保留首条任务 + 最近 10 条 + 抽取的硬事实（偏移/常量/骨架/已排除路线）；熔断 3 次 / 冷却 5 分钟；**不额外调模型** |
+| **连续调用拦截** | `sha256(工具 + 完整入参)` 连续 3 次即拦（不做前缀截断，否则"同文件不同尾部的两次写"会被误判） |
+| **跨轮失败环** | 按 (工具,错误类别) / 类别 / 路径 三键累计；第 2 次提醒、第 3 次判死；NoSymbol 时给出候选函数名 |
+| **工具预检** | 执行前做确定性检查，错误必带"怎么改"：路径不存在给相近文件、IDA 缺参给补救工具建议 |
+| **结构化经验检索** | 按当前题特征词给经验条目打分，只注入命中的 top 6（≤600 字符），**零命中不注入** |
+| **会话续跑** | 追加式 JSONL；恢复时剥离未完成的 `tool_use` / 孤立 `tool_result`（不清洗会直接 400），末尾注入续跑指令 |
+| **API 重试** | 5 次指数退避 + 抖动、优先 `retry-after`、429 上限 3、4xx 不重试 |
+
+**界面**：AI 调用工具时显示实时步骤条（`⏳ 正在反编译 main` → `✅ 1.2s · 3400 字符`），长任务不再"看起来卡死"。
+
+### 14. 对话滚动与离线可用性（v1.7.3 修复）
+- **修复"流式输出时无法向上滚动"**：旧实现每收到一个 token 就 `scrollTop = scrollHeight`，用户上滑一次立刻被拽回底部。改为 stick-to-bottom（距底 ≤48px 才跟随；滚轮上滑/PageUp/Home 立即脱离），并加"回到底部"悬浮按钮；日志面板同样受保护
+- **图标库本地化**：Font Awesome 全量内置到 `src/vendor/`（约 1MB），CSP 收紧为 `font-src 'self'`。原来依赖 cdnjs，实测超时 16 秒会让 `<link>` 阻塞解析、页面停在 loading（内网/离线环境表现为启动卡死）
 
 ## 环境要求
 
@@ -307,6 +339,60 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 
 ## 更新日志
+
+### v1.7.3 (2026-10-18) — AI Agent 运行时 + 对话滚动修复 + 分组密码能力补齐
+
+**一、AI Agent 运行时（借鉴 openclaude）**
+
+新增 `electron/agent-runtime.js`，解决长任务三个核心痛点：上下文爆掉、原地打转、崩溃丢进度。
+
+| 能力 | 机制 | 参数来源 |
+|---|---|---|
+| 大输出落盘 | 60% 头 + 40% 尾预览，超阈值写盘可回读 | openclaude 50k → 本工具 24k（窗口更小） |
+| 旧结果微压缩 | 保留最近 6 条；**不清 is_error** | `microCompact.ts` |
+| 确定性压缩 | 90k token 触发，抽硬事实；熔断 3 次/冷却 5 分钟 | `autoCompact.ts` |
+| 连续调用拦截 | `sha256(工具+完整入参)` × 3 | `doomLoop.ts` |
+| 跨轮失败环 | 三键计数，第 2 次提醒、第 3 次判死 | `toolFailureLoopGuard.ts` |
+| 工具预检 | 错误必带"怎么改" | `toolErrors.ts` |
+| 经验检索 | 按题型特征词打分，零命中不注入 | `memdir/` |
+| 会话续跑 | JSONL + 结构清洗 | `sessionStorage.ts` |
+| API 重试 | 5 次指数退避 | `withRetry.ts` |
+
+> 与计划的偏差：A3 原计划"调模型生成摘要"，改为**确定性抽取硬事实**——压缩本身要再发大请求且可能失败，而 CTF 里必须保住的是偏移/常量/骨架/已排除路线，规则抽取即可。
+
+**二、复查抓到的 4 个致命缺陷（都会让真实求解中断）**
+
+| 缺陷 | 后果 |
+|---|---|
+| 预检/失败环伪造 `tool_use_id`（`id+'-adv'`） | API 400，整轮求解中断 |
+| `needPath` 错列 `run_python`/`ida_decompile` | 所有 Python 脚本与 IDA 反编译被判"缺 path"而拒绝 |
+| IDA 参数名写错（`function` vs 真实 `function_name`） | IDA 工具永远无法通过预检 |
+| 压缩切点落在 `tool_result` 上 | 对应 `tool_use` 被丢弃 → API 400 |
+
+**三、对话滚动修复**
+
+流式输出时每收到一个 token 就 `scrollTop = scrollHeight`，用户上滑一次立刻被拽回底部。改为 stick-to-bottom（距底 ≤48px 才跟随；滚轮上滑/PageUp/Home 立即脱离），新增"回到底部"按钮；日志面板同样受保护。
+
+**四、离线可用性**
+
+Font Awesome 全量本地化（约 1MB），CSP 收紧。原来依赖 cdnjs，实测超时 16 秒导致 `<link>` 阻塞解析、页面卡在 loading——内网/离线环境会表现为启动卡死。
+
+**五、分组密码能力（v1.7.0–1.7.2）**
+
+- `crypto-tables.js`：AES/SM4 全表知识库
+- `classifySbox()`：exact / XOR·ADD / GF(2) 仿射三级判定
+- S 盒非线性度（Walsh 谱）：**修正了两处公式错误**——旧实现把 AES/SM4 标准表也算成 -128，会让 AI 放弃真实 S 盒
+- `inferCipherStructure()`：SM4 / AES 骨架推理
+- 多骨架解密器：SM4 全组合枚举 + AES pycryptodome 主路径；DES/Blowfish 明确不支持
+
+**六、测试**
+
+25 个测试文件 / 13 道真实回归题 / 全绿。新增专项：
+- `test_tool_contract.js`（57 项）：工具 schema 与预检/UI 标签的参数名一致性
+- `test_precheck.js`（26 项）：合法调用必须放行、非法调用必须拦截
+- `test_message_contract.js`（17 项）：`tool_use`/`tool_result` 一对一契约
+- `test_agent_runtime.js`（60 项）：运行时九大能力
+- `test_scroll_follow.js`（14 项）/ `test_ui_integrity.js`（36 项）：滚动与 UI 接线
 
 ### v1.6.0 (2026-10-17) — 自主解题：确定性感知 + 负面断言反证 + 全组合枚举
 

@@ -136,6 +136,39 @@ console.log('\nF) 无 S 盒的文件 → 不产生 constantAnalysis（不制造�
   ok(!(r.fingerprints || []).some(f => f.constantAnalysis), '无 S 盒时无分析');
 }
 
+console.log('\nG) 非线性度必须与已知值一致（防公式写错）');
+{
+  // 历史缺陷：Walsh 奇偶校验漏高位 + 少除以 2 → AES/SM4 标准表都算出 -128，
+  // 与随机表同值，等于这个指标完全失效，还会把真 S 盒建议成"随机占位数据"。
+  // 标准值：AES=112、SM4=112；随机置换 90~96。
+  const { AES_SBOX, SM4_SBOX } = require('../electron/crypto-tables.js');
+  const { analyzeCustomBlockConstants } = require('./scanner_loader.js');
+  const readNL = (sbox) => {
+    // 标准表会被扫描链路直接识别为已知算法、不进入 constantAnalysis 分支，
+    // 所以这里直接调分析入口（传入连续字节形态的合成缓冲）。
+    const table = Buffer.from(sbox);
+    const buf = Buffer.concat([Buffer.alloc(0x200, 0xcc), table, Buffer.alloc(0x200, 0xcc)]);
+    const ca = analyzeCustomBlockConstants(buf, buf.length, 0x200, 1);
+    const m = ca && ca.notes.join('\n').match(/非线性度\s*(-?\d+)/);
+    return m ? Number(m[1]) : null;
+  };
+  const aesNl = readNL(AES_SBOX);
+  const sm4Nl = readNL(SM4_SBOX);
+  const rndNl = readNL(makeCustomSbox());
+  ok(aesNl === 112, `AES 标准 S 盒非线性度 = ${aesNl}（应为 112）`);
+  ok(sm4Nl === 112, `SM4 标准 S 盒非线性度 = ${sm4Nl}（应为 112）`);
+  ok(rndNl !== null && rndNl >= 80 && rndNl <= 104, `随机置换非线性度 ${rndNl} 落在 80~104`);
+  ok(rndNl !== null && rndNl < aesNl, `随机表(${rndNl}) < 标准表(${aesNl})，指标有区分度`);
+
+  // 措辞护栏：低非线性度**不得**劝退（CTF 常见随机置换 S 盒，仍要按 S 盒用）
+  const buf = buildSynthetic({ sbox: makeCustomSbox(), ckDwords: stdCK(), fkDwords: [1, 2, 3, 4] });
+  const r = scanCryptoFingerprints(write('syn_nl_wording.bin', buf));
+  const ca = ((r.fingerprints || []).find(f => f.constantAnalysis) || {}).constantAnalysis;
+  const txt = ca ? ca.notes.join('\n') : '';
+  ok(!/别把噪声表当密码表|疑似\*\*随机占位数据\*\*/.test(txt), '低非线性度不得建议"别当密码表用"');
+  ok(/直接用题目表/.test(txt), '仍明确要求按题目表使用');
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);
 

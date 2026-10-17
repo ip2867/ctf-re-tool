@@ -1267,34 +1267,43 @@ function analyzeCustomBlockConstants(buf, size, sboxOff, sboxStride) {
 
   // ---- 0) S 盒密码学指标：非线性度（区分"精心设计表"与"随机占位表"）----
   // 来源：看雪《常见对称加密算法的混淆层(S盒)及其密码学指标》
-  // 非线性度 = 2^7 - max|Walsh谱|。8 位最优值为 112（AES/SM4 的 S 盒即 112）。
-  // 随机 256 字节表的非线性度通常明显更低（~100 或以下）。
-  // 用途：非线性度 ≥100 → 大概率是精心设计的 S 盒（值得按密码表分析）；
-  //       非线性度 <96 → 疑似随机占位数据，别浪费预算当密码表分析。
+  // 定义：NL = 2^(n-1) - (1/2)·max|Walsh 谱|（n=8 → 128 - maxW/2）。
+  // 实测标定（本机随机置换 ×8）：AES=112、SM4=112、随机置换 90~96。
+  // 判据：≥104 → 精心设计；≤100 → 与随机置换同档，疑似占位/噪声表。
+  // ⚠️ 历史缺陷（已修）：旧实现 two bugs——
+  //    ① 奇偶校验写成 (v ^ (v>>4) ^ (v>>2) ^ (v>>1)) & 1（三个移位都从**原始值**算），
+  //       漏掉 bit3/bit7 的高位传播，导致所有表 maxW 恒等于 256；
+  //    ② 非线性度少除以 2（Walsh 定义里 max|W| 的一半），于是所有表都算出 -128。
+  //       两者叠加把 AES/SM4 标准表也判成"随机占位表"，会误导 AI 放弃真 S 盒。
+  const PARITY8 = (() => {
+    const t = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) { let v = i; v ^= v >> 4; v ^= v >> 2; v ^= v >> 1; t[i] = v & 1; }
+    return t;
+  })();
   const walshMax = (() => {
-    // Walsh 谱：对每个输出 mask b 与输入 mask a，统计 (-1)^(a·x ⊕ b·S(x)) 的相关和
+    // Walsh 谱：对每个输出 mask b 与输入 mask a，统计 Σ(-1)^(a·x ⊕ b·S(x))
     let maxAbs = 0;
     for (let b = 1; b < 256; b++) {   // b=0 全零掩码无信息量
       for (let a = 1; a < 256; a++) {
         let sum = 0;
-        for (let x = 0; x < 256; x++) {
-          // parity(a&x ⊕ b&S(x))
-          let v = (a & x) ^ (b & table[x]);
-          v = (v ^ (v >> 4) ^ (v >> 2) ^ (v >> 1)) & 1;
-          sum += v ? -1 : 1;
-        }
-        if (Math.abs(sum) > maxAbs) maxAbs = Math.abs(sum);
+        for (let x = 0; x < 256; x++) sum += PARITY8[(a & x) ^ (b & table[x])] ? -1 : 1;
+        const ab = Math.abs(sum);
+        if (ab > maxAbs) maxAbs = ab;
       }
     }
     return maxAbs;
   })();
-  const nonlinearity = 128 - walshMax;   // 8 位：2^7 - max|W|
-  if (nonlinearity >= 100) {
-    notes.push(`S 盒非线性度 ${nonlinearity}（≥100，接近 8 位最优 112）→ **精心设计的密码 S 盒**，值得按分组密码分析`);
-  } else if (nonlinearity < 96) {
-    notes.push(`S 盒非线性度 ${nonlinearity}（<96，随机表典型值）→ ⚠️ 疑似**随机占位数据**而非密码 S 盒，先确认它真的被查表代码引用，别把噪声表当密码表烧预算`);
+  const nonlinearity = 128 - walshMax / 2;
+  // ⚠️ 判据只描述"设计强度"，**绝不据此劝退**：
+  //    CTF 题里的自定义 S 盒大量是随机生成的置换（只要双射就能加解密），非线性度自然接近
+  //    随机置换（实测 Disguise stage2 = 98）。若按"像随机表 → 别当密码表"去建议，
+  //    AI 会放弃一个真实在用、且能直接解出 flag 的表（这是比漏报更严重的误导）。
+  //    正确语义：低非线性度 = "这是自定义/非标准设计的表，但仍要按 S 盒用"。
+  if (nonlinearity >= 104) {
+    notes.push(`S 盒非线性度 ${nonlinearity}（AES/SM4 标准表=112）→ 精心设计的密码 S 盒`);
   } else {
-    notes.push(`S 盒非线性度 ${nonlinearity}（介于随机与最优之间）→ 设计强度一般，仍按 S 盒分析`);
+    notes.push(`S 盒非线性度 ${nonlinearity}（随机置换约 90~96，标准 AES/SM4=112）→ 该表**不是标准设计**，` +
+      `多为题目自造（随机置换也能当 S 盒用，CTF 常见）。这不影响它作为 S 盒使用：直接用题目表，别因"设计强度低"排除它`);
   }
 
   // ---- 1) S 盒与标准算法表的关系（精确 / XOR / ADD / GF(2) 仿射）----
@@ -1541,7 +1550,8 @@ function inferCipherStructure(buf, size, ca) {
         (rconOff >= 0 ? `；轮常量 Rcon @0x${rconOff.toString(16)}（${rconXor ? 'XOR 0x' + rconXor.toString(16) : '原样'}）——AES 密钥扩展铁证` : '；未找到 Rcon（可能被替换或不在扫描范围）'),
       advice: '按 AES 结构照抄：SubBytes/ShiftRows/MixColumns/AddRoundKey。轮数看 key 长度（16→10、24→12、32→14）；' +
         'S 盒' + (sboxRel.kind === 'exact' ? '为标准' : '需按关系还原或直接用题目表') + '。' +
-        '可用 gen_block_cipher_solver(skeleton="aes") 生成全组合解密脚本（轮数 10/12/14±2 自动枚举）。',
+        '可用 gen_block_cipher_solver(skeleton="aes") 生成解密脚本（仅标准轮数 10/12/14；' +
+        '轮数被改的变体需按反编译手写）。',
       rconOffset: rconOff,
       rconXor: rconXor,
     });
@@ -6207,7 +6217,7 @@ function getToolDefinitions() {
       description:
         "【分组密码解密脚本生成（多骨架）】按结构推理结果生成可运行解密脚本：" +
         "· SM4 骨架：枚举 密文×FK×key×16 种字节序/状态组合×3 种块内排列（已实战验证）" +
-        "· AES 骨架：枚举 key 长度 16/24/32（轮数 10/12/14±2）× 题目/标准 S 盒 × 字节序/状态排列" +
+        "· AES 骨架：枚举 key 长度 16/24/32（轮数 10/12/14）× 字节序/状态排列（仅标准轮数；轮数或 MixColumns 被改需手写）" +
         "· DES/Blowfish：**不支持**（会明确告知，不要假装能解）" +
         "用法：先 scan_crypto + analyze_structure 确认骨架，再调用本工具（可传 skeleton 参数覆盖默认选择），" +
         "然后 bash/run_python 跑生成的脚本。未命中不代表算法认错。",
@@ -6579,7 +6589,7 @@ print('BYTES '+data.hex())
         if (sk.fkCandidates) lines.push(`- FK 候选数: ${sk.fkCandidates.length}`);
         if (sk.keyHints) lines.push(`- key 提示数: ${sk.keyHints.length}`);
         if (chosen.skeleton === 'SM4') lines.push('- 覆盖: 4 维 × 16 种字节序/状态组合 + 3 种块内排列');
-        if (chosen.skeleton === 'AES') lines.push('- 覆盖: key 长度 16/24/32（轮数 10/12/14±2）× 题目/标准 S 盒 × 字节序/状态排列');
+        if (chosen.skeleton === 'AES') lines.push('- 覆盖: key 长度 16/24/32（标准轮数 10/12/14）× 字节序/状态排列');
         lines.push(`用法: python "${outPath}" "${f}"`);
         lines.push('⚠️ 未命中不代表算法认错——可能轮结构被改写（MixColumns 矩阵/轮函数顺序等），需按反编译实现。');
         return lines.join('\n');

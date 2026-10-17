@@ -19,6 +19,6 @@ const localRequire = (name) => {
 const mod = { exports: {} };
 // eslint-disable-next-line no-new-func
 new Function('fs', 'path', 'module', 'exports', 'require',
-  body + '\nmodule.exports = { scanCryptoFingerprints, CRYPTO_FP, classifySbox, gf2AffineFit };'
+  body + '\nmodule.exports = { scanCryptoFingerprints, CRYPTO_FP, classifySbox, gf2AffineFit, analyzeCustomBlockConstants, inferCipherStructure, findCiphertextCandidate };'
 )(fs, p, mod, mod.exports, localRequire);
 module.exports = mod.exports;

@@ -2989,6 +2989,34 @@ function truncateOutput(text) {
   return s.slice(0, MAX_OUTPUT_CHARS) + `\n...[已截断，原始长度 ${s.length} 字符]`;
 }
 
+// 工具调用的"人话"标签：UI 上显示"正在反编译 main / 正在运行 Python 脚本"，
+// 而不是裸工具名。用户等待时能看到进度，也便于复盘时定位是哪一步卡住。
+function toolLabel(name, input) {
+  const i = input || {};
+  const short = (v, n) => {
+    const s = String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+    return s.length > (n || 40) ? s.slice(0, n || 40) + '…' : s;
+  };
+  switch (name) {
+    case 'read_file': return '读取 ' + short(i.path ? path.basename(i.path) : '', 40);
+    case 'write_file': return '写入 ' + short(i.path ? path.basename(i.path) : '', 40);
+    case 'bash': return '执行命令 ' + short(i.command, 50);
+    case 'run_python': return '运行 Python 脚本' + (i.script ? `（${String(i.script).split('\n').length} 行）` : '');
+    case 'glob': return '查找文件 ' + short(i.pattern, 40);
+    case 'grep': return '搜索 ' + short(i.pattern, 40) + (i.path ? ' @' + short(path.basename(i.path), 24) : '');
+    case 'scan_crypto': return '扫描算法指纹 ' + short(i.path ? path.basename(i.path) : '', 40);
+    case 'extract_payload': return '提取载荷';
+    case 'analyze_structure': return '分析密码结构';
+    case 'gen_block_cipher_solver': case 'gen_sm4_solver': return '生成解密脚本';
+    case 'ida_decompile': return 'IDA 反编译 ' + short(i.function || i.address, 40);
+    case 'ida_get_bytes': return 'IDA 读取字节 ' + short(i.address, 30);
+    case 'ida_list_functions': return 'IDA 列出函数';
+    case 'ida_xrefs': return 'IDA 交叉引用 ' + short(i.address || i.name, 30);
+    case 'switch_to_next_stage': return '切换到下一阶段';
+    default: return name;
+  }
+}
+
 // 执行命令（渲染层/AI 通用；保留全自动，输出截断 + 控制台审计）
 ipcMain.handle('exec-command', async (event, command) => {
   console.log('[exec-command]', String(command).slice(0, 500));
@@ -5706,6 +5734,20 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
           }
         }
 
+        // 通知渲染层"即将执行某工具"——UI 上显示为可折叠的步骤条，
+        // 让用户知道长时间等待时工具真的在跑（而不是界面卡死）。
+        const emitToolEvent = (phase, extra) => {
+          try {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('claude-tool-event', {
+                phase, tool: toolCall.name, id: toolCall.id,
+                label: toolLabel(toolCall.name, toolCall.input),
+                ...(extra || {}),
+              });
+            }
+          } catch (e) { /* UI 通知失败不影响执行 */ }
+        };
+        emitToolEvent('start');
         try {
           const result = await executeToolCall(toolCall.name, toolCall.input);
           const resultText = truncateOutput(typeof result === 'string' ? result : JSON.stringify(result, null, 2));
@@ -5714,12 +5756,14 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
             content: resultText,
             is_error: false
           });
+          emitToolEvent('done', { chars: resultText.length });
         } catch (err) {
           toolResults.push({
             tool_use_id: toolCall.id,
             content: `工具调用失败: ${err.message}`,
             is_error: true
           });
+          emitToolEvent('error', { error: err.message });
         }
       }
 

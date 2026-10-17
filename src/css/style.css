@@ -743,6 +743,54 @@ body {
   border-color: var(--border-color);
 }
 
+/* ---------- 工具执行步骤（AI 调用工具时的实时进度）----------
+   长任务常连续跑 20+ 工具、几分钟无文字输出；把每一步显式列出来，
+   用户能判断"在干活"还是"卡死了"，也便于复盘定位卡点。 */
+.tool-steps {
+  margin: 0 0 16px 42px;
+  padding: 8px 10px;
+  border: 1px dashed var(--border-color);
+  border-radius: 10px;
+  background: var(--bg-tertiary);
+}
+
+.tool-step {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.tool-step-icon {
+  flex: 0 0 14px;
+  width: 14px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.tool-step-label {
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.tool-step-meta {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tool-step-running .tool-step-icon { color: var(--accent-primary); }
+.tool-step-running .tool-step-label { color: var(--text-primary); }
+.tool-step-done .tool-step-icon { color: var(--accent-green); }
+.tool-step-error .tool-step-icon { color: var(--accent-red); }
+.tool-step-error .tool-step-label { color: var(--accent-red); }
+
 .message-user {
   flex-direction: row-reverse;
 }
@@ -860,9 +908,55 @@ body {
 
 /* ---------- 输入区 ---------- */
 .chat-input-area {
+  position: relative;
   padding: 12px 16px 14px;
   border-top: 1px solid var(--border-color);
   background: var(--bg-secondary);
+}
+
+/* "回到底部"悬浮按钮：只有用户主动上滑（脱离跟随）时才出现。
+   为什么需要：流式输出期间曾每个 token 强制滚到底，用户无法向上阅读；
+   现在脱离跟随后停在原处，用这个按钮让用户主动回到最新输出。 */
+.scroll-to-bottom {
+  position: absolute;
+  top: -34px;
+  left: 50%;
+  transform: translateX(-50%) translateY(4px);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  z-index: 5;
+}
+
+.scroll-to-bottom.visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0);
+}
+
+.scroll-to-bottom:hover {
+  color: var(--accent-primary);
+  border-color: var(--accent-primary);
+}
+
+.scroll-to-bottom .scroll-new-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.scroll-to-bottom .scroll-new-hint:not(:empty)::before {
+  content: '新内容';
 }
 
 .input-toolbar {

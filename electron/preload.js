@@ -86,6 +86,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onClaudeStreamChunk: (callback) => {
     ipcRenderer.on('claude-stream-chunk', (event, delta) => callback(delta));
   },
+  // 工具执行事件（start / done / error）：UI 显示"正在跑哪个工具"
+  onClaudeToolEvent: (callback) => {
+    ipcRenderer.on('claude-tool-event', (event, info) => callback(info));
+  },
 
   // 工作目录 / 应用路径 / 设备就绪
   setWorkdir: (dir) => ipcRenderer.invoke('set-workdir', dir),

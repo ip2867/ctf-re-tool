@@ -1,0 +1,12 @@
+{
+  "id": "time-travel-elf64",
+  "name": "time-travel",
+  "main": "time_travel",
+  "type": "ELF64",
+  "notes": "运行型题（input.bin 166KB）；预期不误报内嵌载荷",
+  "expect": {
+    "payloads": [],
+    "summaryMustNotContain": ["内嵌 ELF", "内嵌 PE"],
+    "maxMs": 3000
+  }
+}

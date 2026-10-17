@@ -1,0 +1,12 @@
+{
+  "id": "bankguardian-pe-algo",
+  "name": "BankGuardian",
+  "main": "BankGuardian.exe",
+  "type": "PE",
+  "notes": "PE 明文程序；预期不掉进'文件自身是内嵌 PE'的误报，且能给出算法线索（RC4 疑）",
+  "expect": {
+    "payloads": [],
+    "summaryMustNotContain": ["内嵌 PE"],
+    "maxMs": 8000
+  }
+}

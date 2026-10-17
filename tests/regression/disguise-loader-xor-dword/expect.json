@@ -1,0 +1,21 @@
+{
+  "id": "disguise-loader-xor-dword",
+  "name": "Disguise（xmctf）",
+  "main": "Disguise.exe",
+  "type": "PE",
+  "notes": "三层：第一层 decoy + dword 数组 XOR 释放 stage2；stage2 是魔改 SM4",
+  "expect": {
+    "payloads": [
+      { "type": "pe", "offset": "0xa200", "encode": { "kind": "xor", "key": 7, "stride": 4 } }
+    ],
+    "summaryMustContain": ["内嵌 PE"],
+    "summaryMustNotContain": ["未发现算法指纹"],
+    "maxMs": 5000
+  },
+  "knownFlagSha256": "f48d1c813f4f37a08316efb9b772980fd5777aecb4662cbc26a04d0d21df8b49",
+  "note_on_flag": "答案以 SHA256 保存，避免仓库中直接暴露题解；测试用哈希比对验证",
+  "stage2Expect": {
+    "summaryMustContain": ["自定义分组密码"],
+    "minConfidence": "high"
+  }
+}

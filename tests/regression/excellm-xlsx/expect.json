@@ -1,0 +1,12 @@
+{
+  "id": "excellm-xlsx",
+  "name": "ExceLLM",
+  "main": "ExceLLM.xlsx",
+  "type": "ZIP/XLSX",
+  "notes": "非二进制容器题（xlsx）。本扫描器只负责二进制算法识别，此例用于验证**不误报**（优雅跳过）",
+  "expect": {
+    "payloads": [],
+    "summaryMustNotContain": ["内嵌 ELF", "内嵌 PE"],
+    "maxMs": 3000
+  }
+}

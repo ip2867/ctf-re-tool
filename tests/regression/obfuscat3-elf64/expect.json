@@ -1,0 +1,12 @@
+{
+  "id": "obfuscat3-elf64",
+  "name": "obfuscat3",
+  "main": "obfuscat3",
+  "type": "ELF64",
+  "notes": "混淆型 ELF64；预期不误报内嵌载荷（零指纹是合理结果）",
+  "expect": {
+    "payloads": [],
+    "summaryMustNotContain": ["内嵌 ELF", "内嵌 PE"],
+    "maxMs": 3000
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "id": "missioncritical1-elf32",
+  "name": "missioncritical1",
+  "main": "chall",
+  "type": "ELF64",
+  "notes": "ELF64；预期不误报内嵌载荷",
+  "expect": {
+    "payloads": [],
+    "summaryMustNotContain": ["内嵌 ELF", "内嵌 PE"],
+    "maxMs": 3000
+  }
+}

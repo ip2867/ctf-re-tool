@@ -1,0 +1,13 @@
+{
+  "id": "plutochat-elf64-pcap",
+  "name": "PlutoChat",
+  "main": "plutochat",
+  "type": "ELF64",
+  "notes": "ELF64 + pcap 伴生文件；自定义分组密码 S 盒 @0x3120",
+  "expect": {
+    "payloads": [],
+    "summaryMustContain": ["自定义分组密码"],
+    "summaryMustNotContain": ["内嵌 ELF", "内嵌 PE"],
+    "maxMs": 3000
+  }
+}

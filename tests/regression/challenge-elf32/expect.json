@@ -1,0 +1,13 @@
+{
+  "id": "challenge-elf32",
+  "name": "Challenge",
+  "main": "Challenge",
+  "type": "ELF32",
+  "notes": "标准 SM4（FK+S盒双命中）；预期不被误判为内嵌 ELF",
+  "expect": {
+    "payloads": [],
+    "summaryMustContain": ["SM4"],
+    "summaryMustNotContain": ["内嵌 ELF"],
+    "maxMs": 3000
+  }
+}

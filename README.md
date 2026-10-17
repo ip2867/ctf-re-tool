@@ -14,7 +14,11 @@
 - **结构化知识库**：54 页可检索手法/题解页（含 43 篇历年逆向题，带 `attack_chain` 解法链 / `reasoning_chain` 思维链 / `failed_attempts` 避坑），按关键词结构化加权检索，命中即注入 AI 上下文。
 - **经验自进化**：每次解题沉淀的多步攻击链写入经验库，下次同类题自动速查复用。
 
-**下载**：到 [Releases](https://github.com/ip2867/ctf-re-tool/releases) 下载 `CTF-RE-TOOL.exe`（便携单文件，双击即用）。
+**下载**：[v1.7.3 便携版 CTF-RE-TOOL.exe](https://github.com/ip2867/ctf-re-tool/releases/download/v1.7.3/CTF-RE-TOOL.exe)（73.9 MB，单文件双击即用，无需安装 / 无需 Node.js）
+
+> 校验：`SHA256 = 04a7c37e53c1b663379ab8683fb1863facd1e551456fffcc50634670908262d1`
+>
+> 首次运行请在「设置」页填写 IDA / JEB / jadx 等外部工具路径（本工具是调度框架，不含这些工具）。
 
 > 适用范围：CTF 竞赛、授权渗透测试、自有系统的安全研究。请勿用于未授权目标。
 

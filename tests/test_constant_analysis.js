@@ -117,7 +117,7 @@ console.log('\nD) 随机自定义 S 盒 → 必须明确说"与标准表完全�
   const buf = buildSynthetic({ sbox: makeCustomSbox(), ckDwords: stdCK(), fkDwords: [1, 2, 3, 4] });
   const r = scanCryptoFingerprints(write('syn_random.bin', buf));
   const ca = ((r.fingerprints || []).find(f => f.constantAnalysis) || {}).constantAnalysis;
-  ok(!!ca && /没有实质相同|完全不同/.test(ca.notes.join('\n')), '明确说明"与标准 SM4/AES 完全不同"');
+  ok(!!ca && /没有实质相同|完全不同|无任何可还原关系/.test(ca.notes.join('\n')), '明确说明"与标准 SM4/AES 无可还原关系"');
   ok(!/可精确还原/.test(ca.notes.join('\n')), '不编造不存在的关系');
 }
 

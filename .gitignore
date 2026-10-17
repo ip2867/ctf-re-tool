@@ -49,3 +49,17 @@ _*.log
 # Python 缓存（内置 pyc 助手运行/编译产物）
 __pycache__/
 *.pyc
+
+# 单测运行期产物（tests/test_scan_disguise.js 会释放出 stage2 中间文件）
+tests/_stage2.bin
+
+# 解题过程留下的临时产物（AI 写出的中间文件）
+payload.bin
+rks.txt
+sbox_S.bin
+
+# 回归题集：真实赛题二进制体积大、属第三方题目，不入库（只保留 expect.json 与说明）。
+# 本地准备：把题目文件放到 tests/regression/<case>/ 下（文件名见各 expect.json 的 main 字段）。
+tests/regression/*/*
+!tests/regression/*/expect.json
+!tests/regression/README.md

@@ -1,0 +1,12 @@
+{
+  "id": "parallelism-elf64",
+  "name": "parallelism",
+  "main": "parallelism",
+  "type": "ELF64",
+  "notes": "运行型题（伴生 .out 为纯数字）；预期不误报内嵌载荷",
+  "expect": {
+    "payloads": [],
+    "summaryMustNotContain": ["内嵌 ELF", "内嵌 PE"],
+    "maxMs": 3000
+  }
+}

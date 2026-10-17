@@ -1,0 +1,12 @@
+{
+  "id": "romanromance-elf64",
+  "name": "RomanRomance",
+  "main": "romanromance",
+  "type": "ELF64",
+  "notes": "ELF64 + enc.txt（34 字节短密文）；预期不误报内嵌载荷",
+  "expect": {
+    "payloads": [],
+    "summaryMustNotContain": ["内嵌 ELF", "内嵌 PE"],
+    "maxMs": 3000
+  }
+}

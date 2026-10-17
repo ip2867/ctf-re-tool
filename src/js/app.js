@@ -516,6 +516,8 @@ async function analyzeFile(filePath, opts = {}) {
     state._platformChallenge = null;
     state._platformChallengeDesc = '';
     state._platformFiles = null;
+    // 扫描结果按题缓存：换题必须清空，否则上一题的反证证据会串到本题
+    state.lastAlgScan = null;
     // 多阶段接力：接力来的新阶段保留上一阶段摘要；非接力（拖入/选择/平台新题）则清空接力态。
     if (opts.isHandoff) {
       state.stageContext = String(opts.stageContext || state.stageContext || '');
@@ -895,26 +897,62 @@ async function analyzeZipHandout(zipPath) {
 // 还会清空上一阶段结论、且 IDA 单实例（13337）无法同时开两个目标。
 // 本函数承载 AI 的 switch_to_next_stage 请求：校验 → 存证 → 提炼摘要 → kill 旧进程
 // → analyzeFile(新文件, isHandoff) → autoAnalyze 继续求解。
-const STAGE_MAX_DEPTH = 3;   // 最多接力层数（超出则停下交人工）
+// Phase 4.3：层数上限不再硬编码。
+// 固定 3 层在"三层壳 + 一层真实逻辑"的题上会提前截断；但无限接力又会因 AI 反复提取同一
+// 无效文件而空转。折中：按"是否确实产生了**新的、未访问过的**可执行文件"判断——
+// runStageHandoff 已有 md5 去重（stageVisitedMd5），这里把上限放宽到 6，由去重负责防循环。
+const STAGE_MAX_DEPTH = 6;
+// 兼容旧引用：实际判断改用 state.stageDepth 与 STAGE_MAX_DEPTH
 
 // 从 AI 文本 + findings 提炼"给下一阶段用"的摘要（控制长度，信息密度优先）
+// Phase 4.2：升级为**结构化交接包**——不只是自由文本，而是"已知事实 / 已排除路 / 下一层线索"三段式。
+// 结构化的价值：下一阶段 AI 能直接复用（密钥、算法、偏移），而不是重新读一遍散文。
 function buildStageSummary(aiText, handoff) {
   const parts = [];
   const st = state.fileInfo || {};
-  parts.push(`### 前序阶段（第 ${state.stageDepth} 层）：${st.fileName || '未知文件'}（${state.fileType || '?'}）`);
-  if (handoff && handoff.reason) parts.push(`**判定为下一阶段载体的理由**：${handoff.reason}`);
-  if (handoff && handoff.carried) parts.push(`**AI 明确要求沿用的结论**：\n${handoff.carried}`);
-  // 从 findings 提炼已识别算法/结论
+  // 与 runNegativeAssertionCheck 同因：本函数在接力作用域执行，读不到局部 `analysisData`。
+  // 统一走 state.lastAlgScan（扫描时写入、换题时清空）。
+  const sc = state.lastAlgScan || {};
   const f = state.findings || {};
+
+  parts.push(`# 第 ${state.stageDepth} 层交接包：${st.fileName || '未知文件'}（${state.fileType || '?'}）`);
+
+  // ── 1. 已知事实（确定性数据优先，AI 推测其次）──
+  const facts = [];
+  facts.push(`- 文件：\`${st.fileName || '?'}\`，大小 ${st.sizeFormatted || st.size || '?'}，类型 ${state.fileType || '?'}`);
+  if (sc.summary && sc.summary.length) {
+    for (const s of sc.summary) facts.push(`- 工具识别：**${s.algo}**（置信度 ${s.confidence}）—— ${s.evidence}`);
+  }
+  const pl = (sc.payloads || []).concat(sc.embeddedPE || []);
+  if (pl.length) {
+    const p = pl[0], e = p.encode || {};
+    facts.push(`- 本层载荷：${p.type.toUpperCase()} @0x${p.offset.toString(16)}，编码 ${e.kind || 'none'}` +
+      (p.length ? `，长度 ${p.length}` : ''));
+  }
   if (f.algorithms && f.algorithms.length) {
-    parts.push('**本阶段已识别的算法/结构**：' + f.algorithms.map(a => (a && a.text) || a).join('；'));
+    facts.push('- 已识别算法/结构：' + f.algorithms.map(a => (a && a.text) || a).join('；'));
   }
+  if (handoff && handoff.carried) facts.push(`- 上一阶段显式传下的结论：\n${String(handoff.carried).slice(0, 1200)}`);
+  parts.push('## 1. 已知事实\n' + facts.join('\n'));
+
+  // ── 2. 已排除的路（来自本地枚举的失败归因，避免下一层重复烧预算）──
+  // 注意：这里用同步可用的内存态；跨阶段持久化由 excluded_paths.json 承担（提示词侧注入）。
   if (f.flags && f.flags.length) {
-    parts.push('**本阶段出现的 flag 候选（可能为诱饵）**：' + f.flags.map(x => x.flag + (x.verified ? '（已验证）' : '（未验证）')).join('；'));
+    const decoys = f.flags.filter(x => x && !x.verified);
+    if (decoys.length) {
+      parts.push('## 2. 已排除 / 存疑\n- 本层出现的 flag 候选（**未验证，可能是诱饵**）：'
+        + decoys.map(x => `\`${x.flag}\``).join('、'));
+    }
   }
-  // 求解结论（截断，只取要点）
+
+  // ── 3. 本层结论（截断；保留具体数值/偏移，去掉客套）──
   const clean = String(aiText || '').replace(/\s+/g, ' ').trim();
-  if (clean) parts.push(`**本阶段分析结论（节选）**：\n${clean.slice(0, 2500)}`);
+  if (clean) parts.push(`## 3. 本层分析结论（节选）\n${clean.slice(0, 2000)}`);
+
+  // ── 4. 下一层任务 ──
+  parts.push(`## 4. 下一层任务\n- 当前文件是上一层的下一阶段（已提取）。**不要重复上一层的工作**。`
+    + `\n- 优先对**本层**重新做算法扫描，按识别结果走标准框架。`
+    + `\n- 若本层仍是壳/loader，继续按同样方式提取；若已是主逻辑，直接求解 flag。`);
   return parts.join('\n\n');
 }
 
@@ -987,7 +1025,127 @@ async function runStageHandoff(handoff, fromAiText) {
   }
 }
 
-// 更新文件信息UI
+// ========== Phase 4：载荷自动提取与接力 ==========
+// 为什么：即使扫描器给出了"下一层在哪、怎么解码"，实际提取仍要 AI 写脚本跑一遍。
+// 多阶段题的下一步是**确定性的**（按 offset/编码参数解码写文件），没有理由让 AI 消耗工具预算。
+// 工具直接做：解码 → 写盘 → 校验魔数 → 自动接力。
+//
+// 只处理"高置信度且参数完整"的载荷（PE/ELF/DEX、已知编码），失败则静默交给 AI 手动处理。
+function buildPayloadExtractPython(p) {
+  const e = p.encode || {};
+  const off = p.offset;
+  const n = p.length;
+  const lines = [
+    'import sys, re, base64',
+    'src, dst = sys.argv[1], sys.argv[2]',
+    'd = open(src, "rb").read()',
+    `o = ${off}`,
+  ];
+  if (n) lines.push(`n = ${n}`);
+  else lines.push('n = len(d) - o');
+  switch (e.kind) {
+    case 'none':
+      lines.push('blob = d[o:o+n]');
+      break;
+    case 'xor':
+      lines.push(`s = ${e.stride || 1}`, `key = ${e.key}`);
+      lines.push('blob = bytes(d[o+i*s] ^ key for i in range(n))');
+      break;
+    case 'add':
+      lines.push(`s = ${e.stride || 1}`, `key = ${e.key}`);
+      // 编码是 out = in + key，解码必须 **减** key（此前误写成加，导致解出乱码）。
+      lines.push('blob = bytes((d[o+i*s] - key) & 0xff for i in range(n))');
+      break;
+    case 'periodic-xor':
+      lines.push(`keys = [${(e.key || []).join(', ')}]`);
+      lines.push('blob = bytes(d[o+i] ^ keys[i % len(keys)] for i in range(n))');
+      break;
+    case 'rolling-xor':
+      lines.push('blob = bytearray(); prev = 0');
+      lines.push('for i in range(n):');
+      lines.push('    prev = d[o+i] ^ prev');
+      lines.push('    blob.append(prev)');
+      lines.push('blob = bytes(blob)');
+      break;
+    case 'rolling-add':
+      lines.push('blob = bytearray(); prev = 0');
+      lines.push('for i in range(n):');
+      lines.push('    prev = (d[o+i] - prev) & 0xff');
+      lines.push('    blob.append(prev)');
+      lines.push('blob = bytes(blob)');
+      break;
+    case 'base64':
+      lines.push('s = re.sub(rb"[^A-Za-z0-9+/=]", b"", d[o:])');
+      lines.push('s += b"=" * (-len(s) % 4)');
+      lines.push('blob = base64.b64decode(s)[:n]');
+      break;
+    case 'hex':
+      lines.push('s = re.sub(r"[^0-9a-fA-F]", "", d[o:].decode("latin-1"))');
+      lines.push('blob = bytes.fromhex(s[:n*2])');
+      break;
+    default:
+      return null;   // 未知编码：不自动提取
+  }
+  lines.push('open(dst, "wb").write(blob)');
+  lines.push('print("OK", len(blob), blob[:4].hex())');
+  return lines.join('\n');
+}
+
+// 尝试自动提取载荷。返回 { ok, path, head, p } 或 { ok:false, reason }
+async function autoExtractPayload(filePath, payload) {
+  const py = buildPayloadExtractPython(payload);
+  if (!py) return { ok: false, reason: 'unsupported-encoding' };
+  // 有 CASE 目录时用 CASE（每题独立归档）；否则用全局 scripts 目录。
+  // ⚠️ getScriptsDir() 返回的**已经是** .../scripts，不能再拼 /scripts，
+  //    否则会生成 scripts/scripts/xxx.py（实测留下的脏目录）。
+  const caseDir = state.caseDir || '';
+  const scriptsBase = caseDir ? `${caseDir}/scripts` : await getScriptsDir();
+  const outDir = caseDir ? `${caseDir}/extracted` : `${scriptsBase}/extracted`;
+  try { await window.electronAPI.ensureDir(outDir); } catch (e) { /* 忽略 */ }
+  try { await window.electronAPI.ensureDir(scriptsBase); } catch (e) { /* 忽略 */ }
+  const stem = payload.type || 'payload';
+  const outPath = `${outDir}/stage_${stem}_${payload.offset.toString(16)}.bin`;
+  const scriptPath = `${scriptsBase}/extract_${payload.offset.toString(16)}.py`;
+  await window.electronAPI.writeFile(scriptPath, py);
+  const r = await window.electronAPI.runToolArgs(['python', scriptPath, filePath, outPath]);
+  const out = ((r.stdout || '') + (r.stderr ? '\n' + r.stderr : '')).trim();
+  if (!/^OK\b/m.test(out)) return { ok: false, reason: 'extract-failed: ' + out.slice(0, 300) };
+  const m = out.match(/^OK\s+(\d+)\s+([0-9a-f]+)/m);
+  return { ok: true, path: outPath, size: m ? +m[1] : 0, head: m ? m[2] : '' };
+}
+
+// Phase 4.1：扫描到高置信度载荷时，由**工具**自动提取并接力（不等 AI 喊 switch_to_next_stage）
+async function tryAutoHandoffByPayload(filePath, algScan) {
+  const pl = (algScan && Array.isArray(algScan.payloads)) ? algScan.payloads
+    : (algScan && Array.isArray(algScan.embeddedPE) ? algScan.embeddedPE : []);
+  if (!pl.length) return { took: false };
+  // 只处理真实容器 + 高置信度（shellcode/low 不自动接力）
+  const p = pl.find(x => (x.type === 'pe' || x.type === 'elf' || x.type === 'dex') && (x.confidence === 'high' || !x.confidence));
+  if (!p) return { took: false };
+  // 已有接力深度限制 / 同文件已访问检查复用 runStageHandoff
+  addLog('info', `[自动接力] 扫描到 ${p.type.toUpperCase()} 载荷 @0x${p.offset.toString(16)}，尝试自动提取…`);
+  const ex = await autoExtractPayload(filePath, p);
+  if (!ex.ok) {
+    addLog('warning', `[自动接力] 自动提取失败（${ex.reason}），交回 AI 手动处理`);
+    return { took: false, reason: ex.reason };
+  }
+  // 校验魔数，避免把"碰巧通过结构校验"的数据接力下去
+  const expectHead = p.type === 'pe' ? '4d5a' : p.type === 'elf' ? '7f454c46' : '6465780a';
+  if (!String(ex.head || '').startsWith(expectHead.slice(0, 4))) {
+    addLog('warning', `[自动接力] 提取结果魔数不符（得到 ${ex.head}，期望 ${expectHead}），放弃自动接力`);
+    return { took: false, reason: 'bad-magic' };
+  }
+  addLog('success', `[自动接力] 已提取 ${p.type.toUpperCase()} → ${ex.path}（${ex.size} 字节，头 ${ex.head}）`);
+  addSystemMessage(`**⚙️ 工具自动提取了下一层载荷**\n\n- 类型：${p.type.toUpperCase()}\n- 来源偏移：0x${p.offset.toString(16)}\n- 提取结果：\`${ex.path}\`（${ex.size} 字节）\n\n正在自动接力到新文件…`);
+  const handoff = {
+    path: ex.path,
+    reason: `工具扫描识别的 ${p.type.toUpperCase()} 载荷（编码：${(p.encode || {}).kind || 'none'}）`,
+    carried: `上一层文件：${filePath}\n扫描结论：${(algScan.summary || []).map(s => s.algo + '/' + s.confidence).join(', ')}`,
+  };
+  const r = await runStageHandoff(handoff, '');
+  return { took: true, ok: r.ok, note: r.note, path: ex.path };
+}
+
 function updateFileInfoUI(typeResult, infoResult) {
   document.getElementById('file-drop-zone').style.display = 'none';
   document.getElementById('file-info-panel').style.display = 'block';
@@ -6846,7 +7004,139 @@ async function autoSolveBinaryFlag(fileType) {
     return;
   }
 
+  // 阶段1.7：算法指纹扫描（代码层确定性识别）——直接读文件字节，不依赖 IDA 引用关系。
+  // 实测教训：AI 每次都往 AES 猜、啃 VM handler 烧 500+ 秒，而二进制里本有确定性证据
+  // （S 盒/FK/CK/轮结构）。这里先把"工具已识别的算法"摆到 AI 面前，强引导其走标准解密路线。
+  let algHintText = '';
+  try {
+    const sc = await window.electronAPI.scanCryptoFingerprints(state.currentFile);
+    // 存到全局状态：负面断言反证（runNegativeAssertionCheck）在别的作用域，只能读 state。
+    state.lastAlgScan = (sc && sc.success) ? sc : null;
+    if (sc && sc.success && Array.isArray(sc.summary) && sc.summary.length) {
+      analysisData.algScan = sc;
+      const lines = sc.summary.map(s =>
+        `- 【${s.algo}】置信度 ${s.confidence}\n    证据：${s.evidence}\n    建议：${s.note}`);
+      algHintText = `\n## ⚙️ 工具已确定性识别的算法指纹（读文件字节扫描得出，**优先采信**）\n${lines.join('\n')}\n`;
+      // 载荷（下一层载体）命中 → 本层是 loader：必须"先提取下一层再分析它"，否则会误报 decoy 收工。
+      // payloads 覆盖 PE/ELF/DEX 多格式 × 多编码（单字节/周期/滚动 XOR、Base64/Hex 文本等）；
+      // 旧版只看 embeddedPE（仅 PE 子集），这里改为 payloads 并兼容 embeddedPE。
+      const pl = (Array.isArray(sc.payloads) && sc.payloads.length) ? sc.payloads
+        : (Array.isArray(sc.embeddedPE) ? sc.embeddedPE : []);
+      if (pl.length) {
+        const p0 = pl[0];
+        const enc = p0.encode || {};
+        const kindName = p0.type === 'pe' ? 'PE' : p0.type === 'elf' ? 'ELF' : p0.type === 'dex' ? 'DEX' : '载荷';
+        const encDesc = enc.kind === 'none' ? '明文'
+          : enc.kind === 'xor' ? `XOR 0x${(enc.key >>> 0).toString(16)}`
+          : enc.kind === 'add' ? `ADD 0x${(enc.key >>> 0).toString(16)}`
+          : enc.kind === 'periodic-xor' ? `${enc.period} 字节周期 XOR`
+          : enc.kind === 'rolling-xor' ? '滚动 XOR'
+          : enc.kind === 'rolling-add' ? '滚动 ADD'
+          : enc.kind === 'base64' ? 'Base64 文本' : enc.kind === 'hex' ? 'Hex 文本' : enc.kind;
+        algHintText += `\n### 🚫 硬性约束：本层是 loader，**禁止在本层下结论**\n`
+          + `扫描器已在文件字节里**确定性定位**出一个编码存储的 ${kindName} 载荷（${encDesc}，见上"内嵌 ${kindName}"结论，含可直接运行的提取脚本）。\n`
+          + `**第一步必须是把下一层提取出来**（按上面给的 offset/编码参数解码 → 写出文件 → 确认头部魔数正确）；\n`
+          + `然后对**新文件**重新扫描算法指纹并分析。\n`
+          + `**严禁**因为"在本层搜不到明文 MZ/ELF 头 / 找不到第二载体"就断定"真 flag 不在此文件"、或把编码后的载荷当成数据填充物——\n`
+          + `实测教训：那样会直接收工、报出第一层的诱饵（如 "This is a fake flag"）当成答案。\n`;
+        addLog('success', `[算法扫描] 载荷命中：${kindName} @0x${p0.offset.toString(16)} stride=${enc.stride || 1} ${encDesc}（本层为 loader）`);
+      }
+      if (sc.highEntropy && sc.highEntropy.length) {
+        algHintText += `\n### 疑似 key/密文常量（高熵块，供参考）\n${sc.highEntropy.map(h => `- @${h.offset} (${h.len}B) ${h.hex}`).join('\n')}\n`;
+      }
+      addLog('success', `[算法扫描] ${sc.summary.map(s => s.algo + '(' + s.confidence + ')').join(', ')}`);
+      try { await caseAddEvidence('crypto_scan', '算法指纹扫描结果', JSON.stringify(sc, null, 2), 'json'); } catch (e) {}
+    } else {
+      addLog('info', '[算法扫描] 未发现算法指纹（本层可能是壳/加载器/decoy）');
+      algHintText = `\n## ⚙️ 算法指纹扫描：**未发现任何算法常量**\n本层极可能是**壳/加载器/decoy**（SM4/AES/SM3/SHA/TEA/CRC32 常量全无）——算法在**下一层**。\n请先找内嵌/解密逻辑提取下一层，**不要在本层盲猜算法或硬逆它的 VM**。\n`;
+    }
+  } catch (e) { addLog('warning', '[算法扫描] 失败（不阻塞）: ' + e.message); }
+
+  // 阶段1.8（Phase 4.1）：工具自动提取载荷并接力——不再等 AI 主动喊 switch_to_next_stage。
+  // 理由：多阶段题的"提取下一层"是确定性操作（offset/编码参数都已由扫描给出），
+  // 让 AI 花 5~10 次工具调用去写脚本纯属浪费；工具直接做，失败才交回 AI。
+  //
+  // ⚠️ 判据必须区分两类 summary（实测踩坑）：
+  //   · **载荷定位结论**（"内嵌 PE/ELF/DEX（…已定位）"）——这是"我在哪"，**不是**"本层算法"；
+  //   · **算法指纹结论**（SM4/AES/自定义分组密码/TEA…）——这是"本层在做什么"。
+  //   旧判据用 `confidence==='high'` 统一判断，导致"内嵌 PE/high"被当成算法指纹，
+  //   于是在**每一道 loader 题**上都打印"本层同时命中了算法指纹，不自动接力"——整个自动接力形同虚设。
+  const PAYLOAD_SUMMARY_RE = /内嵌\s*(PE|ELF|DEX|载荷)|编码存储/i;
+  try {
+    const sc0 = analysisData.algScan;
+    const sums = (sc0 && Array.isArray(sc0.summary)) ? sc0.summary : [];
+    const algoSignals = sums.filter(s => !PAYLOAD_SUMMARY_RE.test(String(s.algo || ''))
+      && (s.confidence === 'high' || s.confidence === 'medium'));
+    const hasStrongAlgo = algoSignals.length > 0;
+    const hasPayload = !!(sc0 && ((sc0.payloads || []).length || (sc0.embeddedPE || []).length));
+    if (hasPayload && !hasStrongAlgo && state.stageDepth < STAGE_MAX_DEPTH) {
+      // ⚠️ 不能加 `!state._inStageHandoff`：重新接力的新阶段**也是**在 handoff 上下文里跑的，
+      //    加了这个条件等于"多层题只能自动剥一层"（实测 Disguise 三层结构会停在 stage2）。
+      //    防循环靠 runStageHandoff 里的 stageVisitedMd5 去重 + STAGE_MAX_DEPTH 上限，不靠这个标志。
+      const ah = await tryAutoHandoffByPayload(state.currentFile, sc0);
+      if (ah && ah.took) {
+        // 接力内部已递归跑完新阶段的完整求解，直接结束本层
+        addLog('success', `[自动接力] 已切换并完成下一阶段分析（${ah.path}）`);
+        return;
+      }
+    } else if (hasPayload && hasStrongAlgo) {
+      // 本层既有载荷又有真实算法：可能是"带上层数据的多阶段"或"算法就在壳里"，交 AI 判断
+      addLog('info', `[自动接力] 本层同时命中算法指纹（${algoSignals.map(s => s.algo).join(',')}），判定为主逻辑层，不自动接力`);
+    }
+  } catch (e) { addLog('warning', '[自动接力] 失败（不阻塞，交回 AI）: ' + e.message); }
+
+  // 阶段1.9（自主求解）：若扫描器已生成"SM4 变体全组合解密脚本"，**工具直接跑它**。
+  // 为什么：实测 Disguise stage2，AI 拿到全部常量后仍在字节序/块内排列上耗了 300+ 秒、59 次工具调用
+  // 仍未解出；而工具生成的脚本枚举全部组合只需 ~2 秒。这类"有限组合穷举"就该由工具做。
+  try {
+    const sc1 = analysisData.algScan;
+    const caList = ((sc1 && sc1.fingerprints) || []).map(f => f.constantAnalysis).filter(Boolean);
+    const ca = caList.find(c => c && c.decryptScript && c.decryptScript.script);
+    if (ca) {
+      addLog('info', '[自主求解] 检测到 SM4 变体结构，工具自动运行全组合解密脚本…');
+      const baseDir = state.caseDir || (await getScriptsDir());
+      const scriptsBase = state.caseDir ? `${state.caseDir}/scripts` : baseDir;
+      const pyPath = `${scriptsBase}/auto_sm4_variant.py`;
+      try { await window.electronAPI.ensureDir(scriptsBase); } catch (e) {}
+      await window.electronAPI.writeFile(pyPath, ca.decryptScript.script);
+      const rr = await window.electronAPI.runToolArgs(['python', pyPath, state.currentFile]);
+      const outTxt = ((rr.stdout || '') + (rr.stderr ? '\n' + rr.stderr : '')).trim();
+      if (outTxt) await caseAddEvidence('auto_decrypt', '自动解密脚本输出', outTxt.slice(0, 20000), 'log');
+      const fm = outTxt.match(/(?:FLAG:\s*)(\S[^\r\n]*)/);
+      if (fm && fm[1]) {
+        const flag = fm[1].trim();
+        addLog('success', `[自主求解] ✅ 自动脚本解出 flag：${flag}`);
+        recordFlag(flag, 'auto-sm4-script', true);
+        addSolveNote('自主求解', `工具自动生成的解密脚本命中：${flag}`);
+        addSystemMessage(`**🎯 工具自动解出 flag**\n\n\`${flag}\`\n\n（由工具生成的 SM4 变体全组合枚举脚本直接跑出，未经 AI 猜测）\n\n\`\`\`\n${outTxt.slice(-1500)}\n\`\`\``);
+        return;   // 已解出，无需再烧 AI 预算
+      }
+      // 未命中：必须明确"这不等于算法认错"——脚本只覆盖 SM4 骨架，换骨架就不适用。
+      addLog('info', `[自主求解] SM4 骨架脚本未命中（**不代表算法认错**），交回 AI。输出尾部：${outTxt.slice(-300).replace(/\s+/g, ' ')}`);
+      addSolveNote('自主求解', 'SM4 骨架脚本未命中 → 需按实际轮结构（可能是 AES/其它）另写实现');
+    }
+  } catch (e) { addLog('warning', '[自主求解] 自动脚本执行失败（不阻塞）: ' + e.message); }
+
   // 阶段2：AI初步分析
+  // ⚠️ 若本层已确认是 loader（有载荷但无算法），**跳过**"静态一次性分析（禁止调用工具）"阶段：
+  //    该阶段的系统提示明确禁止调工具，AI 只能输出"需要更多数据/请用户提供 stage2"——
+  //    实测（Disguise 2026-10-17）这正是它给出"请用户提供 stage2"白烧一轮的原因。
+  //    这种题的下一步是**执行**（提取下一层），直接进 Tool-Use 深挖。
+  {
+    const scL = analysisData.algScan;
+    const sumsL = (scL && Array.isArray(scL.summary)) ? scL.summary : [];
+    const PAYLOAD_RE_L = /内嵌\s*(PE|ELF|DEX|载荷)|编码存储/i;
+    const hasAlgoL = sumsL.some(s => !PAYLOAD_RE_L.test(String(s.algo || ''))
+      && (s.confidence === 'high' || s.confidence === 'medium'));
+    const hasPayloadL = !!(scL && ((scL.payloads || []).length || (scL.embeddedPE || []).length));
+    if (hasPayloadL && !hasAlgoL) {
+      addLog('info', '[阶段2] 本层是 loader（有载荷、无算法）→ 跳过静态分析，直接进入 Tool-Use 深挖（可执行提取）');
+      try { await toolUseDeepSolveBinary(analysisData, fileType); } catch (e) {
+        addLog('warning', '[阶段2] Tool-Use 深挖异常（不阻塞）: ' + e.message);
+      }
+      return;
+    }
+  }
   addLog('info', '========================================');
   addLog('info', '[阶段2] AI初步分析');
   addLog('info', '========================================');
@@ -6926,7 +7216,7 @@ async function autoSolveBinaryFlag(fileType) {
     const analysisPrompt = `我正在分析一个CTF ${fileType}题目。
 
 文件路径：${state.currentFile}
-
+${algHintText}
 以下是通过IDA MCP获取的分析数据：
 
 ## 函数列表
@@ -7088,12 +7378,74 @@ async function toolUseDeepSolveBinary(analysisData, fileType) {
     : '';
   // 成长闭环③：本题历史失败档案注入——已排除的路先摆出来，AI 优先换路而非重蹈覆辙
   const failHint = state._platformChallenge ? await failureHintSection(state._platformChallenge.name) : '';
+  // Phase 3.3：本题**已排除的候选组合**（来自上一轮本地枚举的失败归因）——避免重复烧预算
+  let excludedHint = '';
+  try {
+    const ex = await loadExcludedPaths();
+    if (ex) {
+      excludedHint = `\n## ⛔ 本题已排除的候选（上一轮本地枚举实测失败，**不要再重复尝试**）\n${ex}\n`
+        + `若仍要重试其中某条，必须先说明它与上次的本质差异（否则纯属浪费预算）。\n`;
+    }
+  } catch (e) { /* 忽略 */ }
   // 多阶段接力：上一阶段的结论摘要（壳/packer 题的 stage1 发现）注入本轮提示词
   const stageBlock = state.stageContext
     ? `\n## ⚙️ 前序阶段上下文（本题是多阶段题目，第 ${state.stageDepth} 层）\n${String(state.stageContext).slice(0, 4000)}\n⚠️ 上面的结论来自上一层文件（已分析完），当前文件是它解出的下一阶段。请**在已有结论基础上继续**，不要重复上一层的工作。\n`
     : '';
+  // 算法指纹扫描（若采集阶段未跑或未存，这里补一次）——强引导 AI 走标准解密路线
+  let algHint = '';
+  try {
+    let sc = analysisData && analysisData.algScan;
+    if (!sc && state.currentFile) sc = await window.electronAPI.scanCryptoFingerprints(state.currentFile);
+    if (sc && sc.success) state.lastAlgScan = sc;   // 供跨作用域的反证使用
+    if (sc && sc.success && Array.isArray(sc.summary) && sc.summary.length) {
+      const lines = sc.summary.map(s => `- 【${s.algo}】置信度 ${s.confidence}｜证据：${s.evidence}｜建议：${s.note}`);
+      // 硬约束触发：high 置信度判定，或发现了 256 项双射 S 盒（= 确定存在分组密码，只是常量被改）
+      // 载荷（下一层载体）命中：payloads 覆盖 PE/ELF/DEX；兼容旧 embeddedPE
+      const plDeep = (Array.isArray(sc.payloads) && sc.payloads.length) ? sc.payloads
+        : (Array.isArray(sc.embeddedPE) ? sc.embeddedPE : []);
+      const hasEmbedPE = plDeep.length > 0;
+      const hardTrigger = sc.summary.some(s => s.confidence === 'high' || /自定义分组密码/.test(s.algo));
+      // 三态（勿合并，否则低置信度命中也会被套上"必须先走标准框架"的强约束）：
+      //   载荷命中 → 本层是 loader，先提取下一层
+      //   hard 判定 → 必须先走标准解密框架
+      //   仅低置信度 → 不加硬约束（证据不足，避免误导）
+      let constraint = '';
+      if (hasEmbedPE) {
+        const p0 = plDeep[0], enc = p0.encode || {};
+        const kindName = p0.type === 'pe' ? 'PE' : p0.type === 'elf' ? 'ELF' : p0.type === 'dex' ? 'DEX' : '载荷';
+        const encDesc = enc.kind === 'none' ? '明文' : enc.kind === 'xor' ? `XOR 0x${(enc.key >>> 0).toString(16)}`
+          : enc.kind === 'add' ? `ADD 0x${(enc.key >>> 0).toString(16)}`
+          : enc.kind === 'periodic-xor' ? `${enc.period} 字节周期 XOR`
+          : enc.kind === 'rolling-xor' ? '滚动 XOR' : enc.kind === 'rolling-add' ? '滚动 ADD'
+          : enc.kind === 'base64' ? 'Base64 文本' : enc.kind === 'hex' ? 'Hex 文本' : enc.kind;
+        constraint = `**🚫 最高优先级：本层是 loader/壳，下一层已在上面给出（含提取脚本）**
+扫描器已在文件字节里**确定性定位**出一个编码存储的 ${kindName} 载荷（${encDesc}，@0x${p0.offset.toString(16)}）。**首要动作**就是按上面的脚本把它提取出来
+（解码 → 写出文件 → 确认头部魔数正确），然后对**新文件**重新扫描算法并分析。
+**禁止**：因为本层搜不到明文 MZ/ELF 头/找不到第二载体，就宣称"真 flag 不在此文件"或把编码载荷当填充物——
+实测那样会把第一层诱饵（如 "This is a fake flag"）当成答案收工。
+多阶段题必须 \`switch_to_next_stage\` 接力到提取出的新文件，而不是在当前层硬啃。\n`;
+      } else if (hardTrigger) {
+        constraint = `**⚠️ 硬性顺序约束**：上面存在 **high 置信度算法判定**，或**已确认一个 256 项双射 S 盒**（= 该程序一定含分组密码，只是常量被改）。
+→ **必须先用对应算法的标准解密框架完成验证**（SM4：32 轮 + 轮密钥逆序 rk[31-i] + 块内字节反序 [3][2][1][0]，常量换成题目表；
+   AES/自定义：按 SubBytes/ShiftRows/MixColumns 结构照抄）。\n`
+          + `只有在标准路线确实全部失败（并说明尝试了什么、报错是什么）之后，**才允许**进入"逐条 opcode 手撕 VM"的路线。
+**禁止无视本判定直接开始啃 VM 字节码或写通用 VM 解释器**（实测：那样会烧掉 500+ 秒仍无结果）。\n`;
+      }
+      algHint = `\n## ⚙️ 工具已确定性识别的算法指纹（读文件字节扫描，**优先采信**）
+${lines.join('\n')}
+${constraint}`;
+      addLog('info', `[算法扫描] 注入深度求解提示：${sc.summary.map(s => s.algo).join(', ')}`);
+    } else if (sc && sc.success) {
+      // 零指纹同样是有用信息：本层没有算法常量 → 极可能是壳/加载器/decoy，真算法在下一层
+      algHint = `\n## ⚙️ 工具已确定性扫描算法指纹：**本层未发现任何算法常量**
+含义：当前文件里没有 S 盒/FK/CK/IV/魔数等加密特征 → **本层很可能是壳、加载器或 decoy**，真正的算法在它解出的下一层（内嵌 PE / 解包后的文件）。
+**下一步**：找"释放/解密下一层"的代码（常见：`.data` 大数组按 dword 取低字节 XOR 常量 → 写新缓冲区；或 VirtualAlloc+手工映射），**dump 出下一层并对它重新扫描**；
+不要在本层反复找不存在的加解密逻辑。若本层确有可疑大数组，也可用 \`ida_get_bytes\` 直接读出来自查。\n`;
+      addLog('info', '[算法扫描] 本层零指纹 → 提示 AI 走"找下一层/dump"路线');
+    }
+  } catch (e) { /* 扫描失败不阻塞 */ }
   const prompt = `我在解一道 CTF ${fileType || '二进制'} 题，静态固定清单分析未得出 flag。请**使用工具**自主深入分析并求出 flag。
-${platDesc}${failHint}${stageBlock}
+${algHint}${platDesc}${failHint}${excludedHint}${stageBlock}
 文件路径：${state.currentFile}
 ## 已获取的函数列表（节选）
 ${fnSummary}
@@ -7202,8 +7554,37 @@ ${sideFilesBlock}
       }
 
       // 验证闭环 + 解题成功则经验自动入库（统一走 finalizeSolve 三件套）
-      await finalizeSolve(result.text, { source: 'ai-deep' });
+      const fin = await finalizeSolve(result.text, { source: 'ai-deep' });
       const vf = (state.findings ? state.findings.flags : []).filter(f => f.verified);
+
+      // ── Phase 2：负面断言被推翻 → 用证据强制 AI 再走一轮（不靠它自觉）──
+      // 实测教训（Disguise）：AI 说"文件内无第二载体"就直接收工。工具已用扫描数据反驳；
+      // 这里把反驳当作**新一轮输入**再次调用 AI，而不是只在 UI 上提示一句。
+      if (fin && fin.refuted && fin.refuted.length && fin.retryPrompt && !vf.length) {
+        addLog('warning', '[反证] 追加一轮 AI（负面断言已被推翻，强制重试）');
+        const retryMessages = [
+          { role: 'user', content: prompt },
+          { role: 'assistant', content: String(result.text || '').slice(0, 20000) },
+          { role: 'user', content: fin.retryPrompt + '\n\n请直接执行上述动作；不要重复之前的否定结论。' },
+        ];
+        try {
+          const r2 = await window.electronAPI.claudeChat(retryMessages, buildSystemPrompt());
+          if (r2 && r2.success && r2.text) {
+            state.lastAiText = r2.text;
+            addSolveNote('求解结果(反证重试)', String(r2.text).replace(/\s+/g, ' ').trim().slice(0, 3000));
+            // 重试里若又请求接力，同样处理
+            if (r2.stageSwitch && r2.stageSwitch.path) {
+              const hr = await runStageHandoff(r2.stageSwitch, r2.text);
+              if (hr.ok) return true;
+            }
+            await finalizeSolve(r2.text, { source: 'ai-deep-retry' });
+            const vf2 = (state.findings ? state.findings.flags : []).filter(f => f.verified);
+            addSystemMessage(`**🎯 Tool-Use 深度求解结果（反证后重试）**\n\n${vf2.length ? `**Flag（✅已验证）**: \`${vf2[0].flag}\`` : ''}\n\n${r2.text}`);
+            return vf2.length > 0;
+          }
+        } catch (e) { addLog('warning', '[反证] 重试失败（不阻塞）: ' + e.message); }
+      }
+
       addSystemMessage(`**🎯 Tool-Use 深度求解结果**\n\n${vf.length ? `**Flag（✅已验证）**: \`${vf[0].flag}\`` : ''}\n\n${result.text}`);
       return vf.length > 0;
     }
@@ -7530,9 +7911,18 @@ async function caseAddEvidence(kind, label, content, ext = 'txt') {
 // flag 登记去重
 // 判断一个值是否"像 flag"（xxx{...} 形态，或明确带 flag 前缀）。
 // 用于防止把 [VERIFY] 契约里的中间值（key/密文/期望值）当成 flag 记录。
+//
+// 诱饵（decoy）过滤：多阶段题**普遍**在某一层埋假 flag 诱导（实测 Disguise 第一层的校验表
+// 解出 "This is a fake flag"，工具却把"中间值命中"当成 ✅ 记下来，看起来像"解出来了"）。
+// 真 flag 不会是这种自曝身份的串——按形态直接剔除，避免"假成功"污染结论与经验库。
+const DECOY_FLAG_RE = /(fake|decoy|dummy|placeholder|not[\s_-]*the[\s_-]*real|try[\s_-]*again|wrong[\s_-]*flag|假\s*flag|这不是|诱饵)/i;
+function isDecoyFlag(s) {
+  return DECOY_FLAG_RE.test(String(s || ''));
+}
 function looksLikeFlag(v) {
   const s = String(v == null ? '' : v).trim();
   if (!s || s.length < 5 || s.length > 300) return false;
+  if (isDecoyFlag(s)) return false;                       // 诱饵串不进 flag 库
   // 标准 flag 形态：prefix{...}
   if (/^[A-Za-z][A-Za-z0-9_]*\{[^}]{1,250}\}$/.test(s)) return true;
   // 带明确 flag 前缀（flag/ctf/NCTF/SCTF...）
@@ -8160,7 +8550,12 @@ def run_one(i, a):
                 else:
                     outs.append((ke, "unknown algo " + algo)); break
             except Exception as e:
-                outs.append((ke, "ERR: " + str(e)[:120])); continue
+                # 结构化失败归因（Phase 3）：把"哪一步、什么错"显式打出，便于工具汇总回灌给 AI，
+                # 而不是让 AI 自己去读 traceback 猜。
+                _fail_reason = type(e).__name__ + ": " + str(e)[:160]
+                outs.append((ke, "ERR: " + _fail_reason))
+                print("[FAIL] attempt=%d algo=%s keyenc=%s stage=decrypt reason=%s" % (i, algo, ke, _fail_reason.replace("\\n", " ")))
+                continue
             # 归一化：AI 的 custom decrypt 常返回 str（甚至 list[int]/None），
             # 而下游 printable/FLAG_RE 都按 bytes 处理 —— 必须先转 bytes，否则直接崩。
             out = _to_bytes_out(out)
@@ -8190,6 +8585,17 @@ def run_one(i, a):
                 if fl not in _hit_seen:
                     _hit_seen.add(fl)
                     print("[HIT] attempt=%d keyenc=%s algo=%s flag=%s" % (i, ke, algo, fl))
+            else:
+                # 结构化"解密成功但没出 flag"（Phase 3 归因）：区分可打印/乱码/空，
+                # 便于工具判断是"算法对但 key/iv 错"还是"算法本身选错"。
+                if not out:
+                    _st = "empty"
+                elif _pt_score(out) == 0:
+                    _st = "garbage"
+                else:
+                    _st = "no-flag"
+                print("[MISS] attempt=%d algo=%s keyenc=%s stage=verify result=%s preview=%s"
+                      % (i, algo, ke, _st, pt[:80].replace("\\n", " ")))
     for ke, pt in outs:
         print("[OUT] attempt=%d keyenc=%s: %s" % (i, ke, pt[:400]))
 
@@ -8203,9 +8609,10 @@ for i, a in enumerate(ATTEMPTS):
 
 // 落盘并执行求解脚本，解析 [HIT]/[OUT] 行
 async function runContractScript(attempts) {
-  const baseDir = state.caseDir || (await getScriptsDir());
-  const scriptPath = `${baseDir}/scripts/solve_enum_${Date.now().toString(36)}.py`;
-  await window.electronAPI.ensureDir(`${baseDir}/scripts`);
+  // getScriptsDir() 已经返回 .../scripts，不能再拼 /scripts（否则生成 scripts/scripts/）。
+  const scriptsBase = state.caseDir ? `${state.caseDir}/scripts` : await getScriptsDir();
+  const scriptPath = `${scriptsBase}/solve_enum_${Date.now().toString(36)}.py`;
+  await window.electronAPI.ensureDir(scriptsBase);
   await window.electronAPI.writeFile(scriptPath, buildSolvePython(attempts));
   addLog('info', `[本地求解] ${attempts.length} 个尝试 -> ${scriptPath}`);
   const r = await window.electronAPI.runToolArgs(['python', scriptPath]);
@@ -8614,9 +9021,205 @@ async function failureHintSection(challengeName) {
 }
 
 async function finalizeSolve(aiText, opts = {}) {
-  const { vr, flags, verifiedFlags } = await verifyAndRecord(aiText, opts);
-  await harvestExperience(aiText, { autoSave: verifiedFlags.length > 0 });
+  // 三件事（反证 / 验证 / 经验收割）互相独立：任一抛错都不能把 AI 已产出的结果整体吞掉。
+  // 实测事故：runNegativeAssertionCheck 里一个 ReferenceError 让 autoSolveBinaryFlag 直接跳到
+  // catch，AI 那段正确的"本层是 loader、需提取 stage2"结论被丢弃，还跳过了后续 Tool-Use 深挖。
+  // 故此处逐步降级：失败只记日志，继续下一步。
+  let neg = { refuted: [], retryPrompt: '' };
+  try {
+    neg = await runNegativeAssertionCheck(aiText, opts);
+  } catch (e) { addLog('warning', '[反证] 异常（已隔离，不阻塞求解）: ' + e.message); }
+
+  let vr = null, flags = [], verifiedFlags = [];
+  try {
+    const r = await verifyAndRecord(aiText, opts);
+    vr = r.vr; flags = r.flags || []; verifiedFlags = r.verifiedFlags || [];
+  } catch (e) { addLog('warning', '[验证闭环] 异常（已隔离，不阻塞求解）: ' + e.message); }
+
+  try {
+    await harvestExperience(aiText, { autoSave: verifiedFlags.length > 0 });
+  } catch (e) { addLog('warning', '[经验] 收割异常（已隔离）: ' + e.message); }
+
+  if (neg && neg.refuted.length && !verifiedFlags.length) {
+    return { vr, flags, verifiedFlags, refuted: neg.refuted, retryPrompt: neg.retryPrompt };
+  }
   return { vr, flags, verifiedFlags };
+}
+
+// ========== 负面断言反证（Phase 2）==========
+// 为什么需要（Disguise 实测）：AI 说"文件内无第二可执行载体，真 flag 不在此文件"，工具**直接采信**，
+// 于是收工报了个诱饵。事实是 stage2 就在 .data 里，只是被编码存储、明文搜 MZ 搜不到。
+// 原则：**AI 的否定性结论必须被数据验证**，工具不能只是被动采信。
+//
+// 结构：每条规则 = { id, detect(文本) -> bool, verify(ctx) -> 反驳文本|null, retryPrompt }
+//   · detect：识别"AI 在断言不存在某物"
+//   · verify：用确定性数据（扫描结果、文件字节）验证该断言是否成立；成立返回 null，不成立返回证据
+//   · 验证器只允许报**确定性事实**（偏移/长度/魔数），不给模糊判断 → 避免用猜测反驳猜测。
+function buildNegativeAssertionRules() {
+  return [
+    {
+      id: 'no-second-carrier',
+      // 断言"没有第二载体/内嵌文件/下一层"，或"上一层缺下一层数据我无法继续"
+      detect: (t) => /(无|没有|不存在|未发现|找不到|搜不到|missing|no)\s*[^。\n]{0,24}(第二|另一个|内嵌|嵌入|下一层|second|embedded|next[- ]stage|另一个可执行|可执行载体|PE\s*载荷)/i.test(t)
+        || /(真\s*flag\s*(不在|不在此)|flag\s*不在此文件|not\s+in\s+this\s+file)/i.test(t)
+        // "stage2 未提供 / 没有 stage2 的内容 / 缺 stage2" → 同样属于"以为拿不到下一层"
+        || /(stage\s*\d+|下一层|下一阶段)[^。\n]{0,20}(未|没有|无法|缺|missing|not\s+provided|not\s+available)/i.test(t),
+      verify: (ctx) => {
+        const sc = ctx.algScan || {};
+        const pl = Array.isArray(sc.payloads) ? sc.payloads : (Array.isArray(sc.embeddedPE) ? sc.embeddedPE : []);
+        if (!pl.length) return null;   // 确实没有 → 断言成立，不反驳
+        const p = pl[0];
+        const e = p.encode || {};
+        const typeName = p.type === 'pe' ? 'PE' : p.type === 'elf' ? 'ELF' : p.type === 'dex' ? 'DEX' : '载荷';
+        const how = e.kind === 'none' ? '明文'
+          : e.kind === 'xor' ? `XOR 0x${(e.key >>> 0).toString(16)}`
+          : e.kind === 'add' ? `ADD 0x${(e.key >>> 0).toString(16)}`
+          : e.kind === 'periodic-xor' ? `${e.period} 字节周期 XOR`
+          : e.kind === 'rolling-xor' ? '滚动 XOR' : e.kind === 'rolling-add' ? '滚动 ADD'
+          : e.kind === 'base64' ? 'Base64 文本' : e.kind === 'hex' ? 'Hex 文本' : e.kind;
+        return `**你的结论"没有第二载体"被工具数据推翻**：扫描器在文件偏移 **0x${p.offset.toString(16)}** 处`
+          + `确定性定位到一个**编码存储的 ${typeName} 载荷**（${how}，步长 ${e.stride || 1}`
+          + (p.length ? `，长度 ${p.length} 字节` : '')
+          + `）。它之所以"搜不到"，是因为 ${typeName} 头被编码掩盖了——不是不存在。`
+          + `\n下一步：按扫描结论里的提取脚本解码写出该文件，对**新文件**重新分析；不要在本层下"真 flag 不在此文件"的结论。`;
+      },
+      // 反驳后要求 AI 重做的具体动作（工具无法代替 AI 完成"分析下一层"，但能强制它先提取）
+      retryPrompt: (ctx) => {
+        const sc = ctx.algScan || {};
+        const pl = Array.isArray(sc.payloads) ? sc.payloads : [];
+        const p = pl[0];
+        if (!p) return null;
+        return `⛔ 复核：你刚才断言"没有第二载体/真 flag 不在此文件"，但工具的字节扫描在 0x${p.offset.toString(16)} 找到了编码后的 ${p.type.toUpperCase()} 载荷。`
+          + `请**立即按提取脚本解码出该文件**（run_python），确认其头部魔数后，用 switch_to_next_stage 接力到新文件继续；不要就此收工。`;
+      },
+    },
+    {
+      id: 'delegates-to-user',
+      // 断言"需要用户提供 / 请把 stage2 发我 / 需要人工提取"——把可自动完成的活推给人。
+      // 实测（Disguise）：AI 正确判断"本层是 loader、缺 stage2"，但结论是"请用户提供 stage2"，
+      // 而工具**本可以自己提取**。这类"正确的诊断 + 错误的行动"最难被人工发现，必须拦下。
+      detect: (t) => /(请|需要|麻烦|建议)\s*(用户|你|人工|手动)\s*[^。\n]{0,24}(提供|给出|上传|提取|dump|发|补)/i.test(t)
+        || /(需要|待)\s*(人工|用户)\s*(提供|提取|介入|处理)/i.test(t)
+        || /(stage2|下一层|内嵌文件|payload)\s*(未|没有|无法)\s*(提供|获取|提取)/i.test(t),
+      verify: (ctx) => {
+        const sc = ctx.algScan || {};
+        const pl = Array.isArray(sc.payloads) ? sc.payloads : (Array.isArray(sc.embeddedPE) ? sc.embeddedPE : []);
+        if (!pl.length) return null;          // 没有载荷 → 确实需要人工，不反驳
+        const p = pl[0], e = p.encode || {};
+        const how = e.kind === 'none' ? '明文'
+          : e.kind === 'xor' ? `XOR 0x${(e.key >>> 0).toString(16)}`
+          : e.kind === 'add' ? `ADD 0x${(e.key >>> 0).toString(16)}`
+          : e.kind === 'periodic-xor' ? `${e.period} 字节周期 XOR`
+          : e.kind === 'rolling-xor' ? '滚动 XOR' : e.kind === 'rolling-add' ? '滚动 ADD'
+          : e.kind === 'base64' ? 'Base64 文本' : e.kind === 'hex' ? 'Hex 文本' : e.kind;
+        return `**这个结论把工具能做的事推给了用户**：下一层载荷的提取是**纯确定性操作**，`
+          + `扫描器已给出全部参数（偏移 0x${p.offset.toString(16)}、${how}`
+          + (p.length ? `、长度 ${p.length}` : '') + `），不需要人工提供。`
+          + `\n正确做法：直接用 run_python 按参数解码并写出文件（工具也会自动接力），然后分析新文件。`;
+      },
+      retryPrompt: (ctx) => {
+        const sc = ctx.algScan || {};
+        const pl = Array.isArray(sc.payloads) ? sc.payloads : [];
+        const p = pl[0];
+        if (!p) return null;
+        return `⛔ 复核：你把"提取下一层"推给了用户，但这是确定性操作。`
+          + `请**自己用 run_python** 按偏移 0x${p.offset.toString(16)} / ${p.encode.kind} 参数解码并写出文件，`
+          + `校验 MZ/ELF 魔数后继续分析；不要要求用户提供。`;
+      },
+    },
+    {
+      id: 'no-crypto',
+      // 断言"没有加密/没有算法/是明文"
+      detect: (t) => /(没有|无|不含|未使用|不存在|no)\s*[^。\n]{0,16}(加密|算法|密码|crypto|encrypt|cipher)/i.test(t)
+        && !/(可能|疑似|或许|不确定|待确认)/.test(t),
+      verify: (ctx) => {
+        const sc = ctx.algScan || {};
+        const strong = (sc.summary || []).filter(s => s.confidence === 'high' || s.confidence === 'medium');
+        if (!strong.length) return null;
+        return `**你的结论"没有加密/算法"被工具数据推翻**：扫描器从文件字节里确定性识别到 `
+          + strong.map(s => `${s.algo}（${s.confidence}）`).join('、')
+          + `。证据：${strong[0].evidence}`;
+      },
+      retryPrompt: (ctx) => {
+        const sc = ctx.algScan || {};
+        const strong = (sc.summary || []).find(s => s.confidence === 'high');
+        if (!strong) return null;
+        return `⛔ 复核：你断言"没有加密算法"，但扫描器识别到 ${strong.algo}（high）。请按该算法的标准框架验证，不要断言"无加密"。`;
+      },
+    },
+    {
+      id: 'no-decoding',
+      // 断言"没有解密/解码逻辑"
+      detect: (t) => /(没有|无|不存在|未发现|no)\s*[^。\n]{0,16}(解密|解码|脱壳|decrypt|unpack|decod)/i.test(t),
+      verify: (ctx) => {
+        const sc = ctx.algScan || {};
+        const pl = Array.isArray(sc.payloads) ? sc.payloads : [];
+        if (!pl.length) return null;
+        const p = pl[0], e = p.encode || {};
+        if (!e.kind || e.kind === 'none') return null;
+        return `**你的结论"没有解密/解码逻辑"被工具数据推翻**：文件偏移 0x${p.offset.toString(16)} 处的 ${p.type.toUpperCase()} 载荷`
+          + `就是被编码存储的（${e.kind}${e.key != null ? ` key=0x${(e.key >>> 0).toString(16)}` : ''}）。编码本身就是解码逻辑的产物。`;
+      },
+      retryPrompt: () => `⛔ 复核：你断言"没有解码逻辑"，但工具找到了编码存储的载荷。请先解码提取，再看它的解码程序逻辑。`,
+    },
+    {
+      id: 'no-vm',
+      // 断言"没有 VM / 不是 VM"
+      detect: (t) => /(没有|无|不是|并非|no)\s*[^。\n]{0,8}(VM|虚拟机|解释器|字节码)/i.test(t),
+      verify: (ctx) => {
+        // VM 无法从静态字节可靠判定 → 只在**已确认分组密码 S 盒**时反驳（那种题几乎都套 VM 外壳）
+        const sc = ctx.algScan || {};
+        const cb = (sc.summary || []).find(s => /自定义分组密码/.test(s.algo) && s.confidence === 'high');
+        if (!cb) return null;
+        return `**"没有 VM"这个结论不可靠**：扫描器已确认存在 256 项双射 S 盒（自定义分组密码）。`
+          + `实测同类题（Disguise）的 VM 只是**外壳**，真正的算法是魔改 SM4——不要因为"找不到 VM"就放弃，`
+          + `也不要因为"找到了 VM"就去硬逆它。优先按分组密码结构验证。`;
+      },
+      retryPrompt: () => `⛔ 复核：你断言"没有 VM"，但已确认存在分组密码。请改为验证分组密码结构（S盒/轮函数/轮密钥），而不是纠结 VM 存不存在。`,
+    },
+  ];
+}
+
+// 对 AI 的最终文本跑一遍负面断言反证。返回 { refuted: [{id, evidence}], retryPrompt }
+// 注意：一次只反证**前两条**，避免把提示词撑爆；且只反证有确定性证据的。
+function checkNegativeAssertions(aiText, ctx) {
+  const text = String(aiText || '');
+  if (!text) return { refuted: [], retryPrompt: '' };
+  const rules = buildNegativeAssertionRules();
+  const refuted = [];
+  const prompts = [];
+  for (const rule of rules) {
+    if (refuted.length >= 2) break;
+    let hit = false;
+    try { hit = rule.detect(text); } catch (e) { continue; }
+    if (!hit) continue;
+    let evidence = null;
+    try { evidence = rule.verify(ctx || {}); } catch (e) { evidence = null; }
+    if (!evidence) continue;   // 断言成立（或无确定性证据）→ 不反驳
+    refuted.push({ id: rule.id, evidence });
+    try {
+      const rp = rule.retryPrompt ? rule.retryPrompt(ctx || {}) : null;
+      if (rp) prompts.push(rp);
+    } catch (e) { /* 忽略 */ }
+  }
+  return { refuted, retryPrompt: prompts.join('\n\n') };
+}
+
+// 执行反证：把证据落盘 + 记日志 + 返回是否被推翻（供调用方决定是否追加一轮 AI）
+// ⚠️ algScan 必须由调用方显式传入：`analysisData` 是 autoSolveBinaryFlag 的**局部变量**，
+//    本函数在另一作用域（且会被多个求解流程调用），引用它会抛 ReferenceError 并吞掉整轮 AI 结果。
+//    实测代价：Disguise 那轮 AI 已经给出了正确的"本层是 loader、需提取 stage2"结论，却因这个异常被丢弃。
+async function runNegativeAssertionCheck(aiText, opts = {}) {
+  const algScan = opts.algScan || (state.lastAlgScan || null);
+  if (!algScan) return { refuted: [], retryPrompt: '' };   // 无扫描数据 → 无从反证，直接放行
+  const ctx = { algScan };
+  const r = checkNegativeAssertions(aiText, ctx);
+  if (!r.refuted.length) return r;
+  addLog('warning', `[反证] AI 的负面结论被数据推翻 ${r.refuted.length} 条：${r.refuted.map(x => x.id).join(', ')}`);
+  addSolveNote('负面断言反证', r.refuted.map(x => `[${x.id}] ${x.evidence.replace(/\s+/g, ' ').slice(0, 200)}`).join(' || '));
+  try { await caseAddEvidence('negative_assertion', '负面断言反证', r.refuted.map(x => `## ${x.id}\n${x.evidence}`).join('\n\n---\n\n'), 'md'); } catch (e) {}
+  addSystemMessage(`**🔍 负面断言反证**\n\nAI 的否定性结论被工具数据推翻：\n\n${r.refuted.map(x => x.evidence).join('\n\n')}`);
+  return r;
 }
 
 // 验证闭环：解析 [VERIFY] → 本地复现 → 标记 flag 验证状态
@@ -8632,18 +9235,22 @@ async function runVerification(aiText) {
   // 契约里 expected 明确是 flag 形态的，也记下来（未验证）
   contracts.forEach(c => { if (c && looksLikeFlag(c.expected)) recordFlag(String(c.expected).trim(), 'verify-contract', false); });
 
-  // 命中值：只有"确实像 flag"的才是真 flag；其余（key/中间值）仅视为复现成功、不入 flag 库
+  // 命中值分三类（诱饵必须单独识别，否则"命中 fake flag"会被当成验证通过 = 假成功）：
+  //   flagHits = 真 flag 形态；decoyHits = 诱饵串（fake/decoy/假flag）
   const flagHits = r.hits.filter(h => looksLikeFlag(h));
-  const verified = r.hits.length > 0;
+  const decoyHits = r.hits.filter(h => !looksLikeFlag(h) && isDecoyFlag(h));
+  const verified = flagHits.length > 0;
   // 命中是 flag → 标同值 flag 为已验证
   flagHits.forEach(h => recordFlag(h, 'verify', true));
   // 命中不是 flag（中间值/key）但复现成功 → 把契约 expected 对应的 flag 一并标验证？
   // 不能：中间值复现不等于 flag 被验证。故仅当存在 flag 形态命中时才标验证。
   const note = flagHits.length
     ? `本地复现通过（flag）：${flagHits.join(', ')}`
-    : (verified ? `本地复现通过（命中中间值/密钥，非 flag）：${r.hits.join(', ')}` : `本地复现失败（${contracts.length} 个契约无命中）`);
+    : (decoyHits.length
+      ? `本地复现只命中**诱饵**（非真 flag）：${decoyHits.join(', ')} —— 当前层是 decoy，真 flag 在下一层载体`
+      : (r.hits.length ? `本地复现通过（命中中间值/密钥，非 flag）：${r.hits.join(', ')}` : `本地复现失败（${contracts.length} 个契约无命中）`));
   addSolveNote('验证', note);
-  addLog(flagHits.length ? 'success' : (verified ? 'info' : 'warning'), `[验证闭环] ${note}`);
+  addLog(flagHits.length ? 'success' : (decoyHits.length ? 'warning' : (r.hits.length ? 'info' : 'warning')), `[验证闭环] ${note}`);
 
   // ===== 多候选密文交叉校验（防"变种题"陷阱）=====
   // 即使本地复现"通过"了，也要确认用的是 so 里**真正被校验**的那条密文，而不是随便一条。
@@ -8757,6 +9364,121 @@ function synthesizeHypotheses(contracts) {
   return out;
 }
 
+// 解析求解脚本的结构化失败输出 → 归因摘要（Phase 3）
+// 目的：把"30 个脚本都失败"变成"22 个算法选错（garbage）、5 个 key 错（no-flag）、3 个报错（TypeError）"，
+// 让 AI 下一步有方向，而不是重头再来。
+function attributeFailure(output, attempts) {
+  const text = String(output || '');
+  const fails = [];     // [{attempt, algo, keyenc, stage, reason}]
+  const misses = [];    // [{attempt, algo, keyenc, result, preview}]
+  let m;
+  const reF = /\[FAIL\]\s*attempt=(\d+)\s+algo=(\S+)\s+keyenc=(\S+)\s+stage=(\S+)\s+reason=([^\r\n]*)/gi;
+  while ((m = reF.exec(text)) !== null) {
+    fails.push({ attempt: +m[1], algo: m[2], keyenc: m[3], stage: m[4], reason: m[5].trim() });
+  }
+  const reM = /\[MISS\]\s*attempt=(\d+)\s+algo=(\S+)\s+keyenc=(\S+)\s+stage=(\S+)\s+result=(\S+)\s+preview=([^\r\n]*)/gi;
+  while ((m = reM.exec(text)) !== null) {
+    misses.push({ attempt: +m[1], algo: m[2], keyenc: m[3], stage: m[4], result: m[5], preview: m[6].trim() });
+  }
+  const total = Array.isArray(attempts) ? attempts.length : 0;
+  const errFails = fails.filter(f => /^decrypt$/.test(f.stage));
+  const garbage = misses.filter(x => x.result === 'garbage').length;
+  const empty = misses.filter(x => x.result === 'empty').length;
+  const noFlag = misses.filter(x => x.result === 'no-flag').length;
+  const algoSet = [...new Set(misses.map(x => x.algo).concat(fails.map(f => f.algo)))];
+  // 归因结论：给出"最可能是什么错了"的判断（仅基于结构化输出，不猜测）
+  const hints = [];
+  if (errFails.length) {
+    const byReason = {};
+    for (const f of errFails) { const k = f.reason.split(':')[0]; byReason[k] = (byReason[k] || 0) + 1; }
+    hints.push(`解密阶段报错 ${errFails.length} 次（${Object.entries(byReason).map(([k, v]) => k + '×' + v).join(', ')}）→ 多为参数形态不匹配（key 长度/编码/函数签名），不是算法错`);
+  }
+  if (garbage > 0) hints.push(`解出乱码 ${garbage} 次 → 算法或 key/iv 选错（若全部乱码，优先换算法族而不是换 key）`);
+  if (empty > 0) hints.push(`解出空串 ${empty} 次 → 密文/偏移取错，或该候选不是这条数据`);
+  if (noFlag > 0) hints.push(`解出可打印但无 flag ${noFlag} 次 → 可能是中间值层（还需再解一层）或 key 正确但算法模式（ECB/CBC/轮序）错`);
+  if (!fails.length && !misses.length && total) hints.push('脚本未输出结构化归因（旧模板或执行异常）');
+  return {
+    total, fails, misses,
+    summary: { errFails: errFails.length, garbage, empty, noFlag, algos: algoSet },
+    hints,
+    text: hints.length ? hints.join('\n') : '（无可用归因）',
+  };
+}
+
+// Phase 3.3：把"已排除的路"持久化到本题 CASE，下次注入提示词（避免重复烧预算）
+function excludedPathKey() { return state.caseDir ? `${state.caseDir}/excluded_paths.json` : ''; }
+async function saveExcludedPaths(entries) {
+  const key = excludedPathKey();
+  if (!key || !Array.isArray(entries) || !entries.length) return;
+  try {
+    const rf = await window.electronAPI.readFile(key);
+    let cur = [];
+    if (rf && rf.success) { try { cur = JSON.parse(rf.content || '[]'); } catch (e) { cur = []; } }
+    const seen = new Set(cur.map(x => `${x.algo}|${x.keyenc}|${x.reason}`));
+    for (const e of entries) {
+      const k = `${e.algo}|${e.keyenc}|${e.reason}`;
+      if (!seen.has(k)) { cur.push({ ...e, ts: new Date().toISOString() }); seen.add(k); }
+    }
+    await window.electronAPI.writeFile(key, JSON.stringify(cur.slice(-40), null, 2));
+  } catch (e) { /* 落盘失败不阻塞 */ }
+}
+async function loadExcludedPaths() {
+  const key = excludedPathKey();
+  if (!key) return '';
+  try {
+    const rf = await window.electronAPI.readFile(key);
+    if (!rf || !rf.success) return '';
+    const arr = JSON.parse(rf.content || '[]');
+    if (!Array.isArray(arr) || !arr.length) return '';
+    const uniq = [];
+    const seen = new Set();
+    for (const x of arr) {
+      const k = `${x.algo}|${x.keyenc}|${x.reason}`;
+      if (seen.has(k)) continue;
+      seen.add(k); uniq.push(x);
+    }
+    return uniq.slice(-12).map(x => `- ${x.algo}（key 编码 ${x.keyenc}）：${x.reason}`).join('\n');
+  } catch (e) { return ''; }
+}
+
+// Phase 3.3：按**信息增益**给候选排序（不是随机顺序，也不是全并行）。
+// 依据：① 工具已识别的算法（high 置信度）优先；② 短 key 优先（计算快、常见）；
+//      ③ 常见编码（hex/ascii）优先；④ 已排除的组合降权到末尾（仍保留一次机会，但最后试）。
+// 这比"全并行"更实用：脚本是单进程顺序执行，真正省时间的是"先试最可能成功的"。
+function rankAttempts(attempts, opts = {}) {
+  if (!Array.isArray(attempts)) return [];
+  const known = (opts.knownAlgos || []).map(a => String(a).toLowerCase());
+  const excluded = opts.excluded || new Set();
+  const score = (a) => {
+    let s = 0;
+    const algo = String(a.algo || '').toLowerCase();
+    const ke = String(a.key_encoding || 'ascii').toLowerCase();
+    const key = String(a.key == null ? '' : a.key);
+    // 工具识别出的算法：高优先级
+    if (known.some(k => k && (algo.includes(k) || k.includes(algo)))) s += 100;
+    // 标准算法族略优先于 custom（custom 依赖 AI 的代码质量）
+    if (algo === 'custom' || algo === 'node_js') s -= 10;
+    // 常见 key 编码
+    if (ke === 'hex') s += 8;
+    else if (ke === 'ascii') s += 6;
+    else if (ke === 'base64') s += 2;
+    // 常见 key 长度（8/16/24/32 字节）
+    const kl = key.length;
+    if ([8, 16, 24, 32].includes(kl)) s += 5;
+    // 无 expected 的候选优先级略低（AI 自己也不确定）
+    if (!a.expected) s -= 3;
+    if (!a.ciphertext) s -= 20;
+    // 已排除组合：降到末尾（仍试，但最后）
+    const ek = `${algo}|${ke}`;
+    if (excluded.has(ek)) s -= 200;
+    return s;
+  };
+  return attempts
+    .map((a, i) => ({ a, i, s: score(a) }))
+    .sort((x, y) => (y.s - x.s) || (x.i - y.i))
+    .map(x => x.a);
+}
+
 // 本地枚举：解析 [HYPOTHESES] → 并行尝试全部组合 → 命中即记
 async function runHypotheses(aiText, opts = {}) {
   let attempts = Array.isArray(aiText) ? aiText : parseHypotheses(aiText);
@@ -8769,20 +9491,79 @@ async function runHypotheses(aiText, opts = {}) {
     addLog('warning', '[本地枚举] 无可枚举候选（AI 未给 [HYPOTHESES]，且缺少可合成的密文契约）');
     return null;
   }
+  // Phase 3.3：剪掉"上次已排除"的候选（同 algo+keyenc+密文前缀 且已知失败原因）
+  const excluded = await loadExcludedPaths();
+  if (excluded && attempts.length > 4) {
+    // 只做提示，不硬剪（AI 可能这轮换了 key/密文，硬剪会误伤）；真正的剪枝信息在下方注入
+    addLog('info', '[本地枚举] 已加载本题历史排除路径（将随结果一并回灌）');
+  }
   const cap = opts.synthFrom ? 24 : 16;
   if (attempts.length > cap) attempts = attempts.slice(0, cap);
+  // Phase 3.3：按信息增益排序（工具识别的算法优先、已排除组合降权到末尾）
+  try {
+    // 同样只能读 state（本函数在多个求解流程里被调用，没有 analysisData 入参）
+    const knownAlgos = ((state.lastAlgScan && state.lastAlgScan.summary) || [])
+      .filter(s => (s.confidence === 'high' || s.confidence === 'medium')
+        && !/内嵌\s*(PE|ELF|DEX|载荷)|编码存储/i.test(String(s.algo || '')))   // 排除"载荷定位"类结论
+      .map(s => s.algo);
+    const exSet = new Set();
+    if (excluded) {
+      for (const line of String(excluded).split('\n')) {
+        const m = line.match(/^-\s*(\S+)（key 编码 (\S+)）/);
+        if (m) exSet.add(`${m[1].toLowerCase()}|${m[2].toLowerCase()}`);
+      }
+    }
+    attempts = rankAttempts(attempts, { knownAlgos, excluded: exSet });
+    if (knownAlgos.length) addLog('info', `[本地枚举] 已按信息增益排序（优先：${knownAlgos.join('/')}）`);
+  } catch (e) { /* 排序失败不阻塞 */ }
   addLog('info', `[本地枚举] ${attempts.length} 个候选组合（算法/密钥/字节序）...`);
   const r = await runContractScript(attempts);
   if (r.output) caseAddEvidence('hypotheses', '假设枚举输出', r.output, 'log');
-  if (r.hits.length) {
-    r.hits.forEach(h => recordFlag(h, 'hypotheses', true));
-    addSolveNote('本地枚举命中', r.hits.join(', '));
-    addLog('success', `[本地枚举] ✅ 命中: ${r.hits.join(', ')}`);
-    addSystemMessage(`**🎯 本地枚举命中**\n\n${r.hits.map(h => `\`${h}\``).join('\n\n')}\n\n（算法/密钥/字节序组合由 AI 假设 + 本地并行验证得出）`);
-    return { verified: true, hits: r.hits };
+
+  // Phase 3.2：结构化归因（失败也有信息量）
+  const attr = attributeFailure(r.output, attempts);
+  if (attr.total > 1) {
+    addLog('info', `[归因] ${attr.text.replace(/\n/g, ' | ')}`);
+    addSolveNote('失败归因', attr.text.replace(/\n/g, ' ').slice(0, 500));
+    // 把失败候选登记为"已排除路"（供下一轮提示词，避免重跑）
+    const excludedEntries = [];
+    for (const f of attr.fails.slice(0, 8)) {
+      const a = attempts[f.attempt] || {};
+      excludedEntries.push({ algo: f.algo, keyenc: f.keyenc, reason: `${f.stage} 报错 ${f.reason.slice(0, 60)}`, key: String(a.key || '').slice(0, 32) });
+    }
+    for (const x of attr.misses.filter(x => x.result === 'garbage').slice(0, 8)) {
+      const a = attempts[x.attempt] || {};
+      excludedEntries.push({ algo: x.algo, keyenc: x.keyenc, reason: '解出乱码（算法/key/iv 不符）', key: String(a.key || '').slice(0, 32) });
+    }
+    if (excludedEntries.length) await saveExcludedPaths(excludedEntries);
+  }
+
+  // 区分三类命中（举一反三：多阶段题普遍在第一层埋诱饵，把诱饵当"✅命中"= 假成功收工）：
+  //   · 真 flag 形态 → 确认成功
+  //   · 诱饵串（fake/decoy/假flag…）→ 只提示"这是诱饵，继续找真载体"，绝不报成功
+  //   · 其它（key/中间值）→ 复现成功但非 flag
+  const flagHits = r.hits.filter(h => looksLikeFlag(h));
+  const decoyHits = r.hits.filter(h => !looksLikeFlag(h) && isDecoyFlag(h));
+  const midHits = r.hits.filter(h => !looksLikeFlag(h) && !isDecoyFlag(h));
+  if (flagHits.length) {
+    flagHits.forEach(h => recordFlag(h, 'hypotheses', true));
+    addSolveNote('本地枚举命中', flagHits.join(', '));
+    addLog('success', `[本地枚举] ✅ 命中: ${flagHits.join(', ')}`);
+    addSystemMessage(`**🎯 本地枚举命中**\n\n${flagHits.map(h => `\`${h}\``).join('\n\n')}\n\n（算法/密钥/字节序组合由 AI 假设 + 本地并行验证得出）`);
+    return { verified: true, hits: flagHits, attribution: attr, excluded };
+  }
+  if (decoyHits.length) {
+    addSolveNote('本地枚举', `命中诱饵（非真 flag）：${decoyHits.join(', ')}`);
+    addLog('warning', `[本地枚举] ⚠️ 命中的是**诱饵**（如 fake/假flag）：${decoyHits.join(', ')} —— 本题该层是 decoy，真 flag 在下一层载体里`);
+    addSystemMessage(`**⚠️ 本地枚举只命中了"诱饵"**\n\n${decoyHits.map(h => `\`${h}\``).join('\n\n')}\n\n这类串自曝身份（fake/假flag），**不是真 flag**。说明当前层是**诱饵层/壳**——请找出并提取下一层载体（内嵌 PE/解密后的文件）后继续，不要就此收工。`);
+    return { verified: false, hits: [], decoy: decoyHits, attribution: attr, excluded };
+  }
+  if (midHits.length) {
+    addLog('info', `[本地枚举] 命中中间值/密钥（非 flag）：${midHits.join(', ')}`);
+    return { verified: false, hits: [], mid: midHits, attribution: attr, excluded };
   }
   addLog(opts.quiet ? 'info' : 'warning', '[本地枚举] 全部候选未命中，输出已存入证据目录');
-  return { verified: false, hits: [] };
+  return { verified: false, hits: [], attribution: attr, excluded };
 }
 
 // 经验去重键：剥离「- [日期] 」前缀与全部标点/空白后比对。
@@ -9072,6 +9853,7 @@ function extractFlags(text) {
     if (/^(.)\1*$/.test(inner)) return true;              // 单一字符重复
     if (/['"]\s*\+|\+\s*['"]|bytes\(/.test(inner)) return true;  // 代码拼接片段（如 '+bytes(s)+b'）不是 flag
     if (/[\u4e00-\u9fff]/.test(inner)) return true;       // 中文说明文字（如"flag内容"）不是 flag
+    if (isDecoyFlag(v) || isDecoyFlag(inner)) return true; // 诱饵（fake/decoy/假flag）不是 flag
     return false;
   };
   const push = v => { if (v && !isPlaceholder(v) && !out.includes(v)) out.push(v); };

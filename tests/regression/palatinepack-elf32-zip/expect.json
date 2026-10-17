@@ -1,0 +1,13 @@
+{
+  "id": "palatinepack-elf32-zip",
+  "name": "PalatinePack",
+  "main": "palatinepack",
+  "type": "ELF64",
+  "notes": "ELF + zip + 加密 flag.txt；标准 AES S 盒",
+  "expect": {
+    "payloads": [],
+    "summaryMustContain": ["AES"],
+    "summaryMustNotContain": ["内嵌 ELF", "内嵌 PE"],
+    "maxMs": 3000
+  }
+}

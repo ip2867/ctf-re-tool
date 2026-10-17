@@ -1,0 +1,12 @@
+{
+  "id": "dock-check-elf64",
+  "name": "dock_check（ZeroG-CTF）",
+  "main": "dock_check",
+  "type": "ELF64",
+  "notes": "带 code.py 提示的 ELF64；预期不误报内嵌载荷",
+  "expect": {
+    "payloads": [],
+    "summaryMustNotContain": ["内嵌 ELF", "内嵌 PE"],
+    "maxMs": 3000
+  }
+}

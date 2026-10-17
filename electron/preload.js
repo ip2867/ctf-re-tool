@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // 文件分析
   detectFileType: (filePath) => ipcRenderer.invoke('detect-file-type', filePath),
+  // 加密算法指纹扫描（读文件字节，确定性识别 SM4/AES/SM3/TEA… 及"本层无指纹=可能是壳"）
+  scanCryptoFingerprints: (filePath) => ipcRenderer.invoke('scan-crypto-fingerprints', filePath),
   getFileInfo: (filePath) => ipcRenderer.invoke('get-file-info', filePath),
   extractApkSO: (apkPath) => ipcRenderer.invoke('extract-apk-so', apkPath),
   // PYC 反汇编/常量提取（多后端回退，pycdc 失败也能出结果）

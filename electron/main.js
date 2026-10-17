@@ -525,6 +525,1390 @@ ipcMain.handle('detect-file-type', async (event, filePath) => {
   }
 });
 
+// ============ 加密算法指纹扫描器（代码层确定性识别）============
+// 为什么需要：实测（Disguise/xmctf）AI 每次都往 AES 猜、啃 VM handler 烧 500+ 秒，
+// 而二进制里其实有确定性证据（S 盒常量、FK/CK、轮结构）可一眼判定算法。
+// 旧链路"算法识别"全靠 AI 看 + 软提示，且 S 盒/FK 能否被看到取决于"引用它的函数是否被采集"
+// （PE/ELF 主路径只读被反编译函数引用的地址）→ 极易漏。
+// 本扫描器**直接读文件字节**，不依赖 IDA、不受引用关系限制，给出确定性的算法候选。
+const CRYPTO_FP = [
+  // [名称, 字节模式（hex，空格分隔），说明]
+  ['SM4-FK', 'a3 b1 ba c6 56 aa 33 50 67 7d 91 97 b2 70 22 dc', 'SM4 系统参数 FK（铁证，出现即 SM4）'],
+  ['SM4-FK-BE', 'c6 ba b1 a3 50 33 aa 56 97 91 7d 67 dc 22 70 b2', 'SM4 FK（大端存放）'],
+  ['SM4-SBOX', 'd6 90 e9 fe cc e1 3d b7', 'SM4 标准 S 盒首 4 字节'],
+  ['SM4-CK', '00 07 0e 15', 'SM4 轮常量 CK 起始（配合 256 双射表判定）'],
+  ['AES-SBOX', '63 7c 77 7b f2 6b 6f c5', 'AES S 盒首 8 字节'],
+  ['AES-INV-SBOX', '52 09 6a d5 30 36 a5 38', 'AES 逆 S 盒首 8 字节（解密码表）'],
+  ['SM3-IV', '73 80 16 6f 49 14 b2 b9 17 24 42 d7', 'SM3 IV（铁证，出现即 SM3）'],
+  ['MD5-IV', '01 23 45 67 89 ab cd ef', 'MD5 IV（小端存放）'],
+  ['SHA256-IV', '67 e6 09 6a 85 ae 67 bb', 'SHA256 IV（小端存放）'],
+  ['TEA-DELTA', 'b9 79 37 9e', 'TEA/XTEA delta 0x9E3779B9（小端）'],
+  ['TEA-DELTA-INV', '47 c8 86 61', 'TEA delta 取反 0x61C88647（小端）'],
+  ['CRC32-POLY', '20 83 b8 ed', 'CRC32 多项式 0xEDB88320（小端）'],
+  ['RC4-ID', '00 01 02 03 04 05 06 07 08 09', 'RC4 KSA 初值/常见排列'],
+  ['B64-STD', '41 42 43 44 45 46 47 48 49 4a 4b 4c 4d 4e 4f 50 51 52 53 54 55 56 57 58 59 5a 61 62 63 64 65 66 67 68 69 6a 6b 6c 6d 6e 6f 70 71 72 73 74 75 76 77 78 79 7a 30 31 32 33 34 35 36 37 38 39 2b 2f', '标准 Base64 表'],
+];
+
+function hexToBytes(hex) { return Buffer.from(hex.replace(/\s+/g, ''), 'hex'); }
+function findPattern(buf, pat) {
+  const idxs = [];
+  let from = 0, at;
+  while ((at = buf.indexOf(pat, from)) !== -1) { idxs.push(at); from = at + 1; if (idxs.length >= 8) break; }
+  return idxs;
+}
+
+// ============ 载荷检测流水线（可插拔）============
+// 设计目标（v1.6.0 Phase 1）：把"找下一层载体"从单一窄公式升级为**按序尝试多种形态**。
+// 每个检测器 = 一个 `(buf,size,limit) => items[]` 函数，统一输出：
+//   { type:'pe'|'elf'|'dex'|'shellcode', offset, length, confidence,
+//     encode:{kind,key,stride,period}, head }
+// 新增形态只需写一个检测器并注册到 PAYLOAD_DETECTORS —— 主流程、提示词、测试都不用改。
+// 失败语义：某个检测器抛错只跳过它自己（try/catch），其它检测器继续 → "优雅失败"。
+const PAYLOAD_MAX = 4;
+
+// 已知 DOS stub（0x40..0x74）：用于恢复周期 XOR 的多字节密钥（已知明文攻击）。
+// 绝大多数链接器产出相同 stub；不匹配只会"漏报"，不会误报。
+const DOS_STUB_KNOWN = (() => {
+  const a = [];
+  const code = [0x0e, 0x1f, 0xba, 0x0e, 0x00, 0xb4, 0x09, 0xcd, 0x21, 0xb8, 0x01, 0x4c, 0xcd, 0x21];
+  for (let t = 0; t < code.length; t++) a.push([0x40 + t, code[t]]);
+  const s = 'This program cannot be run in DOS mode.\r\r\n$';
+  for (let t = 0; t < s.length; t++) a.push([0x4e + t, s.charCodeAt(t) & 0xff]);
+  return a;
+})();
+
+// 用"逻辑字节读取器"校验 PE 头（支持任意编码/步长：decode(j) 返回第 j 个逻辑字节）
+function validatePE(decode, maxItems) {
+  if (maxItems < 0x100) return null;
+  if (decode(0) !== 0x4d || decode(1) !== 0x5a) return null;
+  const e = (decode(0x3c) | (decode(0x3d) << 8) | (decode(0x3e) << 16) | (decode(0x3f) << 24)) >>> 0;
+  if (e < 0x40 || e > 0x100000 || e + 4 > maxItems) return null;
+  if (!(decode(e) === 0x50 && decode(e + 1) === 0x45 && decode(e + 2) === 0 && decode(e + 3) === 0)) return null;
+  let length = 0;
+  if (e + 24 <= maxItems) {
+    const nsec = decode(e + 6) | (decode(e + 7) << 8);
+    const optSize = decode(e + 20) | (decode(e + 21) << 8);
+    const secTbl = e + 24 + optSize;
+    if (nsec >= 1 && nsec <= 96) {
+      let end = 0, ok = true;
+      for (let k = 0; k < nsec; k++) {
+        const p = secTbl + k * 40;
+        if (p + 24 > maxItems) { ok = false; break; }
+        const rs = (decode(p + 16) | (decode(p + 17) << 8) | (decode(p + 18) << 16) | (decode(p + 19) << 24)) >>> 0;
+        const rp = (decode(p + 20) | (decode(p + 21) << 8) | (decode(p + 22) << 16) | (decode(p + 23) << 24)) >>> 0;
+        if (rp + rs > end) end = rp + rs;
+      }
+      if (ok && end >= 0x100 && end <= maxItems) length = end;
+    }
+  }
+  return { e_lfanew: e, length };
+}
+
+// ELF 头校验 + 用节头表推算长度（支持 32/64 位、大小端）
+function validateELF(decode, maxItems) {
+  if (maxItems < 0x40) return null;
+  const magic = [0x7f, 0x45, 0x4c, 0x46];
+  for (let t = 0; t < 4; t++) if (decode(t) !== magic[t]) return null;
+  const cls = decode(4), data = decode(5), ver = decode(6);
+  if ((cls !== 1 && cls !== 2) || (data !== 1 && data !== 2) || ver !== 1) return null;
+  const be = data === 2;
+  const rd16 = (o) => (o + 2 > maxItems ? NaN : (be ? (decode(o) << 8) | decode(o + 1) : decode(o) | (decode(o + 1) << 8)));
+  const rd32 = (o) => (o + 4 > maxItems ? NaN : (be
+    ? ((decode(o) << 24) | (decode(o + 1) << 16) | (decode(o + 2) << 8) | decode(o + 3)) >>> 0
+    : (decode(o) | (decode(o + 1) << 8) | (decode(o + 2) << 16) | (decode(o + 3) << 24)) >>> 0));
+  let shoff, shentsize, shnum;
+  if (cls === 1) { shoff = rd32(0x20); shentsize = rd16(0x2e); shnum = rd16(0x30); }
+  else { shoff = rd32(0x28) + rd32(0x2c) * 4294967296; shentsize = rd16(0x3a); shnum = rd16(0x3c); }
+  let length = 0;
+  if (shentsize > 0 && shnum > 0 && shnum < 0x10000 && shoff > 0 && shoff < 2 ** 40) {
+    const end = shoff + shentsize * shnum;
+    if (end >= 0x40 && end <= maxItems) length = end;
+  }
+  return { length };
+}
+
+// DEX 头校验 + file_size 字段
+function validateDEX(decode, maxItems) {
+  if (maxItems < 0x24) return null;
+  const magic = [0x64, 0x65, 0x78, 0x0a];
+  for (let t = 0; t < 4; t++) if (decode(t) !== magic[t]) return null;
+  for (let t = 4; t < 7; t++) { const c = decode(t); if (c < 0x30 || c > 0x39) return null; }
+  if (decode(7) !== 0) return null;
+  const fs = (decode(0x20) | (decode(0x21) << 8) | (decode(0x22) << 16) | (decode(0x23) << 24)) >>> 0;
+  return { length: (fs >= 0x100 && fs <= maxItems) ? fs : 0 };
+}
+
+// 检测器 1：PE，单字节 XOR/ADD × stride 1/4/2（v1.5.3 能力，保留）
+// 性能要点：热路径零分配（此前每候选 push 一个数组，实测 1.8s → 0.6s）。
+function detectPESingleByte(buf, size, limit) {
+  const hits = [];
+  const MAX = Math.min(limit, PAYLOAD_MAX);
+  const emit = (kind, key, i, s) => {
+    if (i === 0 && key === 0) return;                    // 文件自身 DOS 头
+    const avail = Math.floor((size - i) / s);
+    if (avail < 0x40) return;
+    if (hits.some(x => Math.abs(x.offset - i) < 4 && x.encode.kind === kind)) return;
+    const dec = (j) => (kind === 'add' ? ((buf[i + j * s] - key) & 0xff) : (buf[i + j * s] ^ key));
+    const v = validatePE(dec, avail);
+    if (!v) return;
+    hits.push({ type: 'pe', label: 'PE', offset: i, length: v.length, confidence: 'high', head: '4d5a',
+      encode: { kind, key, stride: s, period: 1 } });
+  };
+  for (const s of [1, 4, 2]) {
+    if (hits.length >= MAX) break;
+    for (let i = 0; i + s < size; i++) {
+      if (hits.length >= MAX) break;
+      const a = buf[i], b = buf[i + s];
+      if ((a ^ b) !== 0x17 && ((b - a) & 0xff) !== 0x0d) continue;
+      // 内联核对 MZ（等价于先算 key 再解码首两字节），通过后才进入昂贵校验
+      if ((a ^ b) === 0x17) {
+        const key = a ^ 0x4d;
+        const b0 = a ^ key, b1 = b ^ key;
+        if (b0 === 0x4d && b1 === 0x5a) emit('xor', key, i, s);
+      }
+      if (((b - a) & 0xff) === 0x0d) {
+        const key = (a - 0x4d) & 0xff;
+        const b0 = (a - key) & 0xff, b1 = (b - key) & 0xff;
+        if (b0 === 0x4d && b1 === 0x5a) emit('add', key, i, s);
+      }
+    }
+  }
+  return hits;
+}
+
+// 检测器 2：PE，周期 XOR（周期 2 用 MZ 直接解出；3/4/8 用 DOS stub 已知明文恢复 key）
+function detectPEPeriodic(buf, size, limit) {
+  const hits = [];
+  const MAX = Math.min(limit, PAYLOAD_MAX);
+  // --- 周期 2：MZ 两个字节恰好给出 k0/k1（in[0]=4d, in[1]=5a 是已知明文）---
+  //     任何位置都能"解出"一对 key，靠 e_lfanew→PE\0\0 结构校验过滤（随机偏移通过率 ~2^-32）。
+  //     注意：不能用"前 4 字节周期重复"做预筛——MZ 之后是 90 00 03 00，并不会重复。
+  //     性能：大文件（>16MB）上这项**跳过**。周期 2 编码的 payload 通常出现在 CTF 题目量级文件里；
+  //     通用程序的 190MB 文件里逐字节解 e_lfanew 不划算（实测把扫描从 3.8s 拖到 11.4s）。
+  if (size <= 16 * 1024 * 1024) {
+    for (let i = 0; i + 0x100 < size; i++) {
+      if (hits.length >= MAX) break;
+      const k0 = buf[i] ^ 0x4d, k1 = buf[i + 1] ^ 0x5a;
+      if (k0 === 0 && k1 === 0) continue;              // 明文自身
+      const e = ((buf[i + 0x3c] ^ k0) | ((buf[i + 0x3d] ^ k1) << 8)
+        | ((buf[i + 0x3e] ^ k0) << 16) | ((buf[i + 0x3f] ^ k1) << 24)) >>> 0;
+      // e_lfanew 实际取值几乎总是 0x80/0xE8/0x100 等小值且 4 字节对齐；用它做强预筛。
+      if (e < 0x40 || e > 0x100000 || (e & 3) !== 0) continue;
+      if (i + e + 4 > size) continue;
+      // PE\0\0 校验（e 的奇偶决定用哪个 key）
+      if ((buf[i + e] ^ (e % 2 ? k1 : k0)) !== 0x50) continue;
+      if ((buf[i + e + 1] ^ ((e + 1) % 2 ? k1 : k0)) !== 0x45) continue;
+      if ((buf[i + e + 2] ^ ((e + 2) % 2 ? k1 : k0)) !== 0) continue;
+      if ((buf[i + e + 3] ^ ((e + 3) % 2 ? k1 : k0)) !== 0) continue;
+      const avail = size - i;
+      const dec = (j) => buf[i + j] ^ ((j & 1) ? k1 : k0);
+      const v = validatePE(dec, avail);
+      if (!v) continue;
+      hits.push({ type: 'pe', label: 'PE', offset: i, length: v.length, confidence: 'high', head: '4d5a',
+        encode: { kind: 'periodic-xor', key: [k0, k1], stride: 1, period: 2 } });
+    }
+  }
+  // --- 周期 3/4/8：仅中小文件（性能）；用 DOS stub 已知明文恢复全部 key 字节 ---
+  //     真实链接器产出的 PE 几乎都有标准 DOS stub；没有则跳过（宁可漏报，不误报）。
+  if (size <= 16 * 1024 * 1024 && hits.length < MAX) {
+    for (const p of [3, 4, 8]) {
+      if (hits.length >= MAX) break;
+      // 预筛：任取两个已知明文位置，其隐含 key 必须一致（先比两个同余的位置）
+      const t1 = 0x40, v1 = 0x0e;
+      const t2 = 0x40 + p;
+      if (t2 >= size) continue;
+      const known2 = DOS_STUB_KNOWN.find(x => x[0] === t2);
+      if (!known2) continue;
+      for (let i = 0; i + t2 < size; i++) {
+        if (hits.length >= MAX) break;
+        if (buf[i + t2] !== (buf[i + t1] ^ v1 ^ known2[1])) continue;
+        const keyMap = new Array(p).fill(-1);
+        let ok = true;
+        for (const [t, v] of DOS_STUB_KNOWN) {
+          if (i + t >= size) { ok = false; break; }
+          const k = buf[i + t] ^ v, r = t % p;
+          if (keyMap[r] < 0) keyMap[r] = k; else if (keyMap[r] !== k) { ok = false; break; }
+        }
+        if (!ok || keyMap.some(k => k < 0)) continue;
+        // key 全 0 且偏移 0 = 文件自身就是明文 PE（不是"内嵌载荷"）→ 跳过，避免每个正常 PE 自报。
+        if (i === 0 && keyMap.every(k => k === 0)) continue;
+        const avail = size - i;
+        const dec = (j) => buf[i + j] ^ keyMap[j % p];
+        const v = validatePE(dec, avail);
+        if (!v) continue;
+        if (hits.some(x => Math.abs(x.offset - i) < 8)) continue;
+        hits.push({ type: 'pe', label: 'PE', offset: i, length: v.length, confidence: 'high', head: '4d5a',
+          encode: { kind: 'periodic-xor', key: keyMap.slice(), stride: 1, period: p } });
+      }
+    }
+  }
+  return hits;
+}
+
+// 检测器 3：PE，滚动 XOR / 滚动 ADD（out[i] = in[i] ^ in[i-1] 或 +）
+// 预筛极廉价：in[0]=0x4d，故 out[0]=0x4d；out[1]=0x5a^0x4d=0x17（xor）/ 0x5a+0x4d=0xa7（add）
+function detectPERolling(buf, size, limit) {
+  const hits = [];
+  const MAX = Math.min(limit, PAYLOAD_MAX);
+  for (let i = 0; i + 0x100 < size; i++) {
+    if (hits.length >= MAX) break;
+    if (buf[i] !== 0x4d) continue;
+    // 偏移 0 且首字节即 MZ：文件自身是明文 PE，滚动解码无意义 → 跳过
+    if (i === 0) continue;
+    const b1 = buf[i + 1];
+    const kind = b1 === 0x17 ? 'rolling-xor' : (b1 === 0xa7 ? 'rolling-add' : null);
+    if (!kind) continue;
+    const avail = Math.min(size - i, 0x4000);
+    const dec = Buffer.allocUnsafe(avail);
+    let prev = 0;
+    for (let j = 0; j < avail; j++) {
+      const b = buf[i + j];
+      prev = kind === 'rolling-xor' ? (b ^ prev) : ((b - prev) & 0xff);
+      dec[j] = prev;
+    }
+    const v = validatePE((j) => dec[j], avail);
+    if (!v) continue;
+    hits.push({ type: 'pe', label: 'PE', offset: i, length: v.length, confidence: 'high', head: '4d5a',
+      encode: { kind, key: null, stride: 1, period: 1 } });
+  }
+  return hits;
+}
+
+// 检测器 4：PE，以 Base64 / Hex **文本**存储（MZ 不再以二进制出现）
+function detectPETextEncoded(buf, size, limit) {
+  const hits = [];
+  const MAX = Math.min(limit, PAYLOAD_MAX);
+  const pushIf = (off, kind, decoded) => {
+    if (!decoded || decoded.length < 0x100) return;
+    if (decoded[0] !== 0x4d || decoded[1] !== 0x5a) return;
+    const v = validatePE((j) => decoded[j], decoded.length);
+    if (!v) return;
+    if (hits.some(x => Math.abs(x.offset - off) < 8)) return;
+    hits.push({ type: 'pe', label: 'PE', offset: off, length: v.length, confidence: 'high', head: '4d5a',
+      encode: { kind, key: null, stride: 1, period: 1 } });
+  };
+  // Base64：PE 常见前缀 "TVqQ"（MZ\x90\x00）或 "TVo"（MZ）
+  for (const marker of ['TVqQ', 'TVo']) {
+    let from = 0, at;
+    while ((at = buf.indexOf(marker, from)) !== -1 && hits.length < MAX) {
+      from = at + 1;
+      const chunk = buf.slice(at, Math.min(size, at + 65536)).toString('latin1');
+      const clean = chunk.replace(/[^A-Za-z0-9+/=]/g, '');
+      try { pushIf(at, 'base64', Buffer.from(clean + '='.repeat((4 - clean.length % 4) % 4), 'base64')); } catch (e) {}
+    }
+    if (hits.length >= MAX) break;
+  }
+  // Hex 文本："4d5a" 开头（大小写均试）。不假设第 3~4 字节（不同链接器 stub 不同）。
+  for (const marker of ['4d5a', '4D5A']) {
+    let from = 0, at;
+    while ((at = buf.indexOf(marker, from)) !== -1 && hits.length < MAX) {
+      from = at + 1;
+      const chunk = buf.slice(at, Math.min(size, at + 131072)).toString('latin1');
+      const clean = chunk.replace(/[^0-9a-fA-F]/g, '');
+      try { pushIf(at, 'hex', Buffer.from(clean.slice(0, clean.length - (clean.length % 2)), 'hex')); } catch (e) {}
+    }
+    if (hits.length >= MAX) break;
+  }
+  return hits;
+}
+
+// 检测器 5：ELF / DEX（明文 + 单字节 XOR/ADD × stride 1/4/2）
+// 性能要点（实测 86MB 上 7.4s → ~1.5s）：
+//  · **只扫 3 遍**（stride 1/4/2），每遍同时检查 ELF 与 DEX 两种 magic
+//  · 热路径不分配数组/闭包；magic 用 4 个内联字节比较
+function detectOtherFormats(buf, size, limit) {
+  const hits = [];
+  const MAX = Math.min(limit, PAYLOAD_MAX);
+  const specs = [
+    { type: 'elf', label: 'ELF', m: [0x7f, 0x45, 0x4c, 0x46], validate: validateELF },
+    { type: 'dex', label: 'DEX', m: [0x64, 0x65, 0x78, 0x0a], validate: validateDEX },
+  ];
+  // 把两种格式的判据提到标量：热路径只做整数比较。
+  // ⚠️ 这里**绝不能**在逐字节循环里写 `for (const sp of specs)` —— 每次迭代都分配一个
+  //    数组迭代器，86MB×3 遍 ≈ 2.5 亿次分配，实测让 GC 占 30% CPU（5s → 1.5s 的差别）。
+  const E = specs[0], D = specs[1];
+  const exd = E.m[0] ^ E.m[1], ead = (E.m[1] - E.m[0]) & 0xff;
+  const dxd = D.m[0] ^ D.m[1], dad = (D.m[1] - D.m[0]) & 0xff;
+  const emit = (sp, kind, key, i, s, avail) => {
+    const m = sp.m;
+    const dec = (j) => (kind === 'add' ? ((buf[i + j * s] - key) & 0xff) : (buf[i + j * s] ^ key));
+    const v = sp.validate(dec, avail);
+    if (!v) return;
+    if (hits.some(x => x.type === sp.type && Math.abs(x.offset - i) < 8)) return;
+    hits.push({ type: sp.type, label: sp.label, offset: i, length: v.length, confidence: 'high',
+      head: m.map(x => x.toString(16).padStart(2, '0')).join(''),
+      encode: { kind, key, stride: s, period: 1 } });
+  };
+  for (const s of [1, 4, 2]) {
+    if (hits.length >= MAX) break;
+    for (let i = 0; i + s * 4 < size; i++) {
+      if (hits.length >= MAX) break;
+      const a = buf[i], b = buf[i + s];
+      const ab = (a ^ b), ad = ((b - a) & 0xff);
+      // 两字节判据：绝大多数字节直接在这里被排除（每字节 4 次整数比较，零分配）
+      const eXor = ab === exd, eAdd = ad === ead;
+      const dXor = ab === dxd, dAdd = ad === dad;
+      if (!eXor && !eAdd && !dXor && !dAdd) continue;
+      const avail = Math.floor((size - i) / s);
+      if (avail < 0x40) continue;
+      // 少数候选才进入完整校验（magic 4 字节先内联比，再走头部解析）
+      // ⚠️ key=0 表示"明文"：只有当偏移 i===0（文件自身就是该格式）时才允许，且这种情形
+      //    **不算"内嵌载荷"**（否则每个正常 ELF/PE 都会自报一次，实测回归题集全员误报）。
+      if (eXor) { const k = a ^ E.m[0]; if (!(i === 0 && k === 0)) emit(E, 'xor', k, i, s, avail); }
+      if (eAdd) { const k = (a - E.m[0]) & 0xff; if (!(i === 0 && k === 0)) emit(E, 'add', k, i, s, avail); }
+      if (dXor) { const k = a ^ D.m[0]; if (!(i === 0 && k === 0)) emit(D, 'xor', k, i, s, avail); }
+      if (dAdd) { const k = (a - D.m[0]) & 0xff; if (!(i === 0 && k === 0)) emit(D, 'add', k, i, s, avail); }
+    }
+  }
+  return hits;
+}
+
+// 检测器 6：裸 shellcode 常见序言（保守：只认极特征化的几条，low 置信度）
+function detectShellcodePrologue(buf, size, limit) {
+  const hits = [];
+  const MAX = Math.min(limit, PAYLOAD_MAX);
+  const prologues = [
+    ['fce882000000', 'calc 类 shellcode（fc e8 82 00 00 00）'],
+    ['fc4883e4f0', 'x64 shellcode 常见序言（fc 48 83 e4 f0）'],
+  ];
+  for (const [hex, desc] of prologues) {
+    const pat = hexToBytes(hex);
+    for (const off of findPattern(buf, pat)) {
+      if (hits.length >= MAX) break;
+      hits.push({ type: 'shellcode', label: 'shellcode', offset: off, length: 0, confidence: 'low',
+        head: hex.slice(0, 8), encode: { kind: 'none', key: null, stride: 1, period: 1 }, desc });
+    }
+  }
+  return hits;
+}
+
+// 注册表：新增形态 = 在这里加一行。顺序 = 优先级。
+const PAYLOAD_DETECTORS = [
+  ['pe-single-byte', detectPESingleByte],
+  ['pe-periodic-xor', detectPEPeriodic],
+  ['pe-rolling', detectPERolling],
+  ['pe-text-encoded', detectPETextEncoded],
+  ['elf-dex', detectOtherFormats],
+  ['shellcode-prologue', detectShellcodePrologue],
+];
+
+// 流水线入口：逐个尝试检测器；单个失败不影响其它（优雅失败）。
+function detectPayloads(buf, size) {
+  const acc = [];
+  for (const [name, fn] of PAYLOAD_DETECTORS) {
+    if (acc.length >= PAYLOAD_MAX) break;
+    let items = [];
+    try { items = fn(buf, size, PAYLOAD_MAX - acc.length) || []; } catch (e) { continue; }
+    for (const it of items) {
+      it.detector = name;
+      if (acc.some(x => x.type === it.type && Math.abs(x.offset - it.offset) < 8)) continue;
+      acc.push(it);
+      if (acc.length >= PAYLOAD_MAX) break;
+    }
+  }
+  // shellcode 只是"兜底线索"：一旦发现真正的容器格式（PE/ELF/DEX）就不再报它，避免噪声抢结论
+  return acc.some(x => x.type !== 'shellcode') ? acc.filter(x => x.type !== 'shellcode') : acc;
+}
+
+// 把载荷命中渲染成给 AI 的结论（含可直接运行的提取脚本）
+function payloadRecipe(p) {
+  const off = '0x' + p.offset.toString(16);
+  const n = p.length || 'N';
+  const e = p.encode || { kind: 'none' };
+  const head = 'd = open(r"<当前文件>","rb").read()\n';
+  const out = 'open("stage2.bin","wb").write(blob)\n';
+  const verify = `# 校验：blob 头部应为 ${p.type === 'pe' ? '4d5a (MZ)' : p.type === 'elf' ? '7f454c46 (ELF)' : p.type === 'dex' ? '6465780a (dex)' : p.head}\n`;
+  switch (e.kind) {
+    case 'none':
+      return '```python\n' + head + `blob = d[${off}:${off}+${n}]\n` + out + verify + '```';
+    case 'add': {
+      // 编码是 out = in + key，解码必须 **减** key。
+      // （此前误写成加，会让 ADD 编码的题解出乱码——单测 test_payload_extract.js 抓到的。）
+      const op = e.kind === 'add' ? '(d[o+i*s] - key) & 0xff' : 'd[o+i*s] ^ key';
+      return '```python\n' + head
+        + `o, s, key = ${off}, ${e.stride || 1}, 0x${e.key.toString(16)}\n`
+        + `n = ${n}\n`
+        + `blob = bytes(${op} for i in range(n))\n` + out + verify + '```';
+    }
+    case 'periodic-xor': {
+      const keys = e.key.map(k => '0x' + k.toString(16)).join(', ');
+      return '```python\n' + head
+        + `o, n = ${off}, ${n}\nkeys = [${keys}]\n`
+        + `blob = bytes(d[o+i] ^ keys[i % len(keys)] for i in range(n))\n` + out + verify + '```';
+    }
+    case 'rolling-xor':
+      return '```python\n' + head + `o, n = ${off}, ${n}\nblob = bytearray(); prev = 0\n`
+        + `for i in range(n):\n    prev = d[o+i] ^ prev\n    blob.append(prev)\n` + out + verify + '```';
+    case 'rolling-add':
+      return '```python\n' + head + `o, n = ${off}, ${n}\nblob = bytearray(); prev = 0\n`
+        + `for i in range(n):\n    prev = (d[o+i] - prev) & 0xff\n    blob.append(prev)\n` + out + verify + '```';
+    case 'base64':
+      return '```python\nimport base64, re\n' + head
+        + `s = d[${off}:]\n`
+        + `s = re.sub(rb"[^A-Za-z0-9+/=]", b"", s)\n`
+        + `s += b"=" * (-len(s) % 4)\n`
+        + `blob = base64.b64decode(s)[:${n}]\n` + out + verify + '```';
+    case 'hex':
+      return '```python\n' + head
+        + `s = d[${off}:].decode("latin-1")\n`
+        + `s = re.sub(r"[^0-9a-fA-F]", "", s)\n`
+        + `blob = bytes.fromhex(s[:${typeof n === 'number' ? n * 2 : 'N*2'}])\n` + out + verify + '```';
+    default:
+      return '```python\n' + head + `blob = d[${off}:${off}+${n}]\n` + out + '```';
+  }
+}
+
+function payloadDescription(p, count) {
+  const off = '0x' + p.offset.toString(16);
+  const e = p.encode || { kind: 'none' };
+  const typeName = p.type === 'pe' ? 'PE' : p.type === 'elf' ? 'ELF' : p.type === 'dex' ? 'DEX' : 'shellcode';
+  let how;
+  switch (e.kind) {
+    case 'none': how = '明文存放'; break;
+    case 'xor': how = `头部被 XOR 0x${e.key.toString(16).padStart(2, '0')} 掩盖`; break;
+    case 'add': how = `头部被 ADD 0x${e.key.toString(16).padStart(2, '0')} 掩盖`; break;
+    case 'periodic-xor': how = `头部被 ${e.period} 字节循环 XOR（key=${e.key.map(k => '0x' + k.toString(16)).join(' ')}）掩盖`; break;
+    case 'rolling-xor': how = '整体被滚动 XOR（out[i]=in[i]^in[i-1]）掩盖'; break;
+    case 'rolling-add': how = '整体被滚动 ADD（out[i]=in[i]+in[i-1]）掩盖'; break;
+    case 'base64': how = '以 Base64 文本存储'; break;
+    case 'hex': how = '以十六进制文本存储'; break;
+    default: how = e.kind;
+  }
+  const strideNote = (e.kind !== 'none' && e.stride > 1) ? `每项占 ${e.stride} 字节、只取低字节；` : '';
+  const lenTxt = p.length ? `，推算长度 ${p.length} 字节` : '';
+  const isContainer = p.type !== 'shellcode';
+  const evidence = `在文件偏移 ${off} 处发现**${how}**的 ${typeName} 载荷（${strideNote}故明文搜头部搜不到）：解码后为合法可执行载荷${lenTxt}`
+    + (count > 1 ? `；另有 ${count - 1} 处候选` : '');
+  const note = isContainer
+    ? `**本层是 loader/壳**（所以本层没有算法常量）。下一步**必须先提取下一层再分析它**，不要在本层找算法或硬逆它的逻辑：\n`
+      + payloadRecipe(p)
+      + `\n提取出后，对**新文件**重新做算法指纹扫描——真正的加密算法/VM 在下一层里。`
+      + (p.length ? '' : '（长度用头部字段/节表推算）')
+    : `疑似裸 shellcode（未包装成 PE/ELF）。可从该偏移 dump 后反汇编；若是 loader 解密出的代码块，按"提取→反汇编→识别算法"处理。`;
+  return {
+    algo: `内嵌 ${typeName}（${e.kind === 'none' ? '明文' : '编码存储'}，已定位）`,
+    confidence: p.confidence || 'high',
+    evidence, note,
+  };
+}
+
+
+// ============ 自定义分组密码的常量差分分析 ============
+// 为什么需要（实测教训，Disguise stage2）：AI 已经认出"SM4 骨架 + 自定义 S 盒"，但接下来
+// 花了 300+ 秒、20+ 次脚本反复纠结：FK 是否被替换？CK 和标准表什么关系？字节序怎么摆？
+// 这些问题**全部是确定性可计算的**——工具应当一次性给出，而不是让 AI 猜。
+//
+// 做法（只做可验证的推导，不猜解法）：
+//   1) 把题目 S 盒与标准 SM4 / AES S 盒逐项比对（相同项数、是否互为逆表）
+//   2) 在 S 盒附近搜索"32 项 dword 表"（SM4 轮常量 CK 的形态），与标准 CK 比差分
+//   3) 在附近搜索 16 字节 FK 候选，与标准 FK 比差分
+//   4) 报告字节序线索（表项是按 dword 还是 byte 存放、是否每 4 字节反序）
+const STD_SM4_SBOX = [
+  0xd6,0x90,0xe9,0xfe,0xcc,0xe1,0x3d,0xb7,0x16,0xb6,0x14,0xc2,0x28,0xfb,0x2c,0x05,
+  0x2b,0x67,0x9a,0x76,0x2a,0xbe,0x04,0xc3,0xaa,0x44,0x13,0x26,0x49,0x86,0x06,0x99,
+  0x9c,0x42,0x50,0xf4,0x91,0xef,0x98,0x7a,0x33,0x54,0x0b,0x43,0xed,0xcf,0xac,0x62,
+  0xe4,0xb3,0x1c,0xa9,0xc9,0x08,0xe8,0x95,0x80,0xdf,0x94,0xfa,0x75,0x8f,0x3f,0xa6,
+  0x47,0x07,0xa7,0xfc,0xf3,0x73,0x17,0xba,0x83,0x59,0x3c,0x19,0xe6,0x85,0x4f,0xa8,
+  0x68,0x6b,0x81,0xb2,0x71,0x64,0xda,0x8b,0xf8,0xeb,0x0f,0x4b,0x70,0x56,0x9d,0x35,
+  0x1e,0x24,0x0e,0x5e,0x63,0x58,0xd1,0xa2,0x25,0x22,0x7c,0x3b,0x01,0x21,0x78,0x87,
+  0xd4,0x00,0x46,0x57,0x9f,0xd3,0x27,0x52,0x4c,0x36,0x02,0xe7,0xa0,0xc4,0xc8,0x9e,
+  0xea,0xbf,0x8a,0xd2,0x40,0xc7,0x38,0xb5,0xa3,0xf7,0xf2,0xce,0xf9,0x61,0x15,0xa1,
+  0xe0,0xae,0x5d,0xa4,0x9b,0x34,0x1a,0x55,0xad,0x93,0x32,0x30,0xf5,0x8c,0xb1,0xe3,
+  0x1d,0xf6,0xe2,0x2e,0x82,0x66,0xca,0x60,0xc0,0x29,0x23,0xab,0x0d,0x53,0x4e,0x6f,
+  0xd5,0xdb,0x37,0x45,0xde,0xfd,0x8e,0x2f,0x03,0xff,0x6a,0x72,0x6d,0x6c,0x5b,0x51,
+  0x8d,0x1b,0xaf,0x92,0xbb,0xdd,0xbc,0x7f,0x11,0xd9,0x5c,0x41,0x1f,0x10,0x5a,0xd8,
+  0x0a,0xc1,0x31,0x88,0xa5,0xcd,0x7b,0xbd,0x2d,0x74,0xd0,0x12,0xb8,0xe5,0xb4,0xb0,
+  0x89,0x69,0x97,0x4a,0x0c,0x96,0x77,0x7e,0x65,0xb9,0xf1,0x09,0xc5,0x6e,0xc6,0x84,
+  0x18,0xf0,0x7d,0xec,0x3a,0xdc,0x4d,0x20,0x79,0xee,0x5f,0x3e,0xd7,0xcb,0x39,0x48,
+];
+const STD_AES_SBOX = (() => {
+  // 由 GF(2^8) 逆 + 仿射变换即时生成，避免硬编码 256 项出错
+  const mul = (a, b) => {
+    let p = 0;
+    for (let i = 0; i < 8; i++) {
+      if (b & 1) p ^= a;
+      const hi = a & 0x80;
+      a = (a << 1) & 0xff;
+      if (hi) a ^= 0x1b;
+      b >>= 1;
+    }
+    return p;
+  };
+  const inv = new Array(256).fill(0);
+  for (let a = 1; a < 256; a++) for (let b = 1; b < 256; b++) if (mul(a, b) === 1) { inv[a] = b; break; }
+  const rot = (x, n) => ((x << n) | (x >>> (8 - n))) & 0xff;
+  const out = [];
+  for (let i = 0; i < 256; i++) {
+    const x = inv[i];
+    out.push((x ^ rot(x, 1) ^ rot(x, 2) ^ rot(x, 3) ^ rot(x, 4) ^ 0x63) & 0xff);
+  }
+  return out;
+})();
+const STD_SM4_FK = [0xa3b1bac6, 0x56aa3350, 0x677d9197, 0xb27022dc];
+const STD_SM4_CK = (() => {
+  const out = [];
+  for (let i = 0; i < 32; i++) {
+    const b = [0, 1, 2, 3].map(j => ((4 * i + j) * 7) & 0xff);
+    out.push(((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0);
+  }
+  return out;
+})();
+const bswap32 = (x) => (((x & 0xff) << 24) | (((x >>> 8) & 0xff) << 16) | (((x >>> 16) & 0xff) << 8) | ((x >>> 24) & 0xff)) >>> 0;
+
+function analyzeCustomBlockConstants(buf, size, sboxOff, sboxStride) {
+  const notes = [];
+  const table = [];
+  for (let i = 0; i < 256; i++) table.push(buf[sboxOff + i * sboxStride] & 0xff);
+
+  // ---- 1) S 盒与标准算法表的关系 ----
+  const cmp = (std, name) => {
+    let same = 0;
+    for (let i = 0; i < 256; i++) if (table[i] === std[i]) same++;
+    if (same) notes.push(`S 盒与标准 ${name} 有 ${same}/256 项相同`);
+    return same;
+  };
+  const sameSm4 = cmp(STD_SM4_SBOX, 'SM4');
+  const sameAes = cmp(STD_AES_SBOX, 'AES');
+  // 注意：随机双射与任一固定表的"偶然相同项数"期望值约为 1，判据不能用"相同项数>0"。
+  // 真正的分界是"是否整体可还原"（下面 tryAffine 判断），所以这里只做弱提示。
+  if (sameSm4 < 32 && sameAes < 32) {
+    notes.push('S 盒与标准 SM4/AES 表**没有实质相同**（仅个别项偶然重合，属随机双射的正常现象）');
+  }
+  // 是否为标准表的逐项线性变换（x -> x + c / x ^ c）
+  const tryAffine = (std, name) => {
+    const xorSet = new Set(); let addConsistent = true; let firstAdd = null;
+    for (let i = 0; i < 256; i++) {
+      xorSet.add(table[i] ^ std[i]);
+      const a = (table[i] - std[i]) & 0xff;
+      if (firstAdd === null) firstAdd = a; else if (a !== firstAdd) addConsistent = false;
+    }
+    if (xorSet.size === 1) return `${name} 的每项 XOR 0x${[...xorSet][0].toString(16)}`;
+    if (addConsistent) return `${name} 的每项 + 0x${firstAdd.toString(16)}`;
+    return null;
+  };
+  const affSm4 = tryAffine(STD_SM4_SBOX, 'SM4');
+  const affAes = tryAffine(STD_AES_SBOX, 'AES');
+  if (affSm4) notes.push('可精确还原：' + affSm4);
+  if (affAes) notes.push('可精确还原：' + affAes);
+
+  // ---- 2) 在 S 盒附近搜 32 项 dword 表（SM4 CK 形态）----
+  // 搜索范围：S 盒前后 0x4000 字节，按 4 字节对齐
+  const lo = Math.max(0, sboxOff - 0x4000), hi = Math.min(size - 128, sboxOff + 0x4000);
+  const looksLikeCK = (off) => {
+    // CK 形态判据（放宽）：32 个 dword，且**同一字节位上的增量一致**。
+    // 标准 SM4 CK 每项 = 前项 + 0x07070707（四字节各 +7）；魔改题常整体加常量，
+    // 于是增量变成 0x06070707 / 0x08070707 之类——只要求"四字节各自增量稳定"即可。
+    const deltas = [[], [], [], []];
+    for (let i = 1; i < 32; i++) {
+      const a = buf.readUInt32LE(off + (i - 1) * 4), b = buf.readUInt32LE(off + i * 4);
+      for (let k = 0; k < 4; k++) {
+        deltas[k].push(((b >>> (k * 8)) - (a >>> (k * 8))) & 0xff);
+      }
+    }
+    // 每个字节位的 31 个增量必须几乎全相同（允许 1~2 处进位噪声）
+    let stableBytes = 0;
+    for (let k = 0; k < 4; k++) {
+      const freq = {};
+      for (const d of deltas[k]) freq[d] = (freq[d] || 0) + 1;
+      const best = Math.max(...Object.values(freq));
+      if (best >= 29) stableBytes++;
+    }
+    return stableBytes >= 3;   // 至少 3 个字节位增量稳定
+  };
+  let ckOff = -1;
+  {
+    // 只在"与标准 CK 存在**固定差分**"的表里选（这是 CK 与普通规律表的关键区别）。
+    // 标准 CK 的构造是 ck_ij=(4i+j)*7，任何"整体 + 常量 / 每字节 + 常量 / 字节反序"的魔改
+    // 都保持固定差分；而普通的递增表（如某个循环计数器数组）不会与标准 CK 有任何固定关系。
+    for (let off = lo; off + 128 <= hi; off += 4) {
+      if (!looksLikeCK(off)) continue;
+      const ck = [];
+      for (let i = 0; i < 32; i++) ck.push(buf.readUInt32LE(off + i * 4));
+      const d0 = (ck[0] - STD_SM4_CK[0]) >>> 0;
+      const fixedWord = ck.every((v, i) => (((v - STD_SM4_CK[i]) >>> 0) === d0));
+      const dr = (ck[0] - bswap32(STD_SM4_CK[0])) >>> 0;
+      const fixedBswap = ck.every((v, i) => (((v - bswap32(STD_SM4_CK[i])) >>> 0) === dr));
+      // 每字节固定差
+      let fixedPerByte = true, pbDelta = null;
+      for (let k = 0; k < 4 && fixedPerByte; k++) {
+        const once = ((ck[0] >>> (k * 8)) - (STD_SM4_CK[0] >>> (k * 8))) & 0xff;
+        if (pbDelta === null) pbDelta = once; else if (pbDelta !== once) fixedPerByte = false;
+        if (!fixedPerByte) break;
+        for (let i = 1; i < 32; i++) {
+          const want = (((STD_SM4_CK[i] >>> (k * 8)) + pbDelta) & 0xff);
+          if (((ck[i] >>> (k * 8)) & 0xff) !== want) { fixedPerByte = false; break; }
+        }
+      }
+      if (fixedWord || fixedBswap || fixedPerByte) { ckOff = off; break; }
+    }
+  }
+  if (ckOff >= 0) {
+    const ck = [];
+    for (let i = 0; i < 32; i++) ck.push(buf.readUInt32LE(ckOff + i * 4));
+    // 与标准 CK 的差分（四种可能：原样 / 整字+常量 / 每字节+常量 / 字节反序）
+    const diffWord = (ck[0] - STD_SM4_CK[0]) >>> 0;
+    const allWordSame = ck.every((v, i) => (((v - STD_SM4_CK[i]) >>> 0) === diffWord));
+    const diffRevWord = (ck[0] - bswap32(STD_SM4_CK[0])) >>> 0;
+    const allRevSame = ck.every((v, i) => (((v - bswap32(STD_SM4_CK[i])) >>> 0) === diffRevWord));
+    // 每字节固定差：先由首项四个字节位算出 delta[0..3]，再逐项校验
+    const pb = [];
+    let perByteSame = true;
+    for (let k = 0; k < 4; k++) {
+      const d = (((ck[0] >>> (k * 8)) & 0xff) - ((STD_SM4_CK[0] >>> (k * 8)) & 0xff) + 256) & 0xff;
+      pb.push(d);
+      for (let i = 1; i < 32; i++) {
+        const want = ((((STD_SM4_CK[i] >>> (k * 8)) & 0xff) + d) & 0xff);
+        if (((ck[i] >>> (k * 8)) & 0xff) !== want) { perByteSame = false; break; }
+      }
+      if (!perByteSame) break;
+    }
+    // 每个字节位内的实际步进（用于描述表的形态）
+    const step = (((ck[1] - ck[0]) >>> 0)).toString(16);
+    notes.push(`找到轮常量表 @文件偏移 0x${ckOff.toString(16)}（32 项，相邻步进 0x${step}，SM4 CK 形态）`);
+    if (allWordSame && diffWord === 0) notes.push('该表 = **标准 SM4 CK 原样**');
+    else if (allWordSame) notes.push(`该表 = 标准 SM4 CK + 0x${diffWord.toString(16)}（整字常量差）`);
+    else if (allRevSame) notes.push(`该表 = bswap(标准 SM4 CK) + 0x${diffRevWord.toString(16)}——**每 dword 字节反序**`);
+    else if (perByteSame) {
+      const uniform = pb.every(x => x === pb[0]);
+      notes.push(uniform
+        ? `该表 = 标准 SM4 CK 的**每一字节都 +0x${pb[0].toString(16)}**（等价整字差 0x${(pb[0] * 0x01010101 >>> 0).toString(16)}）`
+        : `该表 = 标准 SM4 CK 的四个字节位分别 +[${pb.map(x => '0x' + x.toString(16)).join(', ')}]`);
+    }
+    else notes.push('该表与标准 CK 的差分**不是固定值**（逐项不同）→ 轮常量被逐项替换，请直接从该表原样取用，不要试图还原标准值');
+  }
+
+  // ---- 3) 在附近搜 16 字节 FK 候选（收集**多个**候选，而不是只取第一个）----
+  // 为什么：完全自定义的 FK 与标准表无任何固定差分，只能靠形态识别 → 必然有误报。
+  // 与其赌一个，不如把候选都交给解密脚本逐个试（16 字节常量 + 试错成本极低）。
+  const fkCands = [];
+  for (let off = lo; off + 16 <= hi; off += 4) {
+    const v = [0, 1, 2, 3].map(i => buf.readUInt32LE(off + i * 4));
+    if (v.every((x, i) => x === STD_SM4_FK[i])) { fkCands.push({ off, kind: '标准 FK 原样' }); continue; }
+    const d = (v[0] - STD_SM4_FK[0]) >>> 0;
+    if (v.every((x, i) => (((x - STD_SM4_FK[i]) >>> 0) === d))) { fkCands.push({ off, kind: `标准 FK + 0x${d.toString(16)}` }); continue; }
+    const dr = (v[0] - bswap32(STD_SM4_FK[0])) >>> 0;
+    if (v.every((x, i) => (((x - bswap32(STD_SM4_FK[i])) >>> 0) === dr))) { fkCands.push({ off, kind: `bswap(标准 FK) + 0x${dr.toString(16)}` }); continue; }
+  }
+  // 兜底：形态匹配（完全自定义 FK）。**不能先到先得**——实测 0xa630 附近有大量高熵数据，
+  // 会把真值（0x10a10，紧邻 key/CK）挤掉。改为全量收集后按"到 CK 的距离"排序。
+  if (!fkCands.length) {
+    const shapeCands = [];
+    // 已知常量表的占位区间——FK 不能与它们重叠（CK 本身就是高熵表，会自我误匹配）
+    const occupied = [];
+    if (ckOff >= 0) occupied.push([ckOff, ckOff + 128]);
+    occupied.push([sboxOff, sboxOff + 256 * (sboxStride || 1)]);
+    const overlapAny = (off) => occupied.some(([a, b]) => off < b && off + 16 > a);
+    for (let off = lo; off + 16 <= hi; off += 4) {
+      if (overlapAny(off)) continue;
+      const v = [0, 1, 2, 3].map(i => buf.readUInt32LE(off + i * 4));
+      if (v.some(x => x === 0)) continue;
+      if (new Set(v).size !== 4) continue;
+      const nonZeroBytes = v.reduce((n, x) => n + [0, 1, 2, 3].filter(k => ((x >>> (k * 8)) & 0xff) !== 0).length, 0);
+      if (nonZeroBytes < 14) continue;
+      shapeCands.push({ off, dist: Math.abs(off - (ckOff >= 0 ? ckOff : sboxOff)) });
+    }
+    shapeCands.sort((a, b) => a.dist - b.dist);
+    // 取"距 CK 最近的 24 个"，再按距离排序（真值通常紧邻 CK/key，但邻近会有大量噪声）
+    for (const c of shapeCands.slice(0, 24)) {
+      fkCands.push({ off: c.off, kind: '**完全自定义**（形态匹配候选）' });
+    }
+  }
+  // ⚠️ 启发式定位 FK 本质上不可靠（完全自定义的 FK 与标准表无任何关系，周围还全是噪声）。
+  // 稳妥做法：把**所有**疑似常量块都交给解密脚本枚举——每个候选只多 32 轮密钥扩展，
+  // 成本可忽略；这比"赌一个位置"可靠得多。故此处在笔记里提示脚本会全量枚举。
+  if (fkCands.length) {
+    notes.push(`FK 定位不可靠（自定义 FK 无固定特征）→ 生成脚本时会枚举文件内**所有** 16 字节常量块，不要只信第一个候选`);
+  }
+  const fkOffList = fkCands.map(c => c.off);
+  const fkOff = fkCands.length ? fkCands[0].off : -1;
+  if (fkCands.length) {
+    notes.push(`FK 候选 ${fkCands.length} 个：` + fkCands.slice(0, 5).map(c => `0x${c.off.toString(16)}（${c.kind}）`).join('、')
+      + (fkCands.length > 5 ? ' …' : ''));
+  }
+
+  // ---- 4) 字节序线索 ----
+  if (sboxStride === 4) {
+    notes.push('S 盒按 **dword 数组**存放（每项 4 字节、值在低字节）→ 读表时必须按 4 字节步长取低字节，不能当连续 256 字节读');
+  }
+  if (ckOff >= 0) {
+    const asBE = [];
+    for (let i = 0; i < 4; i++) asBE.push(buf.readUInt32BE(ckOff + i * 4));
+    const beMatchesStd = asBE.every((v, i) => v === STD_SM4_CK[i]);
+    notes.push(beMatchesStd
+      ? '轮常量按**大端**存放（可直接当 SM4 的 CK 用）'
+      : '轮常量按**小端**存放（若用标准 SM4 实现需注意字节序）');
+  }
+
+  return {
+    sboxFileOffset: '0x' + sboxOff.toString(16),
+    sboxStride,
+    sameSm4, sameAes,
+    ckFileOffset: ckOff >= 0 ? '0x' + ckOff.toString(16) : null,
+    fkFileOffset: fkOff >= 0 ? '0x' + fkOff.toString(16) : null,
+    fkCandidates: fkOffList.map(x => '0x' + x.toString(16)),
+    notes,
+  };
+}
+
+// ============ SM4 变体解密脚本生成器（通用）============
+// 为什么需要：实测 Disguise stage2，AI 已经拿到全部常量，但仍在"字节序/块内排列"上耗掉
+// 300+ 秒。这些是**有限可枚举**的组合（每块 dword 反序 × 轮密钥逆序 × 输出 dword 反序 × 块反序
+// = 16 种），工具一次性全跑完并直接给出命中结果，比让 AI 逐个试快一个数量级。
+//
+// 触发条件（全部满足才生成，避免误报）：
+//   · 确认是自定义分组密码（有 S 盒）
+//   · 找到轮常量表（CK 形态）
+//   · 找到 FK 候选
+//   · 在文件里找到「疑似密文」：长度是 16 的倍数（≥32 字节）、高熵、位于 FK/CK 附近
+// 从 off 开始，测量"连续高熵区"的长度（按 16 字节块推进，遇到低熵/含零块即停）。
+// 用途：密文长度由**数据本身**决定，而不是假设 32/48/64（那会变成针对某道题的特解）。
+// 返回长度（向下取整到 16 的倍数）；不足 16 返回 0。
+function entropyRun(buf, size, off, maxLen) {
+  let len = 0;
+  const limit = Math.min(size, off + maxLen);
+  while (off + len + 16 <= limit) {
+    const p = off + len;
+    const seen = new Set();
+    let zeros = 0;
+    for (let i = 0; i < 16; i++) { const b = buf[p + i]; if (b === 0) zeros++; seen.add(b); }
+    // 一块可接受为"密文块"的条件：零字节 ≤2 且不同字节数 ≥10
+    if (zeros > 2 || seen.size < 10) break;
+    len += 16;
+  }
+  return len;
+}
+
+function findCiphertextCandidate(buf, size, hints) {
+  // === 策略 1（最强）：key 字符串 + 紧邻密文 ===
+  // CTF 题里 "16 字节可打印密钥 + 少量填充 + 高熵密文" 是极常见的常量布局
+  // （实测 Disguise：key@0xfa00 → 8 字节 0 填充 → 密文@0xfa18）。
+  // 这个模式**远比"随便找个高熵块"可靠**，因为 key 的可打印性是强信号。
+  const keyLike = [];
+  // 密钥长度不写死 16：AES-192/256 是 24/32，SM4/分组密码常见 16。
+  // 这里只处理 16 字节（SM4 变体脚本的入口），其余长度由 AI/其他算法分支处理。
+  for (let off = 0; off + 16 <= size; off++) {
+    let ok = true;
+    for (let i = 0; i < 16; i++) {
+      const b = buf[off + i];
+      if (b < 0x20 || b > 0x7e) { ok = false; break; }
+    }
+    if (!ok) continue;
+    // 必须像口令（含字母，且不是纯重复/纯数字）
+    const s = buf.slice(off, off + 16).toString('latin1');
+    if (!/[A-Za-z]/.test(s)) continue;
+    if (!/[A-Za-z0-9_]{8,}/.test(s)) continue;
+    // "像口令"打分：下划线/大小写混合/数字/无空格 → 高分（实测 key 往往是 We1c0me_t0_xmctf 这类）
+    let score = 0;
+    if (/_/.test(s)) score += 5;
+    if (/\d/.test(s)) score += 3;
+    if (/[a-z]/.test(s) && /[A-Z]/.test(s)) score += 3;
+    if (/ /.test(s)) score -= 6;                 // 含空格多半是句子/提示文本
+    if (/\.(dll|exe|dll|pdb)/i.test(s)) score -= 8;
+    if (/^\d+$/.test(s)) score -= 5;
+    keyLike.push({ off, s, score });
+  }
+  // 按分数降序：最像口令的 key 优先（它的相邻密文才是最可能的真密文）
+  keyLike.sort((a, b) => b.score - a.score);
+  const tailCands = [];
+  for (const k of keyLike.slice(0, 6)) {   // 只试最像口令的前 6 个 key（避免全文件噪声）
+    // 从 key 末尾往后 16..512 字节内找高熵块（跳过全零填充）。
+    // 长度**由数据决定**（连续高熵块的最大长度），不再假设 48/64/32 ——
+    // 这是此前的题目特解：那些数字恰好等于 Disguise 的密文长度。
+    for (let start = k.off + 16; start < Math.min(size - 32, k.off + 512); start += 4) {
+      // 跳过全零
+      let allZero = true;
+      for (let z = 0; z < 8; z++) if (buf[start + z] !== 0) { allZero = false; break; }
+      if (allZero) continue;
+      const run = entropyRun(buf, size, start, 512);
+      if (run < 16) continue;
+      tailCands.push({ off: start, len: run, keyOff: k.off, key: k.s, dist: start - k.off, keyScore: k.score });
+      break;
+    }
+  }
+  if (tailCands.length) {
+    // 排序：① key 越"像口令"越优先（这是最强的信号，实测噪声 key 会污染邻近密文）
+    //       ② 距 key 越近
+    tailCands.sort((a, b) => (b.keyScore - a.keyScore) || (a.dist - b.dist));
+    // 去重（同一密文可能被多个重叠 key 命中）
+    const uniq = [];
+    for (const c of tailCands) {
+      if (uniq.some(u => Math.abs(u.off - c.off) < 16)) continue;
+      uniq.push(c);
+      if (uniq.length >= 6) break;
+    }
+    return { cands: uniq, keyHints: keyLike.map(k => k.s).slice(0, 20), strategy: 'key-adjacent' };
+  }
+
+  // === 策略 2（兜底）：靠近常量表的高熵块 ===
+  const tables = [
+    { off: hints.sboxOff, len: 256 * (hints.sboxStride || 1) },
+    { off: hints.ckOff, len: 128 },
+    { off: hints.fkOff, len: 16 },
+  ].filter(t => t.off >= 0);
+  const overlapsTable = (off, len) => tables.some(t => off < t.off + t.len && off + len > t.off);
+  const centers = [hints.sboxOff, hints.fkOff, hints.ckOff].filter(x => x >= 0);
+  const ranges = centers.map(c => [Math.max(0, c - 0x8000), Math.min(size, c + 0x8000)]);
+  const isHighEntropy = (off, len) => {
+    if (off < 0 || off + len > size) return null;
+    const seen = new Set();
+    let zeros = 0;
+    for (let i = 0; i < len; i++) { const b = buf[off + i]; if (b === 0) zeros++; seen.add(b); }
+    const zRatio = zeros / len;
+    if (zRatio > 0.1) return null;
+    if (seen.size < Math.min(200, len * 0.6)) return null;
+    return { zeros: zRatio, uniq: seen.size };
+  };
+  const cands2 = [];
+  for (const [lo, hi] of ranges.concat([[0, size]])) {
+    for (let off = lo; off + 32 <= hi; off += 4) {
+      // 跳过已知常量表内部的起点（否则 CK 表自身会被当成"密文"）
+      if (off >= 0 && tables.some(t => off >= t.off && off < t.off + t.len)) continue;
+      // 长度由连续高熵区决定（不再枚举 48/64/32/128 这类固定值）
+      const runLen = entropyRun(buf, size, off, 512);
+      if (runLen < 32) continue;
+      // 若高熵区**跨过**了某个已知表，把它截断到表边界之前（真正的密文不会包含 S 盒/CK）
+      let capped = runLen;
+      for (const t of tables) {
+        if (off < t.off && off + capped > t.off) { capped = t.off - off; break; }
+      }
+      if (capped < 32) continue;
+      if (overlapsTable(off, capped)) continue;
+      const he = isHighEntropy(off, capped);
+      if (!he) continue;
+      const center = centers.length ? centers.reduce((a, b) => a + b, 0) / centers.length : off;
+      cands2.push({ off, len: capped, dist: Math.abs(off - center), uniq: he.uniq });
+    }
+  }
+  if (!cands2.length) return null;
+  cands2.sort((a, b) => (a.dist - b.dist) || (b.uniq - a.uniq));
+  const out2 = [];
+  for (const c of cands2) {
+    if (out2.some(o => Math.abs(o.off - c.off) < 16)) continue;
+    out2.push(c);
+    if (out2.length >= 12) break;
+  }
+  return { cands: out2, keyHints: keyLike.map(k => k.s).slice(0, 20), strategy: 'entropy-near-tables' };
+}
+
+function buildSM4VariantDecryptScript({ sboxOff, sboxStride, ckOff, fkOffs, ctCands, keyHints }) {
+  const ctList = ctCands.map(c => `    (0x${c.off.toString(16)}, ${c.len}),`).join('\n');
+  const fkList = (fkOffs || []).map(o => `    0x${o.toString(16)},`).join('\n');
+  const keyList = (keyHints || []).slice(0, 40).map(k => `    ${JSON.stringify(k)},`).join('\n');
+  return `#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# 由 ctf-tool 自动生成：SM4 变体（自定义 S 盒 / FK / CK）全组合枚举解密
+#   S 盒 @文件偏移 0x${sboxOff.toString(16)}（stride=${sboxStride}）
+#   CK   @文件偏移 ${ckOff >= 0 ? '0x' + ckOff.toString(16) : '（未定位）'}
+#   FK/密文候选均由工具按"key 相邻布局"等确定性特征给出；无法唯一确定 → 全部枚举
+import struct, itertools, sys
+
+PATH = sys.argv[1] if len(sys.argv) > 1 else r"<目标文件>"
+d = open(PATH, "rb").read()
+_sz = len(d)
+
+SBOX = [d[${sboxOff} + i * ${sboxStride}] for i in range(256)]
+CK   = [struct.unpack_from("<I", d, ${ckOff >= 0 ? ckOff : 0} + i * 4)[0] for i in range(32)]
+# 偏移说明：S 盒=0x${sboxOff.toString(16)}，CK=0x${(ckOff >= 0 ? ckOff : 0).toString(16)}（上面是十进制写法，等价）
+
+CT_CANDS = [
+${ctList}
+]
+
+FK_CANDS = [
+${fkList}
+]
+
+# 工具从文件里找到的"像口令的 16 字节串"（强提示，优先试）
+KEY_HINTS = [
+${keyList}
+]
+
+# 其余 key 候选：文件里所有 16 字节可打印串（兜底）
+KEY_CANDS = []
+seen_k = set()
+for off in range(0, _sz - 16):
+    chunk = d[off:off + 16]
+    try:
+        s = chunk.decode("ascii")
+    except Exception:
+        continue
+    if all(32 <= ord(c) < 127 for c in s) and chunk not in seen_k:
+        seen_k.add(chunk)
+        KEY_CANDS.append(chunk)
+KEY_CANDS = [k.encode("latin-1") for k in KEY_HINTS] + [k for k in KEY_CANDS if k.decode("latin-1", "ignore") not in KEY_HINTS]
+# 分层：工具已按"像口令"给 KEY_HINTS 排序 → 前若干个是强候选。
+# 先只用前 3 个 key 跑全部 FK（覆盖绝大多数题），未命中再放开到全部（--all-keys 或自动）。
+KEY_TIER1 = KEY_CANDS[:3]
+KEY_TIER2 = KEY_CANDS[3:40]
+KEY_CANDS = KEY_CANDS[:80]
+
+M = 0xFFFFFFFF
+def rotl(x, n): return ((x << n) | (x >> (32 - n))) & M
+def tau(a):
+    return ((SBOX[(a >> 24) & 0xff] << 24) | (SBOX[(a >> 16) & 0xff] << 16)
+            | (SBOX[(a >> 8) & 0xff] << 8) | SBOX[a & 0xff]) & M
+def L(b):  return (b ^ rotl(b, 2) ^ rotl(b, 10) ^ rotl(b, 18) ^ rotl(b, 24)) & M
+def Lp(b): return (b ^ rotl(b, 13) ^ rotl(b, 23)) & M
+
+def key_schedule(key_bytes, FK):
+    mk = list(struct.unpack(">4I", key_bytes[:16]))
+    k = [(mk[i] ^ FK[i]) & M for i in range(4)]
+    rk = []
+    for i in range(32):
+        t = (k[i + 1] ^ k[i + 2] ^ k[i + 3] ^ CK[i]) & M
+        k.append((k[i] ^ Lp(tau(t))) & M)
+        rk.append(k[i + 4])
+    return rk
+
+def decrypt_block(blk, rk, *, in_bswap, rk_rev, out_bswap):
+    b = blk
+    if in_bswap:
+        b = b"".join(b[i:i+4][::-1] for i in range(0, 16, 4))
+    x = list(struct.unpack(">4I", b))
+    for i in range(32):
+        kk = rk[31 - i] if rk_rev else rk[i]
+        t = (x[1] ^ x[2] ^ x[3] ^ kk) & M
+        x = [x[1], x[2], x[3], (x[0] ^ L(tau(t))) & M]
+    o = struct.pack(">4I", *x)
+    if out_bswap:
+        o = b"".join(o[i:i+4][::-1] for i in range(0, 16, 4))
+    return o
+
+FLAG_RE = ("xmctf{", "flag{", "ctf{", "dasctf{", "nssctf{", "sctf{", "iscc{", "hgame{")
+def looks_flag(s):
+    low = s.lower()
+    return any(m in low for m in FLAG_RE)
+
+def rev_words(b):
+    out = []
+    for i in range(0, len(b), 16):
+        blk = b[i:i+16]
+        out.append(blk[12:16] + blk[8:12] + blk[4:8] + blk[0:4])
+    return b"".join(out)
+
+def rev_bytes(b):
+    return b"".join(b[i:i+16][::-1] for i in range(0, len(b), 16))
+
+# ---- FK 候选：工具给的 + 紧邻密文的块 + （可选）全文件枚举 ----
+# 全文件枚举很慢，仅当上面都不命中时才启用；用环境变量控制。
+fk_all = list(FK_CANDS)
+ENUM_ALL = ("--all-fk" in sys.argv)
+
+print("S 盒首4字节:", " ".join("%02x" % x for x in SBOX[:4]))
+print("CK首项: 0x%08x" % CK[0])
+print("密文候选 %d / FK 候选 %d / key 候选 %d%s"
+      % (len(CT_CANDS), len(fk_all), len(KEY_CANDS), "（+全文件枚举）" if ENUM_ALL else ""))
+
+tried = 0
+def try_all_fk(fk_list, key_list, tag=""):
+    global tried
+    for ct_off, ct_len in CT_CANDS:
+        CT = d[ct_off:ct_off + ct_len]
+        blocks = [CT[i:i+16] for i in range(0, len(CT), 16)]
+        if len(blocks) * 16 != len(CT):
+            continue
+        for fk_off in fk_list:
+            FK = list(struct.unpack_from("<4I", d, fk_off))
+            for key in key_list:
+                rk = key_schedule(key, FK)
+                # 廉价预筛：单块 + rk 逆序 + 输入反序；不通过就跳过整个 (ct,fk,key) 组合，
+                # 避免 8 种组合 × 3 种排列全跑（这是上千候选能跑完的关键）。
+                # 阈值 8/16 可打印：错误 FK 通常解出全乱码（可打印数 0~3），正确组合通常 10+。
+                probe = decrypt_block(blocks[0], rk, in_bswap=True, rk_rev=True, out_bswap=False)
+                ps = probe.decode("latin-1")
+                good = sum(1 for c in ps if 32 <= ord(c) < 127)
+                if good < 8 and not any(ch in ps for ch in "{}_"):
+                    continue
+                tried += 1
+                for in_bswap, rk_rev, out_bswap in itertools.product([False, True], repeat=3):
+                    pt = b"".join(decrypt_block(b, rk, in_bswap=in_bswap, rk_rev=rk_rev, out_bswap=out_bswap) for b in blocks)
+                    for perm_name, q in (("asis", pt), ("rev_words", rev_words(pt)), ("rev_bytes", rev_bytes(pt))):
+                        s = q.decode("latin-1")
+                        if looks_flag(s):
+                            print("\\n*** FLAG 命中 ***")
+                            print("密文=0x%x len=%d FK=0x%x key=%r in_bswap=%s rk_rev=%s out_bswap=%s perm=%s"
+                                  % (ct_off, ct_len, fk_off, key, in_bswap, rk_rev, out_bswap, perm_name))
+                            print("FLAG:", s)
+                            sys.exit(0)
+
+# 分层：先用"key 与 FK 的字节相似度"排序，最可能的排前面（同一组常量常由同一段代码初始化）
+# 分层执行：先用"最像口令的 3 个 key"跑全部 FK（多数题在这里就命中），
+# 未命中再放开到其余 key。分层显著缩短典型耗时，且不牺牲召回。
+print("阶段 1：%d 个 FK × %d 个高置信 key ..." % (len(fk_all), len(KEY_TIER1)), flush=True)
+try_all_fk(fk_all, KEY_TIER1, "tier1")
+
+if len(KEY_TIER2):
+    print("阶段 2：补充 key（%d 个）..." % len(KEY_TIER2), flush=True)
+    try_all_fk(fk_all, KEY_TIER2, "tier2")
+
+if ENUM_ALL:
+    print("阶段 3：全文件枚举 FK（慢）...", flush=True)
+    extra = [o for o in range(0, _sz - 16, 4) if o not in fk_all]
+    try_all_fk(extra, KEY_CANDS, "all")
+
+print("\\n未命中（共尝试 %d 组）。" % tried)
+print("提示：加 --all-fk 参数可对全文件枚举 FK。")
+`;
+}
+
+// 在分析结果里附加"可直接跑的解密脚本"
+function attachSM4DecryptScript(buf, size, analysis, sboxOff) {
+  const ckOff = analysis.ckFileOffset ? parseInt(analysis.ckFileOffset, 16) : -1;
+  const fkOffs = (analysis.fkCandidates || []).map(x => parseInt(x, 16)).filter(x => x >= 0);
+  if (ckOff < 0) return null;
+  const found = findCiphertextCandidate(buf, size, { sboxOff, ckOff, fkOff: fkOffs[0] || -1 });
+  if (!found || !found.cands || !found.cands.length) return null;
+  const cts = found.cands;
+  // FK 候选：优先用"紧邻密文/key 的 16 字节块"（SM4 初始化里 key/FK/CK 常成组出现），
+  // 再加上启发式候选与全文件枚举兜底（脚本内完成）。
+  const nearFk = [];
+  // FK 候选的三类来源（都**不依赖**具体题目的偏移）：
+  //   A. 每个密文候选/key 位置的结构邻近位置（同一组常量常相邻）
+  //   B. **整个常量区**（S 盒到 CK 到 key 的包围盒）内的所有高熵 16 字节块 —— 覆盖"FK 被放在
+  //      同一节的另一处、与密文不相邻"的常见布局（实测 Disguise：key@0xfa00、FK@0x10a10 相距 4KB）
+  //   C. 全文件兜底（按到 key 的距离排序，取最近的若干）
+  const STRUCTURAL_DELTAS = [
+    0, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024,
+    -16, -32, -48, -64, -96, -128, -192, -256, -384, -512,
+  ];
+  for (const c of cts) {
+    for (const delta of STRUCTURAL_DELTAS) {
+      const off = c.off + delta;
+      if (off >= 0 && off + 16 <= size) nearFk.push(off);
+    }
+  }
+  // B：**key 附近的同一数据区**内的 16 字节块。
+  // 通用依据：SM4/AES 实现会把 key、FK、CK 一起 memcpy 到运行时缓冲区，
+  // key 与 FK 通常在同一段连续数据里；而 S 盒/CK 常在另一（只读）段。
+  // 只用 **key 位置**作锚点，避免把 S 盒/CK 所在的 .rdata 整段纳入（实测会从 16 个涨到 1573 个）。
+  const anchors = [];
+  for (const c of cts) if (c.keyOff != null) anchors.push(c.keyOff);
+  anchors.push(sboxOff);
+  if (ckOff >= 0) anchors.push(ckOff);
+  // FK 搜索优先锚点：**key 位置**（key 与 FK 通常在同一个数据段），
+  // 其次才是 S 盒/CK（可能在不同段，作为兜底）。
+  const keyAnchors = cts.map(c => c.keyOff).filter(x => x != null);
+  const searchAnchors = keyAnchors.length ? keyAnchors : anchors;
+  // 已知常量表的占位区间：FK 不可能落在 S 盒/CK 表内部
+  const occupiedRanges = [];
+  occupiedRanges.push([sboxOff, sboxOff + 256 * (analysis.sboxStride || 1)]);
+  if (ckOff >= 0) occupiedRanges.push([ckOff, ckOff + 128]);
+  const inOccupied = (off) => occupiedRanges.some(([a, b]) => off < b && off + 16 > a);
+  if (searchAnchors.length) {
+    const kMin = Math.min(...searchAnchors), kMax = Math.max(...searchAnchors);
+    const loA = Math.max(0, kMin - 0x2000);
+    const hiA = Math.min(size, kMax + 0x4000);
+    for (let off = loA; off + 16 <= hiA; off += 4) {
+      if (inOccupied(off)) continue;
+      const v = [0, 1, 2, 3].map(i => buf.readUInt32LE(off + i * 4));
+      if (v.includes(0) || new Set(v).size !== 4) continue;
+      const nz = v.reduce((n, x) => n + [0, 1, 2, 3].filter(k => ((x >>> (k * 8)) & 0xff) !== 0).length, 0);
+      if (nz < 14) continue;
+      const bs = Buffer.from(v.flatMap(x => [x & 0xff, (x >>> 8) & 0xff, (x >>> 16) & 0xff, (x >>> 24) & 0xff]));
+      if (bs.every(b => b === 0xcc || b === 0x90)) continue;
+      // 排除"可读文本切片"：真正的 FK 是随机常量，16 字节里几乎不会整段是 ASCII 可打印字符。
+      // （实测噪声大多来自 key 字符串附近的多字节文本、C++ 符号名等）
+      const printable = bs.reduce((n, b) => n + (b >= 0x20 && b <= 0x7e ? 1 : 0), 0);
+      if (printable >= 12) continue;
+      nearFk.push(off);
+    }
+  }
+  // C：兜底
+  if (nearFk.length < 16) {
+    const ref = anchors.length ? anchors[0] : 0;
+    const all = [];
+    for (let off = 0; off + 16 <= size; off += 4) {
+      const v = [0, 1, 2, 3].map(i => buf.readUInt32LE(off + i * 4));
+      if (v.includes(0) || new Set(v).size !== 4) continue;
+      const nz = v.reduce((n, x) => n + [0, 1, 2, 3].filter(k => ((x >>> (k * 8)) & 0xff) !== 0).length, 0);
+      if (nz < 14) continue;
+      all.push({ off, dist: Math.abs(off - ref) });
+    }
+    all.sort((a, b) => a.dist - b.dist);
+    for (const x of all.slice(0, 24)) nearFk.push(x.off);
+  }
+  // 去重。**不做数量截断**：每个 FK 候选只多一次 32 轮密钥扩展（微秒级），
+  // 而截断会把真正的 FK 挤掉（实测：按距离排序时 0x10a10 被 80 个更近的噪声挤出）。
+  // 只把"与锚点极近的"排在前面（大概率是真正的常量组），其余全部保留给脚本枚举。
+  const anchorList = anchors.length ? anchors : [0];
+  const fkUniq = [...new Set([...nearFk, ...fkOffs])];
+  fkUniq.sort((a, b) => {
+    const da = Math.min(...anchorList.map(x => Math.abs(a - x)));
+    const db = Math.min(...anchorList.map(x => Math.abs(b - x)));
+    return da - db;
+  });
+  const fkList = fkUniq;  return {
+    ciphertextCandidates: cts.map(c => ({ offset: '0x' + c.off.toString(16), length: c.len })),
+    fkCandidates: fkList.map(x => '0x' + x.toString(16)),
+    strategy: found.strategy,
+    keyHints: found.keyHints || [],
+    script: buildSM4VariantDecryptScript({
+      sboxOff, sboxStride: analysis.sboxStride, ckOff,
+      fkOffs: fkList, ctCands: cts, keyHints: found.keyHints || [],
+    }),
+  };
+}
+
+// 扫描文件字节，返回确定性算法候选
+function scanCryptoFingerprints(filePath) {
+  const out = [];
+  let buf;
+  try { buf = fs.readFileSync(filePath); } catch (e) { return { success: false, error: '读取失败: ' + e.message }; }
+  const size = buf.length;
+
+  // 1) 已知常量/表模式
+  for (const [name, hexPat, desc] of CRYPTO_FP) {
+    const pat = hexToBytes(hexPat);
+    const hits = findPattern(buf, pat);
+    for (const off of hits) {
+      out.push({ fp: name, desc, offset: '0x' + off.toString(16), algo: name.split('-')[0].replace(/^(SM4|SM3|AES|MD5|SHA256|TEA|CRC32|RC4|B64)$/, '$1') });
+    }
+  }
+
+  // 2) 256 项双射表（S 盒候选：0..255 每值恰出现一次）
+  //    ⚠️ 必须同时扫**定长步长**形态：C 代码里 S 盒常声明为 `unsigned int sbox[256]`，
+  //    即使值域只有 0..255 也占 4 字节/项（`8e 00 00 00 2f 00 00 00 ...`）。
+  //    实测 Disguise stage2：自定义 S 盒就是 dword 数组 @0xd630，只扫连续字节会**完全漏掉**
+  //    → 这正是此前"AI 每次把 SM4 变体认成 AES 变体"的根因。
+  //
+  //    性能：直接对每个偏移做 256 项检查是 O(size×256)，在 180MB 的 electron.exe 上会卡死。
+  //    改为**滑动窗口预筛**——任何 0..255 的置换都满足 XOR=0 且 Σ=32640（必要条件），
+  //    用前缀异或/前缀和可 O(1) 判每个窗口；只有极少数通过这一步的才做完整双射检查。
+  //    stride>1 时按"同一余数类"（off, off+stride, ...）建前缀序列，同样适用。
+  const sboxCands = [];   // {off, stride, head}
+  const PERM_XOR = 0, PERM_SUM = 32640;   // 0..255 的异或和 / 和
+  // 平凡表过滤：二进制里的偏移/跳转表、位重排表（bit-reverse/bit-scatter）也是双射但不是 S 盒。
+  // 实测区分度极大（相邻差分布的种类数）：
+  //   真实 S 盒：AES=160、SM4≈160、自定义/随机置换≈163、Disguise 自定义=169
+  //   误报表（ntdll/electron 位重排、msvcrt 偏移表）：6~8
+  // 取阈值 100（远高于误报、远低于真实 S 盒）。
+  const isTrivialTable = (off, stride) => {
+    const dset = new Set(), xset = new Set();
+    for (let i = 0; i + 1 < 256; i++) {
+      const a = buf[off + i * stride], b = buf[off + (i + 1) * stride];
+      dset.add((b - a) & 0xff);
+      xset.add(b ^ a);
+    }
+    if (Math.max(dset.size, xset.size) < 100) return true;
+    // GF(2^8) 反对数表（antilog/exp table）：t[i+1] == xtime(t[i])，xtime(x)=(x<<1)^(x&0x80?0x1b:0)。
+    // 用于 AES/Rijndael 的 gmul/log 实现，是双射但不是 S 盒（实测 electron.exe 命中两处）。
+    // 真实 S 盒该链式关系几乎不成立（命中数接近 0），故以 100 为界。
+    let xtimeChain = 0;
+    for (let i = 0; i + 1 < 256; i++) {
+      const a = buf[off + i * stride], b = buf[off + (i + 1) * stride];
+      const xt = ((a << 1) ^ (a & 0x80 ? 0x1b : 0)) & 0xff;
+      if (b === xt) xtimeChain++;
+    }
+    if (xtimeChain > 100) return true;
+    return false;
+  };
+  const fullBijection = (off, stride) => {
+    const seen = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) {
+      const b = buf[off + i * stride];
+      if (seen[b]) return false;
+      seen[b] = 1;
+    }
+    return true;
+  };
+  const highBytesZero = (off, stride) => {
+    for (let i = 0; i < 256; i++) for (let k = 1; k < stride; k++) if (buf[off + i * stride + k] !== 0) return false;
+    return true;
+  };
+  for (const stride of [1, 4, 2]) {
+    // 对每个余数类 r，用**定长滑窗**（窗口=256 项）维护 XOR 与和，O(1) 内存、O(n) 时间。
+    // 置换窗口满足 XOR=0 且 Sum=32640（必要条件）；通过者才做完整双射检查。
+    for (let r = 0; r < stride && sboxCands.length < 6; r++) {
+      const idx = (i) => buf[r + i * stride];
+      const n = (size - r - 1 >= 0) ? Math.floor((size - r - 1) / stride) + 1 : 0;
+      if (n < 256) continue;
+      let wx = 0, ws = 0;
+      for (let i = 0; i < 256; i++) { const b = idx(i); wx ^= b; ws += b; }
+      for (let k = 0; k + 256 <= n; k++) {
+        if (k > 0) {                                   // 滑动：去掉 i=k-1，加入 i=k+255
+          const out = idx(k - 1), inn = idx(k + 255);
+          wx ^= out; wx ^= inn; ws -= out; ws += inn;
+        }
+        if (wx !== PERM_XOR || ws !== PERM_SUM) continue;
+        const off = r + k * stride;
+        if (!fullBijection(off, stride)) continue;
+        if (stride > 1 && !highBytesZero(off, stride)) continue;
+        if (isTrivialTable(off, stride)) continue;
+        const head = Array.from({ length: 4 }, (_, i) => buf[off + i * stride].toString(16).padStart(2, '0')).join('');
+        sboxCands.push({ off, stride, head });
+        if (sboxCands.length >= 6) break;
+      }
+    }
+    if (sboxCands.length >= 6) break;
+  }
+  for (const { off, stride, head } of sboxCands) {
+    const isSM4 = head.startsWith('d690e9fe');
+    const isAES = head.startsWith('637c777b');
+    const isAESInv = head.startsWith('52096ad5');
+    const strideNote = stride === 1 ? '' : `（表项按 ${stride} 字节步长存放，值在低字节）`;
+    const item = {
+      fp: 'SBOX-256', algo: isSM4 ? 'SM4' : (isAES ? 'AES' : (isAESInv ? 'AES' : 'CUSTOM-BLOCK')),
+      desc: isSM4 ? 'SM4 标准 S 盒（256 项双射）'
+        : (isAES ? 'AES 标准 S 盒'
+        : (isAESInv ? 'AES 逆 S 盒（解密码表）'
+        : `自定义分组密码 S 盒（256 项双射，非常见算法）${strideNote}`)),
+      offset: '0x' + off.toString(16), head, stride,
+    };
+    // 自定义 S 盒 → 做**常量差分分析**（纯确定性推导，不猜算法）：
+    // 逐个比对标准 SM4/AES 表，找出"是否只是字节变换"，并搜索附近的轮常量表推算差分关系。
+    // 实测价值（Disguise stage2）：AI 花了 345 秒/20+ 次脚本，反复纠结 FK/CK 是否被替换、
+    // 字节序怎么摆；而这些关系全都可以由工具一次性算出来。
+    if (item.algo === 'CUSTOM-BLOCK') {
+      try {
+        const analysis = analyzeCustomBlockConstants(buf, size, off, stride);
+        if (analysis) {
+          item.constantAnalysis = analysis;
+          // 附加"可直接跑"的 SM4 变体解密脚本（覆盖字节序/块内排列的全组合）
+          try {
+            const sk = attachSM4DecryptScript(buf, size, analysis, off);
+            if (sk) analysis.decryptScript = sk;
+          } catch (e) { /* 生成失败不影响主结论 */ }
+        }
+      } catch (e) { /* 分析失败不影响主结论 */ }
+    }
+    out.push(item);
+  }
+
+  // 3) 高熵常量块（16/24/32 字节，疑似 key/密文）——只报前几个，避免噪声。
+  //    ⚠️ 大文件（electron.exe 180MB）下不能对每个偏移 slice（会创建千万级 Buffer）。
+  //    改为原地统计：先按 4 字节步进快速排除（低位重复/含 0），命中才 slice 取 hex。
+  const highEntropy = [];
+  const looksHighEntropy = (off, len) => {
+    let zeros = 0;
+    const seen = new Uint8Array(256);
+    let dup = 0;
+    for (let i = 0; i < len; i++) {
+      const b = buf[off + i];
+      if (b === 0) { zeros++; continue; }
+      if (seen[b]) dup++; else seen[b] = 1;
+    }
+    if (zeros > len * 0.15) return false;
+    if (dup > len * 0.4) return false;      // 重复过多 = 熵不足
+    return true;
+  };
+  for (const len of [32, 24, 16]) {
+    for (let off = 0; off + len <= size && highEntropy.length < 8; off += 4) {
+      if (!looksHighEntropy(off, len)) continue;
+      if (out.some(o => o.offset === '0x' + off.toString(16))) continue;
+      highEntropy.push({ offset: '0x' + off.toString(16), len, hex: buf.slice(off, off + len).toString('hex').slice(0, 64) });
+      off += len - 4;
+    }
+    if (highEntropy.length >= 8) break;
+  }
+
+  // 3.5) 载荷（下一层载体）检测流水线 —— 可插拔，按序尝试多种编码/容器形态。
+  // 为什么：多阶段/壳/loader 题常把下一层 payload 编码后塞进数据段（明文搜不到 MZ/ELF/DEX 头），
+  //   实测 AI 会把它当"填充物"，宣称"文件内无第二载体"直接收工。必须由工具确定性定位并给提取配方。
+  // 形态覆盖：单字节 XOR/ADD×stride / 周期 XOR / 滚动 XOR/ADD / Base64·Hex 文本 / ELF·DEX / shellcode 序言。
+  const payloads = detectPayloads(buf, size);
+
+  // 4) 综合判定（交叉证据 → 置信度）
+  const algos = {};
+  for (const o of out) { algos[o.algo] = algos[o.algo] || []; algos[o.algo].push(o); }
+  const summary = [];
+  const has = (n) => out.some(o => o.fp === n);
+
+  // 4.0) 载荷命中 → **最高优先级结论**：本层是 loader，下一层在此处、按此法解码。
+  //      必须排在所有算法判定之前（loader 层可能同时含 CRC/Base64 等无关常量，不能让它们抢结论）——
+  //      实测教训：只给"去找下一层"的软提示，AI 会把编码存储的 stage2 当成填充物，直接收工报 decoy。
+  if (payloads.length) {
+    for (const p of payloads) summary.push(payloadDescription(p, payloads.length));
+  }
+  if (has('SM4-FK') || has('SM4-FK-BE')) {
+    const customSbox = out.find(o => o.fp === 'SBOX-256' && o.algo === 'CUSTOM-BLOCK');
+    const stdSbox = out.find(o => o.fp === 'SBOX-256' && o.algo === 'SM4');
+    if (customSbox) {
+      summary.push({ algo: 'SM4-魔改变体', confidence: 'high',
+        evidence: `命中 SM4 FK 系统参数（${out.filter(o => o.fp.startsWith('SM4-FK')).map(o => o.offset).join(',')}），` +
+                  `但 S 盒非常准（@${customSbox.offset} 首字节 ${customSbox.head.slice(0, 2)} ≠ d6）→ **FK/CK/S盒 被替换的 SM4 变体**`,
+        note: '用 SM4 解密框架（32 轮 + 轮密钥逆序 rk[31-i] + 块内字节反序 [3][2][1][0]），常量换成题目表；gmssl 会解出乱码（S 盒非标准）。' });
+    } else if (stdSbox) {
+      summary.push({ algo: 'SM4', confidence: 'high', evidence: 'FK 系统参数 + 标准 S 盒双命中', note: '直接 gmssl 解（sm4_ecb/sm4_cbc）。' });
+    } else {
+      summary.push({ algo: 'SM4', confidence: 'high', evidence: '命中 SM4 FK 系统参数（铁证）', note: '按 SM4 结构解；S 盒位置需在 IDA 中确认是否标准。' });
+    }
+  }
+  if (!has('SM4-FK') && !has('SM4-FK-BE') && out.some(o => o.fp === 'SBOX-256' && o.algo === 'CUSTOM-BLOCK')) {
+    const cb = out.filter(o => o.fp === 'SBOX-256' && o.algo === 'CUSTOM-BLOCK');
+    // 大文件（>16MB）通常是**通用程序**（浏览器/DLL/运行时，如 electron.exe 200MB），
+    // 里面合法地嵌着各种密码库与随机置换表；仅凭双射表不能断言"这是本题的算法"。
+    // CTF 题目二进制极少超过 16MB，故只在"题目量级"的文件上给 high 置信度。
+    const bigBinary = size > 16 * 1024 * 1024;
+    // 常量差分分析（确定性推导）：把"AI 要花几十次脚本才能算出来的表关系"直接给出。
+    const ca = cb.find(o => o.constantAnalysis) && cb.find(o => o.constantAnalysis).constantAnalysis;
+    const caText = ca ? ('\n**工具已完成的常量差分分析（确定性推导，直接用，别重新推导）**：\n'
+      + ca.notes.map(n => '  · ' + n).join('\n')
+      + (ca.ckFileOffset ? `\n  · 轮常量表文件偏移 **${ca.ckFileOffset}**（VA = 文件偏移按 PE 节表换算，或直接用 ida_get_bytes 按 VA 读）` : '')
+      + (ca.fkFileOffset ? `\n  · FK 候选文件偏移 **${ca.fkFileOffset}**` : '')
+      + `\n  · S 盒文件偏移 **${ca.sboxFileOffset}**（stride=${ca.sboxStride}）`) : '';
+    // 若已生成"可跑的解密脚本"，直接在提示词里给出——这是把"确定性推导"变成"可执行结论"的关键一步。
+    // ⚠️ 必须写明适用边界：脚本只实现 SM4 骨架（32 轮 + X^X^X^rk + 可替换 S 盒/FK/CK）。
+    //    不能让它读起来像"任意分组密码都能解"，否则 AI 在 AES 变体题上会误信这个脚本。
+    const scriptText = (ca && ca.decryptScript) ? (
+      `\n**工具已生成可直接运行的解密脚本**（自动枚举 字节序 × 轮密钥顺序 × 块内排列 的全部组合，命中即退出）：\n`
+      + `- 密文候选：${(ca.decryptScript.ciphertextCandidates || []).map(c => `${c.offset}(${c.length}B)`).join('、')}\n`
+      + `- 用法：把脚本写到文件后 \`python solve.py <目标文件>\`\n`
+      + `- ⚠️ **适用范围：SM4 骨架**（32 轮 + \`X^X^X^rk\` 轮函数 + 可替换的 S 盒/FK/CK）。`
+      + `若实测结构是 AES 骨架（SubBytes/ShiftRows/MixColumns）或其它分组密码，本脚本**不适用**——`
+      + `请按对应结构另写实现，不要因为脚本失败就断定"算法认错了"。\n`
+      + '```python\n' + ca.decryptScript.script + '\n```\n'
+    ) : '';
+    summary.push({
+      algo: bigBinary ? '疑似自定义分组密码' : '自定义分组密码（已确认）',
+      confidence: bigBinary ? 'low' : 'high',
+      evidence: `发现 ${cb.length} 个 256 项双射 S 盒（非常见算法）：` + cb.map(o => `${o.offset} 首字节 ${o.head.slice(0, 2)}`).join('、')
+        + (bigBinary ? `（文件 ${(size / 1048576).toFixed(0)}MB，属通用程序量级，含密码库/置换表属正常）` : ''),
+      note: (bigBinary
+        ? '文件偏大，可能是通用程序自带的密码实现，**不一定是本题算法**；请结合本题的输入校验点/密文常量判断，勿直接照此下结论。'
+        : '**确定存在分组密码**（双射 S 盒不会偶然出现），常量被改成自定义值。'
+          + '① 先核对轮结构：32 轮 + `X^X^X^rk` 线性变换 → SM4 骨架（即使无标准 FK）；'
+          + '10/12/14 轮 + SubBytes/ShiftRows/MixColumns → AES 骨架。'
+          + '② 结构确认后，直接套对应框架、把 S 盒/常量换成题目表手写实现（禁止硬逆/写通用 VM 解释器）。'
+          + '③ 参照技能 ctf-crypto-identify 的"魔改变体识别三问"。')
+        + caText + scriptText
+    });
+  }
+  if (has('AES-SBOX') && !summary.some(s => /AES/.test(s.algo))) summary.push({ algo: 'AES', confidence: 'high', evidence: 'AES 标准 S 盒', note: '按 AES 解（注意 key 长度 16/24/32）。' });
+  if (has('SM3-IV')) summary.push({ algo: 'SM3', confidence: 'high', evidence: 'SM3 IV（铁证）', note: '哈希不可逆：按"SM3(候选)==目标"爆破/长度扩展。' });
+  if (has('TEA-DELTA') || has('TEA-DELTA-INV')) summary.push({ algo: 'TEA/XTEA/XXTEA', confidence: 'high', evidence: 'TEA delta 常量', note: `按 TEA 族解；delta 大小端/正负见偏移。` });
+  if (has('MD5-IV')) summary.push({ algo: 'MD5', confidence: 'medium', evidence: 'MD5 IV', note: '哈希：爆破/碰撞/截断比较。' });
+  if (has('SHA256-IV')) summary.push({ algo: 'SHA256', confidence: 'medium', evidence: 'SHA256 IV', note: '哈希：同上。' });
+  if (has('CRC32-POLY')) summary.push({ algo: 'CRC32', confidence: 'medium', evidence: 'CRC32 多项式', note: '短输入可碰撞爆破（注意自定义初值/异或）。' });
+  if (has('RC4-ID')) summary.push({ algo: 'RC4（疑）', confidence: 'low', evidence: '出现 00 01 02.. 连续初值（RAM 初始化特征，非铁证）', note: '需在代码中确认 KSA/PRGA。' });
+  if (has('B64-STD')) summary.push({ algo: 'Base64', confidence: 'low', evidence: '标准 Base64 表', note: '编码非加密；可能是自定义表 Base64 的对照。' });
+
+  // 4.5) 无任何算法指纹 → 关键判定（实测 Disguise：第一层是 XOR 编码的内嵌 PE + decoy 表，
+  //      常量全在 stage2 里，本层零指纹）。此时必须提示"先找/提取下一层"，而不是让 AI 在当前层硬猜算法。
+  if (!summary.length) {
+    summary.push({
+      algo: '(未发现算法指纹)', confidence: 'n/a',
+      evidence: `扫描 ${size} 字节，未命中任何已知算法常量（SM4/AES/SM3/MD5/SHA/TEA/CRC32 S盒表均无）`,
+      note: '本层极可能是**壳/加载器/decoy**：算法常量在下一层（内嵌/解密后的文件）里。'
+        + '请先找"内嵌 PE/解密逻辑/资源段"，提取出下一层后**对新文件重跑本扫描**；'
+        + '切勿在当前层盲猜算法或硬逆它的 VM。'
+    });
+  }
+
+  return {
+    success: true, size,
+    summary,                                   // 综合判定（给 AI 看的主结论）
+    fingerprints: out.slice(0, 40),            // 原始命中（证据）
+    highEntropy: highEntropy.slice(0, 8),      // 疑似 key/密文常量
+    payloads,                                  // 下一层载体（多形态，流水线检测）
+    embeddedPE: payloads.filter(p => p.type === 'pe'),  // 向后兼容：仅 PE 子集
+  };
+}
+
+ipcMain.handle('scan-crypto-fingerprints', async (event, filePath) => {
+  try { return scanCryptoFingerprints(filePath); }
+  catch (err) { return { success: false, error: err.message }; }
+});
+
 // 提取 APK 内的 native SO（纯 Node，无 shell/编码问题）
 ipcMain.handle('extract-apk-so', async (event, apkPath) => {
   try {
@@ -3469,8 +4853,10 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
   // "只说不做"催促：模型输出行动意图却零工具调用时注入催促继续执行（最多 3 次，防死循环）
   let actionNudged = false;
   let actionNudgeCount = 0;
-  // 重复调用计数（工具名+参数签名 → 次数）：同一调用重复 ≥3 次时警告换路，防"原地打转"卡死
+  // 重复调用计数（工具名+参数签名 → 次数）：同一调用重复 ≥4 次时警告换路，防"原地打转"卡死
   const dupCounter = new Map();
+  // 脚本类工具的"同思路"签名池（归一化文本 → 出现次数）：截住"换写法重跑"
+  const scriptSigs = new Map();
 
   while (maxIterations > 0) {
     maxIterations--;
@@ -3587,27 +4973,49 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
         // ── 重复调用检测（防"原地打转"卡死）──
         // 实测（Disguise）：AI 把同一个"读 stage2 常量表"脚本跑了 30 次，每次都因手算 RVA→offset
         // 换算错误拿不到数据，就换个写法再试，整个任务卡死。
-        // ⚠️ 签名必须用**完整参数哈希**，不能截断——run_python 的脚本开头（import 段）常在 400 字符内
-        // 完全一样，截断签名会把"内容不同的新脚本"误判成重复并拦掉（恰好拦住最该允许的"换路重写"）。
+        // 两层检测：
+        //   A) 完全相同（完整 sha1 签名）→ 第 4 次拦。
+        //   B) **同思路换写法**（脚本归一化后高度相似，>88%）→ 第 3 次拦。
+        //      实测"换个写法重跑"绕过了 A（签名不同），必须靠相似度才能截住。
+        const dupWarn = (extra) => `⚠️ 检测到**重复劳动**：\n${extra}\n`
+          + '这说明当前做法拿不到预期结果，**继续重试同一调用不会有新结果**。请立即换路径：\n'
+          + '①若是在做 RVA→文件偏移换算：不要手算，改用 pefile.PE(path).get_offset_from_rva(rva) 或 pe.get_memory_mapped_image()[va]（按虚拟地址直接索引，一次就对）；\n'
+          + '②若是在读常量表：先用 ida_get_bytes(address) 直接读（IDA 已加载，无需自己换算）；\n'
+          + '③若脚本反复报同一错误：先把该错误原文贴出来，分析根因再改，而不是换个写法重跑；\n'
+          + '④若确实无法推进：明确说明卡点并给出当前最优结论，不要空转。';
         const sig = toolCall.name + '|' + (() => {
           try { return require('crypto').createHash('sha1').update(JSON.stringify(toolCall.input || {})).digest('hex'); }
           catch (e) { return String(toolCall.input); }
         })();
+        const isScriptTool = /^(run_python|bash|run_command)$/.test(toolCall.name);
         const cnt = (dupCounter.get(sig) || 0) + 1;
         dupCounter.set(sig, cnt);
-        // 阈值放宽到 4（允许"读→改→再读"这类合理重复），且只拦**完全相同**的调用
-        if (cnt >= 4) {
-          toolResults.push({
-            tool_use_id: toolCall.id,
-            content: `⚠️ 检测到重复调用：\n同一个 ${toolCall.name} 调用（参数完全相同或高度相似）已出现 ${cnt} 次。\n`
-              + '这说明当前做法拿不到预期结果，**继续重试同一调用不会有新结果**。请立即换路径：\n'
-              + '①若是在做 RVA→文件偏移换算：不要手算，改用 `pefile.PE(path).get_offset_from_rva(rva)` 或 `pe.get_memory_mapped_image()[va]`（按虚拟地址直接索引，一次就对）；\n'
-              + '②若是在读常量表：先用 `ida_get_bytes(address)` 直接读（IDA 已加载，无需自己换算）；\n'
-              + '③若脚本反复报同一错误：先把该错误原文贴出来，分析根因再改，而不是换个写法重跑；\n'
-              + '④若确实无法推进：明确说明卡点并给出当前最优结论，不要空转。',
-            is_error: true
-          });
-          continue;   // 不再真正执行，省掉一次无意义的重复
+        // 脚本类工具：字节完全相同的脚本重跑必然得到相同输出，第 2 次即拦；
+        // 其它工具（read_file/ida_get_bytes 等）允许 4 次（"读→改→再读"是合理模式）。
+        if (cnt >= (isScriptTool ? 2 : 4)) {
+          toolResults.push({ tool_use_id: toolCall.id, content: dupWarn(`同一个 ${toolCall.name} 调用（参数**完全相同**）已出现 ${cnt} 次，且脚本/命令内容**逐字节相同**。`), is_error: true });
+          continue;
+        }
+        // B) 脚本类工具的"同思路"相似度检测
+        if (isScriptTool) {
+          const raw = String((toolCall.input && (toolCall.input.script || toolCall.input.command)) || '');
+          const norm = normalizeScript(raw);
+          if (norm.length >= 40) {
+            let similarHit = null;
+            for (const [k, v] of scriptSigs.entries()) {
+              if (k === sig) continue;
+              if (scriptSimilarity(norm, v.norm) > 0.88) { similarHit = v; break; }
+            }
+            if (similarHit) {
+              similarHit.count++;
+              if (similarHit.count >= 3) {
+                toolResults.push({ tool_use_id: toolCall.id, content: dupWarn(`你**第 ${similarHit.count} 次**提交了"同一思路、仅换写法"的脚本（归一化后相似度 >88%）。`), is_error: true });
+                continue;
+              }
+            } else {
+              scriptSigs.set(sig, { norm, count: 1 });
+            }
+          }
         }
 
         try {
@@ -3676,6 +5084,52 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
     success: true,
     text: collectedText || (lastResponse && lastResponse.text) || '分析完成（达到最大迭代次数）'
   };
+}
+
+// 脚本归一化：把"同思路换写法"折叠成同一形态，供相似度比较。
+// 关键点：**变量改名不算换思路**（实测 AI 就是把 `data`→`buf`、`off`→`o` 改一遍当新脚本重跑）。
+// 做法：① 去注释/docstring/空白；② 字符串→S、数字→N；③ 把非关键字标识符按"首次出现顺序"
+// 统一重命名为 v0,v1,…（保留 `a.b` 的 .b 方法名——方法名不同即思路不同）。这样
+// `off = pe.get_offset_from_rva(rva)` 与 `o = p.get_offset_from_rva(r)` 归一化后完全相同。
+const SCRIPT_KEYWORDS = new Set(('import,from,as,for,while,if,else,elif,def,return,in,is,not,and,or,None,True,False,'
+  + 'with,try,except,finally,lambda,global,class,break,continue,pass,raise,yield,del,assert,await,async,'
+  + 'print,len,range,int,str,bytes,bytearray,list,dict,set,tuple,open,hex,ord,chr,abs,sum,min,max,sorted,'
+  + 'enumerate,zip,map,filter,repr,format,type,isinstance,getattr,setattr,struct,ord,bin,oct,divmod,'
+  + 'echo,export,then,fi,do,done,set,local,function,const,let,var,read,write,readfile,readFileSync').split(','));
+function normalizeScript(s) {
+  let t = String(s || '')
+    .replace(/"""(?:[\s\S]*?)"""|'''(?:[\s\S]*?)'''/g, ' ')     // 三引号块（docstring）
+    .replace(/#[^\n]*/g, ' ')                                   // # 注释
+    .replace(/\/\/[^\n]*/g, ' ');                               // // 注释
+  // 字符串/数字 → 占位符（放在改名之前，避免字面量里的词被当标识符）
+  t = t.replace(/("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/g, ' S ')
+    .replace(/\b0[xX][0-9a-fA-F]+\b/g, ' N ')
+    .replace(/\b\d+(\.\d+)?\b/g, ' N ');
+  // 标识符改名：非关键字、且不是 `obj.method` 的 method 部分 → v<i>
+  const alias = new Map();
+  let next = 0;
+  t = t.replace(/(\.)?\b([A-Za-z_]\w*)\b/g, (m, dot, id) => {
+    if (dot) return m;                       // 属性/方法名保留（承载语义）
+    if (SCRIPT_KEYWORDS.has(id)) return id;
+    if (!alias.has(id)) alias.set(id, 'v' + (next++));
+    return alias.get(id);
+  });
+  return t.replace(/\s+/g, '');
+}
+// 归一化脚本相似度：二元组集合 Jaccard（对长文本比编辑距离快且稳）
+function scriptSimilarity(a, b) {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const grams = (s) => {
+    const set = new Set();
+    for (let i = 0; i + 1 < s.length; i++) set.add(s.slice(i, i + 2));
+    return set;
+  };
+  const A = grams(a), B = grams(b);
+  if (!A.size || !B.size) return 0;
+  let inter = 0;
+  for (const g of A) if (B.has(g)) inter++;
+  return inter / (A.size + B.size - inter);
 }
 
 // 工具调用落盘日志：写到 <userData>/toolcalls.jsonl，供排查"工具到底有没有被真正调用"。

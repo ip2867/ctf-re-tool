@@ -1,0 +1,7 @@
+chore(release): v1.6.0 版本号同步 + 更新日志
+
+5 处版本号 1.5.2 → 1.6.0：
+- package.json / src/index.html / README.md 标题 / PROJECT-FRAMEWORK.md（2 处）/ 启动.bat（GBK 字节级替换）
+
+README 新增 v1.6.0 更新日志（自主解题四阶段 + 常量差分分析 + 能力边界声明）。
+历史版本条目保持原样。

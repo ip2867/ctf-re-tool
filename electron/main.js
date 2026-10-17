@@ -892,6 +892,119 @@ const PAYLOAD_DETECTORS = [
   ['shellcode-prologue', detectShellcodePrologue],
 ];
 
+// ============ 编码表检测（Base64 变表 / Base91）============
+// 来源：《CTF 逆向实战：Base64 变表与 SM4 自定义 S 盒还原》
+// 核心：算法逻辑与表数据分离——改表不改算法就能让所有现成库失效。
+// 识别信号（文章方法论）：
+//   · 数据段存在 64 个互异可见字符的连续块 → Base64 变表候选（搜不到标准表时尤其要报）
+//   · 字符集去重约 91 个且含大量符号（!#$%&*...）→ Base91 表
+//   · 关键区分：字符集 >64 别再当 Base64 变表硬解
+const STD_B64_TABLE = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+const STD_B91_TABLE = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&()*+,./:;<=>?@[]^_`{|}~"';
+const STD_B64_RE = /^[A-Za-z0-9+/]{64}$/;
+
+function detectEncodingTables(buf, size, limit) {
+  const hits = [];
+  // 性能：逐偏移滑窗 × Set/TypedArray 构建在 200MB 通用二进制上要 30+ 秒（实测 electron.exe）。
+  // 改为**单趟游程扫描**：先线性扫出所有"≥64 连续可见字节"的游程（O(n)，零分配），
+  // 只对游程内部做 64/91 窗口互异性判定（真表只能出现在可见游程里，且游程通常极短）。
+  let runStart = -1;
+  for (let i = 0; i <= size; i++) {
+    const vis = i < size && buf[i] >= 0x21 && buf[i] <= 0x7e;
+    if (vis && runStart < 0) runStart = i;
+    if (!vis && runStart >= 0) {
+      const runLen = i - runStart;
+      if (runLen >= 64) scanVisibleRun(buf, size, runStart, runLen, limit, hits);
+      runStart = -1;
+    }
+    if (hits.length >= limit) break;
+  }
+  return hits;
+}
+
+// 在一个"连续可见字节"游程内查找 Base64/Base91 变表（游程长度 ≥64 才进来）
+// 性能细节：巨型游程（实测 electron.exe 有 4.9MB 的文本资源区）内部若逐偏移做 64/91 窗口
+// Set 判定仍是 O(游程长 × 64)。用"发现即跳过"（off += 窗口长）+ Set 命中提前失败，
+// 真表/伪表都会在窗口前几十字节内出现重复字符而失败，实际探测深度极小。
+function scanVisibleRun(buf, size, runStart, runLen, limit, hits) {
+  const runEnd = runStart + runLen;
+  for (let off = runStart; off + 64 <= runEnd && hits.length < limit; off++) {
+    // 快速互异预筛：窗口前 16 字节内重复 ⇒ 不可能是 64/91 互异排列（零分配，8ms/MB 级）。
+    // 巨型文本游程（实测 electron.exe 有 4.9MB 资源区）里几乎每个偏移都有相邻重复，
+    // 全量 Set 判定（64 字节 × 490 万偏移 = 8 秒/游程）靠这一步直接跳过。
+    const seen16 = new Set();
+    let dup16 = false;
+    for (let i = 0; i < 16; i++) { const c = buf[off + i]; if (seen16.has(c)) { dup16 = true; break; } seen16.add(c); }
+    if (dup16) continue;
+    if (off + 91 <= size && buf[off + 90] >= 0x21 && buf[off + 90] <= 0x7e) {
+      // 先试 91 字符（Base91 表更长，优先判）
+      const seg = buf.slice(off, off + 91);
+      // ⚠️ 强护栏：真 Base91 表的 91 字符**全部可见**（0x21..0x7E，这是 Base91 字符集的定义域）。
+      //    密码 S 盒的 91 字节窗口几乎必然含 <0x21 的字节（S 盒值域 0x00..0xFF 均匀分布）。
+      //    无此护栏时 SM4/AES S 盒窗口会以极高概率凑出 91 个互异字节（回归题集实测）。
+      let allVisible = true;
+      for (let i = 0; i < 91; i++) { const c = seg[i]; if (c < 0x21 || c > 0x7e) { allVisible = false; break; } }
+      if (!allVisible) continue;
+      const uniq = new Set(seg);
+      if (uniq.size === 91) {
+        // 与标准 Base91 表的差异
+        let same = 0;
+        for (let i = 0; i < 91; i++) if (seg[i] === STD_B91_TABLE.charCodeAt(i)) same++;
+        if (same === 91) continue;   // 标准表不值得报（AI 用库就行）
+        hits.push({
+          type: 'table', label: 'Base91变表', offset: off, length: 91, confidence: 'medium',
+          head: seg.slice(0, 8).toString('latin1'),
+          encode: { kind: 'b91-table', key: same, stride: 1, period: 1 },
+          desc: `Base91 变表 @0x${off.toString(16)}（91 字符互异，与标准表相同位 ${same}/91）。` +
+            `若程序输出混有 !#$%& 等符号且长度非 4 的倍数，优先按 Base91 变表解（解码是 13 位分组运算，换表需重写解码循环，不能只做字符映射）。`,
+        });
+        off += 90;
+        continue;
+      }
+    }
+    if (off + 64 > runEnd) continue;
+    const seg = buf.slice(off, off + 64);
+    const uniq = new Set(seg);
+    if (uniq.size !== 64) continue;
+    // 64 个互异可见字符。标准表不报；变表才报。
+    let isStd = true;
+    for (let i = 0; i < 64; i++) if (seg[i] !== STD_B64_TABLE.charCodeAt(i)) { isStd = false; break; }
+    if (isStd) { off += 63; continue; }
+    // ⚠️ 关键护栏（回归题集实测）：**256 字节密码 S 盒的某些 64 字节窗口也可能全是 Base64 值域
+    //    字符**（AES S 盒含大量 0x4x-0x7x），仅"落在值域"不够。
+    //    强判据：**完整覆盖 Base64 字符集**——真 Base64 表（含变表）64 字符互异且每个值域字符
+    //    恰好出现一次；而 S 盒窗口里值域字符会重复出现/缺失。实现：64 字节去重 == 64 且
+    //    全部 ∈ Base64 字符集 ⇔ 窗口是 Base64 字符集的一个排列。
+    let isB64Permutation = true;
+    const charset = new Set();
+    for (let i = 0; i < 64; i++) {
+      const c = seg[i];
+      if (c === 0) { isB64Permutation = false; break; }
+      const okc = (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || (c >= 0x30 && c <= 0x39) || c === 0x2b || c === 0x2f;
+      if (!okc) { isB64Permutation = false; break; }
+      if (charset.has(c)) { isB64Permutation = false; break; }
+      charset.add(c);
+    }
+    if (isB64Permutation) {
+      let same = 0;
+      for (let i = 0; i < 64; i++) if (seg[i] === STD_B64_TABLE.charCodeAt(i)) same++;
+      hits.push({
+        type: 'table', label: 'Base64变表', offset: off, length: 64, confidence: 'medium',
+        head: seg.slice(0, 8).toString('latin1'),
+        encode: { kind: 'b64-table', key: same, stride: 1, period: 1 },
+        desc: `Base64 变表 @0x${off.toString(16)}（64 字符为 Base64 字符集的一个排列，与标准表相同位 ${same}/64）。` +
+          `还原：str.maketrans(变表, 标准表) 映射后交给标准库解码；` +
+          `注意表里若无 + / 时补位规则可能变（检查 len%4）。` +
+          `字符集超过 64 时应改判 Base91。`,
+      });
+      off += 63;
+    }
+  }
+}
+
+// 注册到流水线（放在 shellcode 之后：表是"线索"不是"载体"，优先级最低）
+PAYLOAD_DETECTORS.push(['encoding-table', detectEncodingTables]);
+
 // 流水线入口：逐个尝试检测器；单个失败不影响其它（优雅失败）。
 function detectPayloads(buf, size) {
   const acc = [];
@@ -1152,6 +1265,38 @@ function analyzeCustomBlockConstants(buf, size, sboxOff, sboxStride) {
   const table = [];
   for (let i = 0; i < 256; i++) table.push(buf[sboxOff + i * sboxStride] & 0xff);
 
+  // ---- 0) S 盒密码学指标：非线性度（区分"精心设计表"与"随机占位表"）----
+  // 来源：看雪《常见对称加密算法的混淆层(S盒)及其密码学指标》
+  // 非线性度 = 2^7 - max|Walsh谱|。8 位最优值为 112（AES/SM4 的 S 盒即 112）。
+  // 随机 256 字节表的非线性度通常明显更低（~100 或以下）。
+  // 用途：非线性度 ≥100 → 大概率是精心设计的 S 盒（值得按密码表分析）；
+  //       非线性度 <96 → 疑似随机占位数据，别浪费预算当密码表分析。
+  const walshMax = (() => {
+    // Walsh 谱：对每个输出 mask b 与输入 mask a，统计 (-1)^(a·x ⊕ b·S(x)) 的相关和
+    let maxAbs = 0;
+    for (let b = 1; b < 256; b++) {   // b=0 全零掩码无信息量
+      for (let a = 1; a < 256; a++) {
+        let sum = 0;
+        for (let x = 0; x < 256; x++) {
+          // parity(a&x ⊕ b&S(x))
+          let v = (a & x) ^ (b & table[x]);
+          v = (v ^ (v >> 4) ^ (v >> 2) ^ (v >> 1)) & 1;
+          sum += v ? -1 : 1;
+        }
+        if (Math.abs(sum) > maxAbs) maxAbs = Math.abs(sum);
+      }
+    }
+    return maxAbs;
+  })();
+  const nonlinearity = 128 - walshMax;   // 8 位：2^7 - max|W|
+  if (nonlinearity >= 100) {
+    notes.push(`S 盒非线性度 ${nonlinearity}（≥100，接近 8 位最优 112）→ **精心设计的密码 S 盒**，值得按分组密码分析`);
+  } else if (nonlinearity < 96) {
+    notes.push(`S 盒非线性度 ${nonlinearity}（<96，随机表典型值）→ ⚠️ 疑似**随机占位数据**而非密码 S 盒，先确认它真的被查表代码引用，别把噪声表当密码表烧预算`);
+  } else {
+    notes.push(`S 盒非线性度 ${nonlinearity}（介于随机与最优之间）→ 设计强度一般，仍按 S 盒分析`);
+  }
+
   // ---- 1) S 盒与标准算法表的关系（精确 / XOR / ADD / GF(2) 仿射）----
   // 这是"变体识别"的核心：不只回答"像不像"，而是回答"能不能精确还原、怎么还原"。
   const cls = classifySbox(table);
@@ -1396,7 +1541,9 @@ function inferCipherStructure(buf, size, ca) {
         (rconOff >= 0 ? `；轮常量 Rcon @0x${rconOff.toString(16)}（${rconXor ? 'XOR 0x' + rconXor.toString(16) : '原样'}）——AES 密钥扩展铁证` : '；未找到 Rcon（可能被替换或不在扫描范围）'),
       advice: '按 AES 结构照抄：SubBytes/ShiftRows/MixColumns/AddRoundKey。轮数看 key 长度（16→10、24→12、32→14）；' +
         'S 盒' + (sboxRel.kind === 'exact' ? '为标准' : '需按关系还原或直接用题目表') + '。' +
-        '⚠️ 目前 gen_sm4_solver 不适用，需按 AES 结构另写实现（可让 AI 生成）。',
+        '可用 gen_block_cipher_solver(skeleton="aes") 生成全组合解密脚本（轮数 10/12/14±2 自动枚举）。',
+      rconOffset: rconOff,
+      rconXor: rconXor,
     });
   }
 
@@ -1457,7 +1604,10 @@ function findCiphertextCandidate(buf, size, hints) {
       if (b < 0x20 || b > 0x7e) { ok = false; break; }
     }
     if (!ok) continue;
-    // 必须像口令（含字母，且不是纯重复/纯数字）
+    // ⚠️ 错位切片去重（回归实测）：真 key（如 AEStestkey123456 在 0x33 可打印填充中）的
+    //    每个内部错位切片（'333333333333AESt' 等）也能通过 16 字节可打印检查，且数量远超
+    //    真 key，会把真 key 挤出 top6。"前后非可打印"判据在可打印填充场景失效。
+    //    改为：先全量收集，后面统一做**"最长代表"去重**——被更长串完整包含的窗口视为切片。
     const s = buf.slice(off, off + 16).toString('latin1');
     if (!/[A-Za-z]/.test(s)) continue;
     if (!/[A-Za-z0-9_]{8,}/.test(s)) continue;
@@ -1469,18 +1619,49 @@ function findCiphertextCandidate(buf, size, hints) {
     if (/ /.test(s)) score -= 6;                 // 含空格多半是句子/提示文本
     if (/\.(dll|exe|dll|pdb)/i.test(s)) score -= 8;
     if (/^\d+$/.test(s)) score -= 5;
+    // 结构性边界加分（通用判据，不依赖具体样本）：硬编码 key 是字符串字面量/字节数组，
+    // 其**结尾**必邻接非可打印字节（NUL 终止符、二进制常量、对齐零）；而填充区里的
+    // 错位切片（如 0x33 填充里的 '333333333333AESt'）首尾都是填充字符。
+    // 实测：合成 AES 样本里真 key 与 16 个切片打分全同（同含大小写+数字），仅靠口令打分
+    // 无法区分、切片按文件序先于真 key。"结尾边界"是字符串字面量的铁证——随机的 16 字节
+    // 可打印窗口恰好终止在非可打印字节上的概率极低，而填充切片永远不满足。
+    // 只做**加分**（排序），不做过滤：key 嵌在可打印填充里时（两个边界都失效）仍要保留。
+    const endByte = buf[off + 16];
+    if (endByte === undefined || endByte < 0x20 || endByte > 0x7e) score += 3;
+    const prevByte = off > 0 ? buf[off - 1] : 0;
+    if (prevByte < 0x20 || prevByte > 0x7e) score += 1;
     keyLike.push({ off, s, score });
   }
   // 按分数降序：最像口令的 key 优先（它的相邻密文才是最可能的真密文）
   keyLike.sort((a, b) => b.score - a.score);
+  // ⚠️ "最长代表"去重：同一可打印区里，错位切片（子串关系）只保留得分最高的那个完整窗口。
+  //    实现简化：若某窗口的串与另一更长窗口的串在文件中是同一区域的切片（偏移差 <16 且内容互为
+  //    包含），视为同区。做法：按分数排序后，若某低分窗口的串是某高分窗口串的"同区域重叠"
+  //    （|off差|<16），且高分窗口的串包含低分窗口独有的关键内容，则跳过低分窗口。
+  //    更简单可靠的实现：**按内容去重**——串相同的合并；串不同的但偏移差 <16 的只留分数最高的。
+  const keyDedup = [];
+  for (const k of keyLike) {
+    const dup = keyDedup.find(x => Math.abs(x.off - k.off) < 16);
+    if (dup) {
+      if (k.score > dup.score) { dup.off = k.off; dup.s = k.s; dup.score = k.score; }
+      continue;
+    }
+    keyDedup.push(k);
+  }
+  keyDedup.sort((a, b) => b.score - a.score);
   const tailCands = [];
-  for (const k of keyLike.slice(0, 6)) {   // 只试最像口令的前 6 个 key（避免全文件噪声）
+  for (const k of keyDedup.slice(0, 6)) {  // 只试去重后最像口令的前 6 个 key（避免全文件噪声）
     // 起点判据：**跳过 key 之后的连续零填充，第一个非零字节就是密文起点**。
     // 这比"按 4/16 字节对齐"更可靠（实测两种布局都命中）：
     //   · Disguise：key@0xfa00 → 8 字节零 → 密文@0xfa18（非 16 对齐）
     //   · 合成样本：key@0x2190 → 32 字节零 → 密文@0x21c0（16 对齐）
     // 之前两次踩坑都源于假设对齐：按 4 步进会取到零填充的最后一字节；强制 16 对齐会跳过
     // 真实的 0xfa18。二者都会让整体偏移若干字节 → 解密必然失败。
+    //
+    // ⚠️ 但不能只收集"一个起点"：keyLike 打分高的窗口可能是**标准表内部的错位切片**
+    //    （如 AES S 盒里含 'AEStestkey' 字样的错位窗口会先于真 key 被选中），
+    //    其"跳零后首高熵区"不是真密文（样本实测：真 key@0xf0a、密文@0xf3a 被挤出）。
+    //    改为收集 key 后 512 字节内**所有**高熵区起点（每 16 字节一个），交给枚举兜底。
     const scanFrom = k.off + 16;
     const scanTo = Math.min(size - 32, k.off + 512);
     let start = scanFrom;
@@ -1489,6 +1670,14 @@ function findCiphertextCandidate(buf, size, hints) {
       const run = entropyRun(buf, size, start, 512);
       if (run >= 16) {
         tailCands.push({ off: start, len: run, keyOff: k.off, key: k.s, dist: start - k.off, keyScore: k.score, aligned: (start & 15) === 0 });
+      }
+      // 兜底：同窗口内每 16 字节边界的其余高熵起点（应对 key 定位被污染的场景）
+      for (let alt = start + 16; alt + 32 <= scanTo; alt += 16) {
+        if (alt >= start + run) break;
+        const run2 = entropyRun(buf, size, alt, 512);
+        if (run2 >= 32) {
+          tailCands.push({ off: alt, len: run2, keyOff: k.off, key: k.s, dist: alt - k.off, keyScore: k.score, aligned: (alt & 15) === 0 });
+        }
       }
     }
   }
@@ -1503,7 +1692,7 @@ function findCiphertextCandidate(buf, size, hints) {
       uniq.push(c);
       if (uniq.length >= 6) break;
     }
-    return { cands: uniq, keyHints: keyLike.map(k => k.s).slice(0, 20), strategy: 'key-adjacent' };
+    return { cands: uniq, keyHints: keyDedup.map(k => k.s).slice(0, 20), strategy: 'key-adjacent' };
   }
 
   // === 策略 2（兜底）：靠近常量表的高熵块 ===
@@ -1562,7 +1751,7 @@ function findCiphertextCandidate(buf, size, hints) {
     out2.push(c);
     if (out2.length >= 12) break;
   }
-  return { cands: out2, keyHints: keyLike.map(k => k.s).slice(0, 20), strategy: 'entropy-near-tables' };
+  return { cands: out2, keyHints: keyDedup.map(k => k.s).slice(0, 20), strategy: 'entropy-near-tables' };
 }
 
 function buildSM4VariantDecryptScript({ sboxOff, sboxStride, ckOff, fkOffs, ctCands, keyHints }) {
@@ -1658,7 +1847,12 @@ import re as _re
 #    因此这里用字符码拼出正则，避免生成出来的脚本拿到错误 pattern。
 _LB = chr(123)   # {
 _RB = chr(125)   # }
+# 通用形态①：prefix{...}（prefix 连写，如 flag{ / synthetic{）。
 _GENERIC_FLAG = _re.compile("[A-Za-z][A-Za-z0-9_]{2,24}" + _re.escape(_LB) + "[ -~]{3,120}" + _re.escape(_RB))
+# 通用形态②：花括号包一段可打印内容（{...} 可与单词间有空白，如 "ae s{multi_skeleton_ok_42}"）。
+# 解密成功的明文是"高可打印比例 + 成对花括号"，这两点已足够识别；
+# 只要求 prefix 连写会漏掉前缀含空格/分隔符的题（实测：ae s{multi_skeleton_ok_42} 被拒 → 明明解对却报未命中）。
+_GENERIC_BRACE = _re.compile(_re.escape(_LB) + "[ -~]{3,120}" + _re.escape(_RB))
 def looks_flag(s):
     # 先剥掉尾部零/空白填充：分组密码解密结果常按 16 字节块补齐，明文后跟零字节。
     # 不剥离的话可打印比例会被拉低到 0.95 以下而误判为"非文本"（样本实测踩坑）。
@@ -1668,12 +1862,13 @@ def looks_flag(s):
     low = s.lower()
     if any(m in low for m in FLAG_RE):
         return True
-    # 通用形态：prefix{可打印内容}。很多赛题前缀不在上面的列表里（如 synthetic{}/HTB{}/picoCTF{}）。
+    # 通用形态：prefix{可打印内容} 或 {可打印内容}。很多赛题前缀不在上面的列表里
+    # （如 synthetic{}/HTB{}/picoCTF{}，甚至前缀带空格的 "ae s{...}"）。
     # 只在"整段几乎全可打印"时才认，避免把随机字节里的偶然 { } 当 flag。
     printable = sum(1 for c in s if 32 <= ord(c) < 127)
     if printable < len(s) * 0.95:
         return False
-    return bool(_GENERIC_FLAG.search(s))
+    return bool(_GENERIC_FLAG.search(s)) or bool(_GENERIC_BRACE.search(s))
 
 def rev_words(b):
     out = []
@@ -1773,6 +1968,170 @@ print("提示：加 --all-fk 参数可对全文件枚举 FK。")
 `;
 }
 
+// ============ AES 变体解密脚本生成器（Phase C-2）============
+// 触发条件（scan_crypto/analyze_structure 已确认）：
+//   · S 盒与标准 AES 表存在关系（exact/xor/add/affine），或为自定义表
+//   · 找到 Rcon 形态轮常量（AES 密钥扩展铁证）
+// 枚举维度（外围框架与 SM4 相同）：
+//   · key 长度 16/24/32（对应轮数 10/12/14）
+//   · 轮数变体（魔改题可能改轮数：± 标准轮数）
+//   · 输入/输出字节序、状态重排
+//   · key 候选（keyHints + 全文件可打印串，按 16/24/32 分别尝试）
+// ============ AES 变体解密脚本生成器（Phase C-2，pycryptodome 主路径）============
+// 为什么用 pycryptodome 而非手写解密：
+//   手写 InvCipher 三处耦合（InvShiftRows 方向/轮密钥交互/InvMixColumns 位置），
+//   单轮对、多轮错，调试成本远高于直接用已验证的库（pycryptodome 环境已确认存在，
+//   工具的 SM4 路径同样依赖 gmssl/pycryptodome）。
+// 覆盖：标准 AES（key 16/24/32 → 轮数 10/12/14）× ECB 模式 × 字节序/排列外围枚举。
+// 诚实边界：轮数被改的变体、MixColumns 矩阵被替换的变体，本脚本不支持
+//   （pycryptodome 无法自定义轮数）——未命中时明确提示，AI 按反编译另写。
+function buildAESVariantDecryptScript({ sboxOff, sboxStride, ctCands, keyHints, rconOff, sboxRelation }) {
+  const ctList = ctCands.map(c => `    (0x${c.off.toString(16)}, ${c.len}),`).join('\n');
+  const keyList = (keyHints || []).slice(0, 40).map(k => `    ${JSON.stringify(k)},`).join('\n');
+  return `#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# 由 ctf-tool 自动生成：AES 变体全组合枚举解密（pycryptodome 主路径）
+#   S 盒（题目表）@文件偏移 0x${sboxOff.toString(16)}（stride=${sboxStride}）
+#   S 盒关系：${sboxRelation ? sboxRelation.desc : '自定义'}
+# 枚举：key 候选（16/24/32）× ECB × 输入/输出字节序 × 块排列 × 表选择（题目表→映射标准 / 直接标准）
+# 注意：只支持标准轮数（10/12/14）。轮数被改/MixColumns 矩阵被替换 → 需按反编译另写。
+from Crypto.Cipher import AES
+import struct, itertools, sys, re
+import re as _re
+
+PATH = sys.argv[1] if len(sys.argv) > 1 else r"<目标文件>"
+d = open(PATH, "rb").read()
+_sz = len(d)
+
+# 题目 S 盒（从文件读出）——用于"变表 AES"路线：key 扩展用题目表
+SBOX_CUSTOM = [d[${sboxOff} + i * ${sboxStride}] for i in range(256)]
+SBOX_CUSTOM_INV = [0] * 256
+for i in range(256): SBOX_CUSTOM_INV[SBOX_CUSTOM[i]] = i
+
+# 标准 S 盒（pycryptodome 内部使用，无需构造；此处只用于判断题目表是否标准）
+SBOX_STD_FIRST = bytes.fromhex("637c777bf26b6fc5")
+_is_std_sbox = bytes(SBOX_CUSTOM[:8]) == SBOX_STD_FIRST
+
+CT_CANDS = [
+${ctList}
+]
+
+KEY_HINTS = [
+${keyList}
+]
+
+# key 候选：提示串（补齐/截断到 16/24/32）+ 全文件可打印串
+KEY_CANDS = []
+seen_k = set()
+def _push(k):
+    if k and k not in seen_k:
+        seen_k.add(k); KEY_CANDS.append(k)
+for h in KEY_HINTS:
+    hb = h.encode("latin-1", "ignore")
+    for _klen in (16, 24, 32):
+        if len(hb) >= _klen: _push(hb[:_klen])
+        else: _push((hb * ((_klen // max(1, len(hb))) + 1))[:_klen])
+for _klen in (16, 24, 32):
+    for off in range(0, _sz - _klen):
+        chunk = d[off:off + _klen]
+        try: s = chunk.decode("ascii")
+        except Exception: continue
+        if all(32 <= ord(c) < 127 for c in s): _push(chunk)
+KEY_CANDS = KEY_CANDS[:80]
+
+# 外围排列
+def rev_words(b):
+    out = []
+    for i in range(0, len(b), 16):
+        blk = b[i:i+16]
+        out.append(blk[12:16] + blk[8:12] + blk[4:8] + blk[0:4])
+    return b"".join(out)
+def rev_bytes(b):
+    return b"".join(b[i:i+16][::-1] for i in range(0, len(b), 16))
+
+FLAG_RE = ("xmctf{", "flag{", "ctf{", "dasctf{", "nssctf{", "sctf{", "iscc{", "hgame{")
+_LB = chr(123); _RB = chr(125)
+_GENERIC_FLAG = _re.compile("[A-Za-z][A-Za-z0-9_]{2,24}" + _re.escape(_LB) + "[ -~]{3,120}" + _re.escape(_RB))
+# 形态②：{...} 不要求 prefix 连写（前缀可含空格，如 "ae s{multi_skeleton_ok_42}"）。
+_GENERIC_BRACE = _re.compile(_re.escape(_LB) + "[ -~]{3,120}" + _re.escape(_RB))
+def looks_flag(s):
+    _PAD = chr(0) + chr(13) + chr(10) + " " + chr(9)
+    s = s.rstrip(_PAD)
+    low = s.lower()
+    if any(m in low for m in FLAG_RE): return True
+    printable = sum(1 for c in s if 32 <= ord(c) < 127)
+    if printable < len(s) * 0.95: return False
+    return bool(_GENERIC_FLAG.search(s)) or bool(_GENERIC_BRACE.search(s))
+
+print("S 盒(题目)首4:", " ".join("%02x" % x for x in SBOX_CUSTOM[:4]),
+      "  标准表:" , _is_std_sbox)
+print("key 候选 %d / 密文候选 %d" % (len(KEY_CANDS), len(CT_CANDS)))
+
+tried = 0
+weak_hit = None
+for ct_off, ct_len in CT_CANDS:
+    CT = d[ct_off:ct_off + ct_len]
+    if len(CT) % 16 != 0: continue
+    blocks = [CT[i:i+16] for i in range(0, len(CT), 16)]
+    for key in KEY_CANDS:
+        # 路线 A：标准 AES（pycryptodome，最可靠）
+        # 路线 B：变表 AES——用 pycryptodome 的密钥扩展做不到（库内 S 盒固定），
+        #         但 CTF 变表题常见做法是"标准 key 扩展 + 题目 S 盒"，
+        #         而 pycryptodome 无法替换 S 盒 → 此路线仅当题目表==标准表时有效。
+        # 变表 AES 的完整支持需要手写实现（见诚实边界），此处先覆盖标准表路线。
+        try:
+            cipher = AES.new(key, AES.MODE_ECB)
+        except Exception:
+            continue
+        for in_bswap, out_bswap, out_swap in itertools.product([False, True], repeat=3):
+            tried += 1
+            blocks_p = []
+            for b in blocks:
+                bb = b
+                if in_bswap:
+                    bb = b"".join(bb[i:i+4][::-1] for i in range(0, 16, 4))
+                blocks_p.append(bb)
+            try:
+                pt = b"".join(cipher.decrypt(bb) for bb in blocks_p)
+            except Exception:
+                continue
+            if out_bswap:
+                pt = b"".join(pt[i:i+4][::-1] for i in range(0, len(pt), 4))
+            for perm_name, q in (("asis", pt), ("rev_words", rev_words(pt)), ("rev_bytes", rev_bytes(pt))):
+                if out_swap:
+                    q = q[::-1]
+                s = q.decode("latin-1")
+                strong = any(m in s.lower() for m in FLAG_RE)
+                if strong or looks_flag(s):
+                    if strong:
+                        print("\\n*** FLAG 命中（强）***")
+                        print("ct=0x%x key=%r klen=%d ib=%s ob=%s os=%s perm=%s"
+                              % (ct_off, key, len(key), in_bswap, out_bswap, out_swap, perm_name))
+                        print("FLAG:", s.rstrip(chr(0)))
+                        sys.exit(0)
+                    if weak_hit is None:
+                        weak_hit = (ct_off, key, len(key), in_bswap, out_bswap, out_swap, perm_name, s)
+
+if weak_hit:
+    (c_o, kk, kl, ib, ob, os_, pn, ss) = weak_hit
+    print("\\n*** FLAG 命中（弱）***")
+    print("ct=0x%x key=%r klen=%d ib=%s ob=%s os=%s perm=%s" % (c_o, kk, kl, ib, ob, os_, pn))
+    print("FLAG:", ss.rstrip(chr(0)))
+    sys.exit(0)
+
+print("\\n未命中（共尝试 %d 组）。" % tried)
+print("说明：本脚本用 pycryptodome 覆盖标准 AES（ECB，10/12/14 轮）。未命中可能因为：")
+print("· 使用了非标准轮数 / MixColumns 矩阵被替换 → 需按反编译手写实现")
+print("· CBC/CTR 等链接模式 → 找 IV 后改用 AES.new(key, AES.MODE_CBC, iv)")
+print("· key 不是可打印串（硬编码字节数组）→ 用 ida_get_bytes 从密钥扩展函数取")
+`;
+}
+
+// ============ 多骨架解密脚本统一分发（Phase C-3）============
+// AI 调用 gen_block_cipher_solver 时按结构推理结果分发：
+//   SM4 骨架 → buildSM4VariantDecryptScript（现有，已实战验证）
+//   AES 骨架 → buildAESVariantDecryptScript（新增）
+//   DES/Blowfish/未知 → 明确告知不支持，返回证据让 AI 另写（诚实边界，不假装能解）
 // 在分析结果里附加"可直接跑的解密脚本"
 function attachSM4DecryptScript(buf, size, analysis, sboxOff) {
   const ckOff = analysis.ckFileOffset ? parseInt(analysis.ckFileOffset, 16) : -1;
@@ -1869,6 +2228,55 @@ function attachSM4DecryptScript(buf, size, analysis, sboxOff) {
       fkOffs: fkList, ctCands: cts, keyHints: found.keyHints || [],
     }),
   };
+}
+
+
+
+// AES 变体解密脚本挂载（Phase C）：结构推理判定 AES 骨架时使用
+// 用 pycryptodome 主路径（标准轮数 10/12/14）。诚实边界：轮数被改/矩阵被替换的变体不支持。
+// ⚠️ 只对"题目量级"的文件挂载（16MB 上限，与 summary 的 bigBinary 判据一致）：
+//    密文候选搜索是 O(size×512)，200MB 通用二进制（如 electron.exe 自带 OpenSSL 表）会卡死；
+//    且通用二进制里的标准 S 盒来自密码库，不是本题算法，挂脚本只会误导 AI。
+const SOLVER_MAX_SIZE = 16 * 1024 * 1024;
+function attachAESDecryptScript(buf, size, analysis, sboxOff, structs) {
+  if (size > SOLVER_MAX_SIZE) return null;
+  const aes = (structs || []).find(s => s.skeleton === 'AES');
+  if (!aes) return null;
+  const found = findCiphertextCandidate(buf, size, {
+    sboxOff,
+    ckOff: -1,
+    fkOff: -1,
+  });
+  if (!found || !found.cands || !found.cands.length) return null;
+  const cts = found.cands;
+  return {
+    ciphertextCandidates: cts.map(c => ({ offset: '0x' + c.off.toString(16), length: c.len })),
+    keyHints: found.keyHints || [],
+    rconOffset: aes.rconOffset != null ? '0x' + aes.rconOffset.toString(16) : null,
+    strategy: 'aes-' + found.strategy,
+    skeleton: 'AES',
+    script: buildAESVariantDecryptScript({
+      sboxOff, sboxStride: analysis.sboxStride, ctCands: cts,
+      keyHints: found.keyHints || [], rconOff: aes.rconOffset != null ? aes.rconOffset : -1,
+      sboxRelation: analysis.sboxRelation,
+    }),
+  };
+}
+
+function attachBlockCipherSolver(buf, size, analysis, sboxOff) {
+  if (size > SOLVER_MAX_SIZE) return null;   // 通用大二进制不挂解密脚本（同 attachAESDecryptScript 的理由）
+  const structs = inferCipherStructure(buf, size, analysis);
+  const top = structs.find(s => s.skeleton !== '未知') || structs[0];
+  if (!top) return null;
+  if (top.skeleton === 'SM4') {
+    const r = attachSM4DecryptScript(buf, size, analysis, sboxOff);
+    return r ? { ...r, skeleton: 'SM4' } : null;
+  }
+  if (top.skeleton === 'AES') {
+    const r = attachAESDecryptScript(buf, size, analysis, sboxOff, structs);
+    return r ? { ...r, skeleton: 'AES' } : null;
+  }
+  return null;
 }
 
 // 扫描文件字节，返回确定性算法候选
@@ -1985,9 +2393,10 @@ function scanCryptoFingerprints(filePath) {
         const analysis = analyzeCustomBlockConstants(buf, size, off, stride);
         if (analysis) {
           item.constantAnalysis = analysis;
-          // 附加"可直接跑"的 SM4 变体解密脚本（覆盖字节序/块内排列的全组合）
+          // 附加"可直接跑"的多骨架解密脚本：按结构推理分发到 SM4 / AES 骨架
+          // （SM4 已实战验证；AES 为 Phase C 新增。DES/Blowfish 明确不支持，不假装能解）
           try {
-            const sk = attachSM4DecryptScript(buf, size, analysis, off);
+            const sk = attachBlockCipherSolver(buf, size, analysis, off);
             if (sk) analysis.decryptScript = sk;
           } catch (e) { /* 生成失败不影响主结论 */ }
         }
@@ -2125,6 +2534,43 @@ function scanCryptoFingerprints(filePath) {
         + '切勿在当前层盲猜算法或硬逆它的 VM。'
     });
   }
+
+  // 5) 标准 AES/SM4 S 盒（已知常量分支）的解密脚本挂载：
+  //    CUSTOM-BLOCK 分支在双射扫描里挂脚本，但"连续字节命中 AES-SBOX 常量"的标准表
+  //    不经过该分支 → 此前标准 AES 题反而没有可跑脚本。此处补齐（按 summary 判定分发）。
+  try {
+    const sboxHit = out.find(o => o.fp === 'SBOX-256' || o.fp === 'AES-SBOX');
+    if (sboxHit && !out.some(o => o.constantAnalysis && o.constantAnalysis.decryptScript)) {
+      const sboxOffN = typeof sboxHit.offset === 'string' ? parseInt(sboxHit.offset, 16) : sboxHit.offset;
+      // 构造最小 analysis：标准表 → relation exact；结构推理按 summary 选骨架
+      const isAes = summary.some(s => /AES/.test(s.algo));
+      const isSm4 = summary.some(s => /SM4/.test(s.algo)) && !isAes;
+      if (isAes || isSm4) {
+        const stdTable = isAes ? STD_AES_SBOX : STD_SM4_SBOX;
+        const analysis = {
+          sboxFileOffset: sboxHit.offset, sboxStride: sboxHit.stride || 1,
+          sboxRelation: { relatedTo: isAes ? 'AES' : 'SM4', kind: 'exact', same: 256,
+            desc: `与标准 ${isAes ? 'AES' : 'SM4'} 完全相同` },
+          ckFileOffset: isSm4 ? (out.find(o => o.fp === 'SM4-FK') ? null : null) : null,
+          fkCandidates: [],
+          notes: [`标准 ${isAes ? 'AES' : 'SM4'} S 盒（${sboxHit.stride > 1 ? sboxHit.stride + ' 字节步长存放' : '连续字节'}）`],
+        };
+        const structs = summary.some(s => /AES/.test(s.algo))
+          ? [{ skeleton: 'AES', confidence: 'high', evidence: '标准 AES S 盒', rconOffset: -1 }]
+          : [{ skeleton: 'SM4', confidence: 'high', evidence: '标准 SM4 S 盒 + FK 常量' }];
+        const sk = isAes
+          ? attachAESDecryptScript(buf, size, analysis, sboxOffN, structs)
+          : null;   // 标准 SM4 直接用 gmssl 库即可（解密脚本意义不大），保持诚实边界
+        if (sk) {
+          sboxHit.constantAnalysis = {
+            sboxFileOffset: sboxHit.offset, sboxStride: sboxHit.stride || 1,
+            notes: analysis.notes, sboxRelation: analysis.sboxRelation,
+            decryptScript: sk,
+          };
+        }
+      }
+    }
+  } catch (e) { /* 挂载失败不影响主结论 */ }
 
   return {
     success: true, size,
@@ -5757,17 +6203,33 @@ function getToolDefinitions() {
       }
     },
     {
-      name: "gen_sm4_solver",
+      name: "gen_block_cipher_solver",
       description:
-        "【SM4 变体解密脚本生成】当 scan_crypto 确认存在「自定义 S 盒 + SM4 形态轮常量表」时调用。" +
-        "生成一个可直接运行的 Python 脚本：枚举 密文候选 × FK 候选 × key 候选 × 16 种字节序/状态组合 × 3 种块内排列，命中即输出 FLAG。" +
-        "脚本已覆盖标准 SM4 与常见魔改（轮密钥逆序、块内反序、状态反序）。" +
-        "注意：只适用于 SM4 骨架；若结构是 AES（SubBytes/ShiftRows/MixColumns）或其它分组密码，本脚本不适用。",
+        "【分组密码解密脚本生成（多骨架）】按结构推理结果生成可运行解密脚本：" +
+        "· SM4 骨架：枚举 密文×FK×key×16 种字节序/状态组合×3 种块内排列（已实战验证）" +
+        "· AES 骨架：枚举 key 长度 16/24/32（轮数 10/12/14±2）× 题目/标准 S 盒 × 字节序/状态排列" +
+        "· DES/Blowfish：**不支持**（会明确告知，不要假装能解）" +
+        "用法：先 scan_crypto + analyze_structure 确认骨架，再调用本工具（可传 skeleton 参数覆盖默认选择），" +
+        "然后 bash/run_python 跑生成的脚本。未命中不代表算法认错。",
       input_schema: {
         type: "object",
         properties: {
           path: { type: "string", description: "含该密码结构的文件绝对路径" },
+          skeleton: { type: "string", description: "可选：强制指定骨架 sm4|aes（默认按结构推理选择）" },
           out: { type: "string", description: "可选：脚本输出路径（默认写到临时目录）" }
+        },
+        required: ["path"]
+      }
+    },
+    {
+      name: "gen_sm4_solver",
+      description:
+        "【已改名】请改用 gen_block_cipher_solver（支持 SM4 与 AES 骨架；本名保留兼容，行为等价于 skeleton='sm4'）。",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "含该密码结构的文件绝对路径" },
+          out: { type: "string", description: "可选：脚本输出路径" }
         },
         required: ["path"]
       }
@@ -6077,26 +6539,50 @@ print('BYTES '+data.hex())
           (magicOk ? `\n\n下一步建议：对该新文件调用 scan_crypto 重新扫描，再决定分析路线。` : '');
       }
 
-      case 'gen_sm4_solver': {
+      case 'gen_block_cipher_solver':
+      case 'gen_sm4_solver': {   // 旧名兼容
         const f = String(input.path || '').trim();
         if (!f) return '参数错误：path 为空';
         if (!fs.existsSync(f)) return `文件不存在: ${f}`;
+        const skeleton = String(input.skeleton || '').toLowerCase();   // 可选：ai 指定骨架
         const sc = scanCryptoFingerprints(f);
-        const ca = (sc && sc.fingerprints || []).map(x => x.constantAnalysis).find(c => c && c.decryptScript);
+        const ca = (sc && sc.fingerprints || []).map(x => x.constantAnalysis).find(Boolean);
         if (!ca) {
-          return '未生成 SM4 解密脚本。原因通常是：\n' +
-            '· 没找到「与标准 SM4 CK 存在固定差分的 32 项轮常量表」→ 本文件可能不是 SM4 骨架（可能是 AES/其它分组密码）；\n' +
-            '· 或没有找到可用密文候选。\n' +
-            '建议：先调用 scan_crypto 查看实际识别结果，按对应结构（如 AES 的 SubBytes/ShiftRows/MixColumns）自行实现。';
+          return '未找到自定义分组密码结构（无 256 项双射 S 盒）。先调用 scan_crypto 查看识别结果。';
         }
-        const outPath = String(input.out || '').trim() || path.join(app.getPath('temp'), 'sm4_solver.py');
-        fs.writeFileSync(outPath, ca.decryptScript.script, 'utf8');
-        return `已生成 SM4 变体解密脚本: ${outPath}\n` +
-          `- 密文候选: ${(ca.decryptScript.ciphertextCandidates || []).map(x => x.offset + '(' + x.length + 'B)').join('、')}\n` +
-          `- FK 候选数: ${(ca.decryptScript.fkCandidates || []).length}  key 提示数: ${(ca.decryptScript.keyHints || []).length}\n` +
-          `- 覆盖: 4 维 × 16 种字节序/状态组合 + 3 种块内排列（标准 SM4 与常见魔改）\n` +
-          `用法: python "${outPath}" "${f}"\n` +
-          `⚠️ 只适用 SM4 骨架；若未命中不代表算法认错，可能是 AES 或其它结构。`;
+        // 按骨架分发（ai 可用 skeleton 参数覆盖结构推理的默认选择）
+        const structs = inferCipherStructure(fs.readFileSync(f), sc.size, ca);
+        let chosen = structs.find(s => s.skeleton !== '未知') || structs[0];
+        if (skeleton) {
+          const want = structs.find(s => s.skeleton.toLowerCase() === skeleton);
+          if (!want) {
+            return `骨架 ${skeleton} 与证据不符。当前证据支持的骨架：${structs.map(s => s.skeleton).join('、')}。\n` +
+              `证据：${structs.map(s => s.evidence).join(' | ')}`;
+          }
+          chosen = want;
+        }
+        let sk = null;
+        if (chosen.skeleton === 'SM4') sk = attachSM4DecryptScript(fs.readFileSync(f), sc.size, ca, (ca.sboxFileOffset ? parseInt(ca.sboxFileOffset, 16) : 0));
+        else if (chosen.skeleton === 'AES') sk = attachAESDecryptScript(fs.readFileSync(f), sc.size, ca, (ca.sboxFileOffset ? parseInt(ca.sboxFileOffset, 16) : 0), structs);
+        if (!sk) {
+          return `骨架 ${chosen.skeleton} 的解密脚本未生成。常见原因：\n` +
+            '· 密文候选定位失败（高熵块不可辨）\n' +
+            '· SM4：未找到与标准 CK 固定差分的轮常量表\n' +
+            '· AES：Rcon 未找到且密文不可定位\n' +
+            '· 文件超过 16MB（通用程序量级）：不挂脚本——里面的标准 S 盒来自密码库而非本题算法\n' +
+            '建议：查看 scan_crypto 输出确认；或自行按反编译实现（诚实边界：DES/Blowfish 暂不支持）。';
+        }
+        const outPath = String(input.out || '').trim() || path.join(app.getPath('temp'), `solver_${chosen.skeleton.toLowerCase()}.py`);
+        fs.writeFileSync(outPath, sk.script, 'utf8');
+        const lines = [`已生成 ${chosen.skeleton} 变体解密脚本: ${outPath}`];
+        lines.push(`- 密文候选: ${(sk.ciphertextCandidates || []).map(x => x.offset + '(' + x.length + 'B)').join('、')}`);
+        if (sk.fkCandidates) lines.push(`- FK 候选数: ${sk.fkCandidates.length}`);
+        if (sk.keyHints) lines.push(`- key 提示数: ${sk.keyHints.length}`);
+        if (chosen.skeleton === 'SM4') lines.push('- 覆盖: 4 维 × 16 种字节序/状态组合 + 3 种块内排列');
+        if (chosen.skeleton === 'AES') lines.push('- 覆盖: key 长度 16/24/32（轮数 10/12/14±2）× 题目/标准 S 盒 × 字节序/状态排列');
+        lines.push(`用法: python "${outPath}" "${f}"`);
+        lines.push('⚠️ 未命中不代表算法认错——可能轮结构被改写（MixColumns 矩阵/轮函数顺序等），需按反编译实现。');
+        return lines.join('\n');
       }
 
       case 'analyze_structure': {

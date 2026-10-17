@@ -6,6 +6,11 @@ const zlib = require('zlib');
 const http = require('http');
 const https = require('https');
 const { Client: SshClient } = require('ssh2');
+// Agent 运行时（上下文压缩/重复调用护栏/会话持久化），详见 electron/agent-runtime.js
+const {
+  persistToolResult, microcompact, DoomLoopGuard, FailureLoopGuard,
+  estimateTokens, SessionLog, sanitizeHistoryForResume, compactHistoryDeterministic,
+} = require('./agent-runtime');
 
 // ============ 全局异常兜底（防闪退） ============
 // 之前主进程没有任何 uncaughtException/unhandledRejection 处理：任意一个后台任务
@@ -5107,7 +5112,7 @@ function postClaudeJSON(requestBody) {
       let data = '';
       res.on('data', (chunk) => { data += chunk; });
       res.on('end', () => {
-        resolve({ statusCode: res.statusCode, raw: data });
+        resolve({ statusCode: res.statusCode, raw: data, headers: res.headers });
       });
     });
 
@@ -5239,7 +5244,7 @@ function postClaudeStream(requestBody, onDelta) {
 
       res.on('end', () => {
         message.content = Object.keys(blocks).sort((a, b) => a - b).map(k => blocks[k]);
-        resolve({ statusCode: 200, raw: JSON.stringify(message), message, streamed: true });
+        resolve({ statusCode: 200, raw: JSON.stringify(message), message, streamed: true, headers: res.headers });
       });
       res.on('error', (e) => reject(e));
     });
@@ -5251,15 +5256,27 @@ function postClaudeStream(requestBody, onDelta) {
   });
 }
 
-// 带退避重试的传输层：429/5xx 或网络异常时重试（最多 2 次，2s/4s 退避）
+// 带退避重试的传输层（借鉴 openclaude withRetry）
+//   · 最多 5 次；延迟 min(500ms × 2^(n-1), 32s) + 0~25% 抖动
+//   · 优先用响应头 retry-after
+//   · 429 单独计数（上限 3），避免限流时越重试越糟
+//   · 400 类参数错误**不重试**（重试同样的请求必然同样失败），直接回给模型改参数
 // 注意：流式模式一旦已向渲染层吐过增量文本就不再重试——重发会造成聊天区内容重复
 async function claudeTransport(requestBody, onDelta) {
   const cfg = getClaudeConfig();
   const useStream = cfg.stream && typeof onDelta === 'function';
-  const maxRetries = 2;
+  const maxRetries = parseInt(process.env.CTF_API_RETRIES, 10) || 5;
+  const max429 = 3;
   let lastErr = null;
   let deltaEmitted = false;
+  let rateLimited = 0;
   const wrappedOnDelta = useStream ? (d) => { deltaEmitted = true; onDelta(d); } : null;
+
+  const backoff = (attempt, retryAfterSec) => {
+    if (retryAfterSec && retryAfterSec > 0) return Math.min(retryAfterSec * 1000, 32000);
+    const base = Math.min(500 * Math.pow(2, attempt), 32000);
+    return Math.round(base * (1 + Math.random() * 0.25));
+  };
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (claudeAborted) throw new Error('已取消');
@@ -5267,21 +5284,43 @@ async function claudeTransport(requestBody, onDelta) {
       const resp = useStream
         ? await postClaudeStream(requestBody, wrappedOnDelta)
         : await postClaudeJSON(requestBody);
-      if ([403, 429, 500, 502, 503, 504].includes(resp.statusCode) && attempt < maxRetries) {
-        await sleep(2000 * (attempt + 1));
+
+      // 不可重试：请求本身有问题（400/401/403/404），直接把错误交给模型/用户
+      if (resp.statusCode >= 400 && resp.statusCode < 500 && resp.statusCode !== 429) {
+        return resp;
+      }
+      if (resp.statusCode === 429) {
+        rateLimited++;
+        if (rateLimited > max429 || attempt >= maxRetries) return resp;
+        const ra = parseRetryAfter(resp.headers);
+        await sleep(backoff(attempt, ra));
+        continue;
+      }
+      if (resp.statusCode >= 500 && attempt < maxRetries && !deltaEmitted) {
+        await sleep(backoff(attempt, parseRetryAfter(resp.headers)));
         continue;
       }
       return resp;
     } catch (e) {
       lastErr = e;
       if (!deltaEmitted && attempt < maxRetries) {
-        await sleep(2000 * (attempt + 1));
+        await sleep(backoff(attempt));
         continue;
       }
       throw e;
     }
   }
   throw lastErr || new Error('Claude API 请求失败');
+}
+
+function parseRetryAfter(headers) {
+  try {
+    if (!headers) return 0;
+    const v = headers['retry-after'] || headers['Retry-After'];
+    if (!v) return 0;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  } catch (e) { return 0; }
 }
 
 // 统一解析：非流式 JSON 或流式重建 message → { success, text, content, toolCalls, stopReason, error }
@@ -5548,6 +5587,101 @@ ipcMain.handle('claude-abort', async () => {
   return { success: true };
 });
 
+// IPC: 会话列表 / 恢复（D1）
+// 恢复时按 openclaude 的清洗顺序：剥离未完成的 tool_use → 剥离孤立 tool_result
+// → 末尾是 user 时注入"从上次中断处继续"。不做清洗直接回放会被 API 400。
+ipcMain.handle('sessions-list', async () => {
+  try {
+    const dir = path.join(app.getPath('userData'), 'sessions');
+    return { success: true, sessions: SessionLog.list(dir) };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('session-load', async (event, id) => {
+  try {
+    const dir = path.join(app.getPath('userData'), 'sessions');
+    const file = path.join(dir, String(id).replace(/[^\w.-]/g, '_') + '.jsonl');
+    if (!fs.existsSync(file)) return { success: false, error: '会话不存在: ' + id };
+    const records = SessionLog.load(file);
+    const messages = sanitizeHistoryForResume(records);
+    return { success: true, messages, rawCount: records.length, cleanedCount: messages.length };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+// ============ 工具预检（B3）============
+// 只在**确定性可判断**的情况拦截，且每条错误必须给出"怎么改"。
+// 目的：模型收到"失败"两个字只能瞎猜；给出候选/正确写法才能让它一轮改对。
+function precheckToolCall(name, input) {
+  const i = input || {};
+  const needPath = ['read_file', 'write_file', 'scan_crypto', 'extract_payload', 'analyze_structure',
+    'gen_block_cipher_solver', 'gen_sm4_solver', 'run_python', 'ida_decompile'];
+  if (needPath.includes(name)) {
+    const p = i.path;
+    if (!p || !String(p).trim()) return `缺少必填参数 path。请传入目标文件的绝对路径后重试。`;
+    if (!fs.existsSync(String(p))) {
+      const dir = path.dirname(String(p));
+      let hint = '';
+      try {
+        if (fs.existsSync(dir)) {
+          const base = path.basename(String(p)).toLowerCase();
+          const near = fs.readdirSync(dir)
+            .map((f) => ({ f, d: levenshtein(base, f.toLowerCase()) }))
+            .sort((a, b) => a.d - b.d)
+            .slice(0, 3)
+            .map((x) => path.join(dir, x.f));
+          if (near.length) hint = `\n同目录下的相近文件：${near.map((x) => '`' + x + '`').join('、')}`;
+        }
+      } catch (e) { /* 目录不可读则不给提示 */ }
+      return `文件不存在：${p}${hint}\n请确认路径（可先用 glob 或 bash 的 dir/ls 查看目录内容）。`;
+    }
+  }
+
+  if (name === 'bash' && (!i.command || !String(i.command).trim())) {
+    return '缺少必填参数 command。请传入要执行的命令，例如 `python solve.py`。';
+  }
+  if (name === 'run_python' && (!i.script || !String(i.script).trim())) {
+    return '缺少必填参数 script。请把完整 Python 代码放在 script 字段里（不要传文件路径）。';
+  }
+  if (name === 'write_file') {
+    if (!i.path || !String(i.path).trim()) return '缺少必填参数 path。';
+    if (i.content === undefined || i.content === null) return '缺少必填参数 content。';
+  }
+  if (name === 'read_file' || name === 'grep') {
+    if (!i.path) return '缺少必填参数 path。';
+  }
+  if (name === 'grep' && !i.pattern) return '缺少必填参数 pattern。';
+  if (name === 'glob' && !i.pattern) return '缺少必填参数 pattern。';
+  if ((name === 'ida_decompile' || name === 'ida_get_bytes') && !i.address && !i.function) {
+    return '缺少 address 或 function 参数。IDA 需要明确的函数名或地址；'
+      + '若不确定，先调 ida_list_functions 列出函数，或 ida_xrefs 定位。';
+  }
+  return null;
+}
+
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  const m = a.length, n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(
+        prev[j] + 1,
+        cur[j - 1] + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      );
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+
+// ============ 上下文压缩 ============
+// 实现见 electron/agent-runtime.js: compactHistoryDeterministic
+// （确定性抽取硬事实；不额外调用模型，压缩本身不会失败也不会多花 token）
+
 // Claude API Tool Use 循环
 async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
   // 初步求解提示明确要求直接分析时，不发送工具定义，
@@ -5573,9 +5707,46 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
   const dupCounter = new Map();
   // 脚本类工具的"同思路"签名池（归一化文本 → 出现次数）：截住"换写法重跑"
   const scriptSigs = new Map();
+  // 连续相同调用拦截（借鉴 openclaude doomLoop）：阈值 3，签名变化即重置
+  const doomGuard = new DoomLoopGuard(3);
+  // 跨轮失败环（按 工具+错误类别 / 类别 / 路径 累计）：第 2 次 advisory，第 3 次要求换路线
+  const failGuard = new FailureLoopGuard(3);
+  // 会话日志：追加式 JSONL，崩溃/关窗后可续跑
+  let sessionLog = null;
+  try {
+    sessionLog = new SessionLog(path.join(app.getPath('userData'), 'sessions'));
+    sessionLog.append('user', messages && messages.length ? messages[messages.length - 1].content : '');
+  } catch (e) { /* 日志失败不影响解题 */ }
+
+  // 上下文预算：DeepSeek 128k 窗口，按 70% 触发摘要压缩（openclaude: 窗口 - 30k buffer）
+  const CONTEXT_BUDGET_TOKENS = parseInt(process.env.CTF_CONTEXT_TOKENS, 10) || 90000;
+  let compactFailures = 0;
+  let lastCompactAt = 0;
 
   while (maxIterations > 0) {
     maxIterations--;
+
+    // ── 上下文维护（每轮开头）──
+    // 1) 微压缩：旧工具结果换成占位串（零模型调用，成本≈0）
+    try { microcompact(conversationHistory, 6); } catch (e) { /* 忽略 */ }
+    // 2) 超预算 → 摘要压缩（失败熔断：连续 3 次失败后冷却 5 分钟）
+    try {
+      const used = estimateTokens(conversationHistory);
+      const cooling = compactFailures >= 3 && (Date.now() - lastCompactAt) < 5 * 60 * 1000;
+      if (used > CONTEXT_BUDGET_TOKENS && !cooling) {
+        lastCompactAt = Date.now();
+        // 先试确定性压缩（保留最近若干轮 + 硬事实），失败才降级为截断
+        const compacted = compactHistoryDeterministic(conversationHistory);
+        if (compacted) {
+          conversationHistory = compacted;
+          compactFailures = 0;
+          console.log(`[Context] 已压缩：${used} → ${estimateTokens(conversationHistory)} token`);
+        } else {
+          compactFailures++;
+        }
+      }
+    } catch (e) { compactFailures++; }
+
 
     // 冲刺阶段：到达 SPRINT_AT 后注入一次强制收尾指令——停止一切新分析，落地结论/脚本。
     // （复杂题 4 轮实测均耗尽预算于"写最终脚本之前"，靠提示词自约不够，代码强制兜底。）
@@ -5734,6 +5905,20 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
           }
         }
 
+        // B1) 连续相同调用拦截（工具名 + 完整入参的 sha256）。
+        //     与下面"累计次数"不同：这个看的是**连续**，中间插了别的调用就重置。
+        //     阈值 3（与 openclaude doomLoop 一致）；命中后保持拦截直到签名变化。
+        const doom = doomGuard.check(toolCall.name, toolCall.input);
+        if (doom.blocked) {
+          toolResults.push({
+            tool_use_id: toolCall.id,
+            content: `⚠️ 已拦截：同样的调用（${toolCall.name}，参数完全相同）已连续 ${doom.count} 次。\n`
+              + '继续重复不会有新结果。请改参数、换工具或换假设——如果可观测状态确实变了，再重复一次是允许的。',
+            is_error: true,
+          });
+          continue;
+        }
+
         // 通知渲染层"即将执行某工具"——UI 上显示为可折叠的步骤条，
         // 让用户知道长时间等待时工具真的在跑（而不是界面卡死）。
         const emitToolEvent = (phase, extra) => {
@@ -5748,22 +5933,54 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
           } catch (e) { /* UI 通知失败不影响执行 */ }
         };
         emitToolEvent('start');
+
+        // B3) 工具预检：在真正执行前做确定性检查，错误信息必须包含"怎么改"。
+        //     模型现在只收到"失败"两个字时只能瞎猜，预检直接给出候选/正确写法。
+        const precheck = precheckToolCall(toolCall.name, toolCall.input);
+        if (precheck) {
+          toolResults.push({ tool_use_id: toolCall.id, content: precheck, is_error: true });
+          emitToolEvent('error', { error: precheck.split('\n')[0] });
+          failGuard.recordFailure(toolCall.name, precheck, toolCall.input && toolCall.input.path);
+          const adv = failGuard.takeAdvisories();
+          if (adv.length) toolResults.push({ tool_use_id: toolCall.id + '-adv', content: '💡 ' + adv.join('\n'), is_error: false });
+          continue;
+        }
+
         try {
           const result = await executeToolCall(toolCall.name, toolCall.input);
-          const resultText = truncateOutput(typeof result === 'string' ? result : JSON.stringify(result, null, 2));
+          const rawText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+          // A1) 大输出落盘：只截头会丢掉尾部的错误堆栈/flag，改为 60/40 头尾预览 + 落盘路径。
+          const resultText = persistToolResult(rawText, {
+            maxChars: parseInt(process.env.CTF_TOOL_RESULT_MAX, 10) || 24000,
+            dir: path.join(app.getPath('userData'), 'tool-results'),
+            id: toolCall.id,
+          });
           toolResults.push({
             tool_use_id: toolCall.id,
             content: resultText,
             is_error: false
           });
           emitToolEvent('done', { chars: resultText.length });
+          failGuard.recordSuccess(toolCall.name, toolCall.input && toolCall.input.path);
+          doomGuard.reset();   // 成功且有状态变化 → 重置连续计数
         } catch (err) {
+          const errMsg = `工具调用失败: ${err.message}`;
           toolResults.push({
             tool_use_id: toolCall.id,
-            content: `工具调用失败: ${err.message}`,
+            content: errMsg,
             is_error: true
           });
           emitToolEvent('error', { error: err.message });
+          // B2) 跨轮失败环：按 (工具, 错误类别) / 类别 / 路径累计
+          const fr = failGuard.recordFailure(toolCall.name, errMsg, toolCall.input && toolCall.input.path);
+          if (fr.tripped) {
+            toolResults.push({
+              tool_use_id: toolCall.id + '-loop',
+              content: `🛑 ${toolCall.name} 已连续 ${fr.count} 次同类失败（${fr.category}）。`
+                + '这条路走不通了：请换工具、换假设，或先说明卡点并给出当前最优结论。',
+              is_error: true,
+            });
+          }
         }
       }
 
@@ -5790,7 +6007,7 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
         content: assistantContent
       });
 
-      conversationHistory.push({
+      const toolResultMsg = {
         role: 'user',
         content: toolResults.map(tr => ({
           type: 'tool_result',
@@ -5798,7 +6015,16 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
           content: tr.content,
           ...(tr.is_error ? { is_error: true } : {})
         }))
-      });
+      };
+      conversationHistory.push(toolResultMsg);
+
+      // D1) 会话日志（追加式 JSONL）：崩溃/关窗后可按最后一条完整 tool_result 续跑
+      try {
+        if (sessionLog) {
+          sessionLog.append('assistant', assistantContent);
+          sessionLog.append('user', toolResultMsg.content);
+        }
+      } catch (e) { /* 日志失败不影响解题 */ }
 
       // 继续循环，让API处理工具结果
       continue;

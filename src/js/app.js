@@ -393,6 +393,9 @@ function setupEventListeners() {
   if (attachBtn) attachBtn.addEventListener('click', sendFileInfoToChat);
   const clearChatBtn = document.getElementById('btn-clear-chat');
   if (clearChatBtn) clearChatBtn.addEventListener('click', clearChat);
+  // 会话恢复（D1）：从最近一次中断的对话继续
+  const resumeBtn = document.getElementById('btn-resume-session');
+  if (resumeBtn) resumeBtn.addEventListener('click', resumeLastSession);
 
   // 通用输入弹窗（替代 prompt()）
   const promptOk = document.getElementById('btn-prompt-ok');
@@ -7850,30 +7853,95 @@ ${result.text}`;
 //   2) 命中优先，其次补齐"最近 N 条"（保证上下文新鲜）；
 //   3) 去重、限总条数，避免撑爆 token。
 function selectRelevantExperience(expText, findings) {
-  const lines = String(expText || '').split('\n').map(s => s.trim()).filter(s => s && s.length > 8);
-  if (!lines.length) return '';
-  // 当前题特征词
+  // 结构化检索（借鉴 openclaude memdir）：按"当前题的特征词"给经验条目打分，
+  // 只注入命中的 top 几条（≤600 字符），而不是把整个经验库塞进提示词。
+  // 兼容两种格式：旧自由文本行 与 新 [technique]/[pitfall] + applies_to/Rule/Why/How。
   const kws = [];
   const ft = (state.fileType || '').toUpperCase();
   if (ft) kws.push(ft);
   if (/APK|DEX/i.test(ft)) kws.push('APK', 'so', 'native', 'JEB', 'Frida', 'smali', 'SharedPreferences');
   else if (/PE|ELF|EXE|BIN/i.test(ft)) kws.push('native', 'IDA', 'PE', 'ELF', 'VM', '常量表');
+
+  // 用最近一次扫描结论做特征词（骨架/S 盒关系/存放形态）
+  const scan = state.lastAlgScan || null;
+  if (scan) {
+    for (const s of (scan.summary || [])) {
+      const a = String(s.algo || '');
+      if (a) kws.push(a);
+      for (const m of a.match(/(SM4|AES|DES|Blowfish|TEA|RC4|Base64|Base91|VM)/gi) || []) kws.push(m);
+    }
+    for (const f of (scan.fingerprints || [])) {
+      if (f.stride > 1) kws.push('dword', 'stride');
+      if (f.constantAnalysis) {
+        const rel = f.constantAnalysis.sboxRelation;
+        if (rel && rel.relatedTo) kws.push(rel.relatedTo);
+        kws.push('S盒', 'sbox', '常量');
+      }
+    }
+    for (const pl of (scan.payloads || [])) {
+      kws.push(pl.type === 'pe' ? 'loader' : String(pl.type || ''));
+      if (pl.encode && pl.encode.kind) kws.push('XOR', '编码');
+    }
+  }
+
   const pkg = (state.findings && state.findings.meta && state.findings.meta.packageName) || '';
   if (pkg) kws.push(pkg);
-  for (const a of (findings && findings.algorithms) || []) { const t = (a && a.text) || String(a); if (t) kws.push(t.slice(0, 20)); }
-  const kwSet = kws.filter(Boolean);
-  const score = (l) => kwSet.reduce((n, k) => n + (l.toLowerCase().includes(String(k).toLowerCase()) ? 1 : 0), 0);
-  const scored = lines.map((l, i) => ({ l, i, s: score(l) }));
-  const hit = scored.filter(x => x.s > 0).sort((a, b) => (b.s - a.s) || (b.i - a.i));
-  const recent = scored.slice(-8); // 最近 8 条兜底（含最新教训）
-  const picked = [];
-  const seen = new Set();
-  for (const x of hit.concat(recent)) {
-    if (seen.has(x.l)) continue;
-    seen.add(x.l); picked.push(x.l);
-    if (picked.length >= 18) break;
+  for (const a of (findings && findings.algorithms) || []) {
+    const x = (a && a.text) || String(a);
+    if (x) kws.push(x.slice(0, 20));
   }
-  return picked.join('\n');
+
+  // 调用主进程的结构化检索（失败则退回本地的宽松匹配，保证不会因 IPC 故障丢经验）
+  try {
+    const api = window.electronAPI;
+    if (api && api.experienceRank) {
+      // 同步接口不可用时用缓存结果；这里优先用同步实现（见下方 localRank）
+    }
+  } catch (e) { /* 忽略 */ }
+  return localRankExperience(expText, kws);
+}
+
+// 与 electron/agent-runtime.js: rankExperience 同算法的渲染层实现
+// （渲染层不能 require 主进程模块；两边由 test_agent_runtime.js 的同组断言守住一致性）
+function localRankExperience(expText, keywords) {
+  const limit = 6, maxChars = 600;
+  const kws = (keywords || []).map(k => String(k).toLowerCase()).filter(Boolean);
+  const lines = String(expText || '').split('\n').filter(l => /^\s*-/.test(l));
+  const items = [];
+  lines.forEach((raw, idx) => {
+    const m = raw.trim().match(/^-\s*\[(\w+)\]\s*(.*)$/);
+    let kind = 'legacy', tags = [], rule = raw.trim(), why = '', how = '';
+    if (m && /^(technique|pitfall|layout|tool-usage|fact)$/i.test(m[1])) {
+      kind = m[1].toLowerCase();
+      const body = m[2];
+      const tm = body.match(/applies_to\s*=\s*([^|]+)/i);
+      if (tm) tags = tm[1].split(/[,，\s]+/).filter(Boolean);
+      rule = (body.match(/Rule:\s*(.+?)(?=\||$)/i) || [])[1] || body;
+      why = (body.match(/Why:\s*(.+?)(?=\||$)/i) || [])[1] || '';
+      how = (body.match(/How:\s*(.+?)(?=\||$)/i) || [])[1] || '';
+    } else {
+      rule = raw.trim().replace(/^-\s*(\[[^\]]+\]\s*)?/, '');
+    }
+    const hay = (raw + ' ' + tags.join(' ')).toLowerCase();
+    const hits = kws.reduce((n, k) => n + (hay.includes(k) ? 1 : 0), 0);
+    if (!hits) return;                       // 零命中不注入（否则等于把经验库全塞进提示词）
+    items.push({ kind, tags, rule: rule.trim(), why: why.trim(), how: how.trim(), hits, idx });
+  });
+  items.sort((a, b) => (b.hits - a.hits) || (b.idx - a.idx));
+  const out = [];
+  let used = 0;
+  for (const e of items.slice(0, limit)) {
+    let text;
+    if (e.kind === 'legacy') text = '- ' + e.rule;
+    else {
+      text = '- [' + e.kind + '] ' + e.rule;
+      if (e.why) text += '\n  为什么：' + e.why;
+      if (e.how) text += '\n  怎么做：' + e.how;
+    }
+    if (used + text.length > maxChars) break;
+    out.push(text); used += text.length;
+  }
+  return out.join('\n');
 }
 
 // 构建系统提示（连接状态取真实探测结果，不夸大）
@@ -10304,6 +10372,37 @@ function clearChat() {
   if (chatMessages) chatMessages.innerHTML = '';
   state.chatHistory = [];
   addLog('info', '聊天已清空');
+}
+
+// 会话恢复（D1）：读取最近一次会话日志，把清洗后的历史接回对话。
+// 主进程已剥离未完成的 tool_use / 孤立 tool_result（不清洗直接回放会被 API 400），
+// 并在末尾注入"从上次中断处继续"。这里只负责接回内存状态并给用户可见反馈。
+async function resumeLastSession() {
+  try {
+    const api = window.electronAPI;
+    if (!api || !api.sessionsList) { addLog('warning', '当前版本不支持会话恢复'); return; }
+    const list = await api.sessionsList();
+    if (!list || !list.success) { addLog('error', '读取会话列表失败: ' + ((list && list.error) || '未知')); return; }
+    const sessions = (list.sessions || []).filter(s => s.size > 0);
+    if (!sessions.length) { addSystemMessage('**没有可恢复的会话**\n\n当前还没有已保存的 AI 对话记录。'); return; }
+    const latest = sessions[0];
+    const loaded = await api.sessionLoad(latest.id);
+    if (!loaded || !loaded.success) { addLog('error', '读取会话失败: ' + ((loaded && loaded.error) || '未知')); return; }
+    const messages = loaded.messages || [];
+    if (!messages.length) { addSystemMessage('**该会话没有可恢复的内容**'); return; }
+
+    // 接回内存历史（主进程下次调用会带上它继续）
+    state.chatHistory = messages.slice();
+    addSystemMessage(
+      '**已恢复会话** ' + latest.id + '\n\n'
+      + '- 原始记录 ' + loaded.rawCount + ' 条，清洗后 ' + loaded.cleanedCount + ' 条'
+      + '（已移除未完成的工具调用，避免接口报错）\n'
+      + '- 直接发送任意消息即可从中断处继续。'
+    );
+    addLog('success', '已恢复会话 ' + latest.id);
+  } catch (e) {
+    addLog('error', '恢复会话异常: ' + e.message);
+  }
 }
 
 

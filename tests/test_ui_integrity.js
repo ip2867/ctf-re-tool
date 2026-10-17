@@ -70,5 +70,16 @@ console.log('\nE) 字体本地化（离线/内网不得卡启动）');
   ok(!/font-src https:/.test(html), 'CSP 不再放行外部字体域');
 }
 
+console.log('\nF) 会话恢复与经验检索接线');
+{
+  ok(/btn-resume-session/.test(html), 'HTML 有"恢复会话"按钮');
+  ok(/sessionsList|sessions-list/.test(preloadJs), 'preload 暴露 sessionsList');
+  ok(/resumeLastSession/.test(appJs), '渲染层实现 resumeLastSession');
+  ok(/function localRankExperience/.test(appJs), '渲染层提供结构化经验检索');
+  ok(/applies_to/.test(appJs) && /technique\|pitfall/.test(appJs), '支持结构化经验格式');
+  ok(!/function selectRelevantExperience[\s\S]{0,800}recent = scored\.slice\(-8\)/.test(appJs),
+     '旧"最近 8 条兜底"逻辑已移除（零命中不再注入经验）');
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

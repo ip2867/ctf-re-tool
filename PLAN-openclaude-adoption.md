@@ -304,19 +304,28 @@ applies_to: ["SM4", "自定义S盒", "dword数组"]
 
 ## 执行顺序与验收
 
-| 阶段 | 内容 | 预估改动量 | 验收 |
+| 阶段 | 内容 | 状态 | 落点 / 验收 |
 |---|---|---|---|
-| **A1** | 工具输出落盘 + 头尾预览 | ~60 行 | 200KB 输出不爆窗口，模型可回查 |
-| **B1** | 工具级 doom loop | ~50 行 | 同调用重复 3 次被拦并给出改法 |
-| **B3** | 预检 + 纠正性错误 | ~120 行 | IDA 函数名错误时返回候选；路径错误返回相似名 |
-| **A2** | 旧结果微压缩 | ~40 行 | 60 轮后上下文仍稳定 |
-| **C1** | 结构化经验 + 题型检索 | ~200 行（含迁移脚本） | 同题型二次解题命中经验 |
-| **D1** | JSONL 会话 + 续跑 | ~150 行 | kill 后能续跑 |
-| **D2** | API 重试退避 | ~40 行 | 429/5xx 自动恢复 |
-| **A3** | 摘要压缩 | ~180 行 | 150 轮压力测试通过 |
-| **E1–E3** | 子 agent / cache / goal | ~400 行 | 按需 |
+| **A1** | 工具输出落盘 + 头尾预览 | ✅ 已完成 | `agent-runtime.js: persistToolResult` / `main.js` 工具结果路径；60/40 预览 + 落盘路径回读 |
+| **B1** | 工具级 doom loop | ✅ 已完成 | `agent-runtime.js: DoomLoopGuard`；连续 3 次相同调用拦截，签名变化即重置 |
+| **B2** | 跨轮失败环 | ✅ 已完成 | `agent-runtime.js: FailureLoopGuard`；三键计数，第 2 次 advisory、第 3 次 trip |
+| **B3** | 预检 + 纠正性错误 | ✅ 已完成 | `main.js: precheckToolCall`；路径不存在给 Levenshtein 相近文件、IDA 缺参给调用建议 |
+| **A2** | 旧结果微压缩 | ✅ 已完成 | `agent-runtime.js: microcompact`；保留最近 6 条、绝不清 `is_error` |
+| **C1** | 结构化经验 + 题型检索 | ✅ 已完成 | `rankExperience`（主进程）+ `localRankExperience`（渲染层）；零命中不注入 |
+| **D1** | JSONL 会话 + 续跑 | ✅ 已完成 | `SessionLog` / `sanitizeHistoryForResume` + `sessions-list` / `session-load` IPC + UI 恢复按钮 |
+| **D2** | API 重试退避 | ✅ 已完成 | `claudeTransport`；5 次、指数退避 + 抖动、429 上限 3、4xx 不重试 |
+| **A3** | 摘要压缩 | ✅ 已完成（确定性版） | `compactHistoryDeterministic`；90k token 触发、熔断 3 次/冷却 5 分钟；**不额外调模型** |
+| **E1–E3** | 子 agent / cache / goal | ⏳ 按需 | 见下方说明 |
 
-**先做 A1 + B1 + B3**（约 1 天，改动小、收益立刻可见），再做 A2/C1/D1，最后 A3/E。
+**与计划的偏差（有意为之）**：A3 原计划"调模型生成摘要"，实际改为**确定性抽取硬事实**。
+理由：压缩本身要再发一次大请求（慢、可能失败、还占 token），而 CTF 里真正必须保留的是
+偏移/常量/骨架/已排除路线——这些用规则就能抽出来。若后续发现摘要质量不足，再升级为
+"确定性抽取 + 模型补充"的两段式。
+
+**E1–E3 暂不做的原因**：E1 子 agent 需要独立消息栈与结果回传协议，改动量约 400 行；
+E2 prompt cache 依赖 provider 是否支持 `cache_control`（当前 DeepSeek 代理不支持，
+但已保证 system + tools 前缀稳定）；E3 goal evaluator 每轮多一次模型调用。
+现阶段 A1–D2 已覆盖"上下文不爆 / 不空转 / 可续跑"三个核心痛点，E 系列留作后续。
 
 ---
 

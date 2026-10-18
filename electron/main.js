@@ -5874,6 +5874,19 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
     return await sendClaudeRequest(messages, systemPrompt, onDelta, opts);
   }
 
+  // 骨架先行的预算纪律（P0.2）：深度求解提示词里原有"脚本必须真跑"只是软约束，
+  // 实测 AI 会把 60 轮里的前 40 轮全花在反编译/读字节上，最后没预算落脚本。
+  // 提到 system 级（每轮都随请求发送，不受上下文压缩影响），让模型开跑前就知道分段边界；
+  // 真正的强制在循环里（第 16 轮骨架检查 / 第 45 轮收敛催促），提示词只负责提前对齐预期。
+  const BUDGET_RULES = [
+    '【预算纪律（硬性分段，工具轮次上限 60）】',
+    '- 第 1-15 轮：只做侦察——反编译、读字节、搜字符串、确认常量表。不要在这一段写最终解密脚本。',
+    '- 第 16 轮起：必须已经有一个可跑的脚本骨架（至少调用过一次 run_python；逻辑不完整也算，先跑起来再迭代）。没跑过就会被强制打断去写。',
+    '- 第 45 轮起：停止扩大侦察范围，必须开始收敛——把已有发现落到 [VERIFY]、[HYPOTHESES] 或 [FLAG]。',
+    '- 判据是代码检查，不是自我感觉：脚本必须真的通过 run_python 执行过并贴出真实输出。'
+  ].join('\n');
+  systemPrompt = (systemPrompt ? String(systemPrompt) + '\n\n' : '') + BUDGET_RULES;
+
   const tools = getToolDefinitions();
   let conversationHistory = [...messages];
   // 单轮工具循环上限：复杂逆向题（如并行归并+反演）实测需要大量"反编译→推演→写脚本→修正"迭代，
@@ -5891,9 +5904,35 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
   let lastResponse = null;
   let collectedText = '';
   let sprintInjected = false;
+  // 骨架先行（P0.2）：第 16 轮检查"整个会话是否跑过脚本"，第 45 轮检查"是否开始收敛"。
+  // 与 SPRINT_AT=50 的冲刺各管一段：16 轮管"有没有动手写"，45 轮管"有没有开始收口"，
+  // 50 轮才是"停分析、落最终脚本"。计数上限 2，避免脚本工具确实不可用时无限催促。
+  const SKELETON_AT = parseInt(process.env.CTF_SKELETON_AT, 10) || 16;
+  const CONVERGE_AT = parseInt(process.env.CTF_CONVERGE_AT, 10) || 45;
+  let skeletonNudgeCount = 0;
+  let convergeNudged = false;
+  // 轮次一律按"已消耗轮数"算，不依赖 maxIterations 的递减写法——
+  // 环境变量改过上限（CTF_MAX_TOOL_ITER）时位置仍然正确。
+  let roundsUsed = 0;
+  // 脚本工具清单与 P0.2 的判据保持一致：run_python / bash / run_command 任一都算"动手跑过"。
+  const SCRIPT_TOOL_RE = /^(run_python|bash|run_command)$/;
+  // 跨上下文压缩的"跑过脚本"标记：压缩会丢掉早期 assistant 消息，
+  // 只扫当前 history 会把已跑过脚本的会话误判成"零脚本"。
+  let sawScriptTool = false;
   // "只说不做"催促：模型输出行动意图却零工具调用时注入催促继续执行（最多 3 次，防死循环）
   let actionNudged = false;
   let actionNudgeCount = 0;
+  // "读完就收工"催促计数（已用工具但无 flag/契约；最多 2 次）
+  let shallowNudgeCount = 0;
+  // 分层收尾的"落地检查单"计数：与 shallowNudgeCount 分开记。
+  // 前一层催的是"别只读几处，继续挖证据"；这一层催的是"手里的证据已经够多了，
+  // 把它固化成可跑脚本/可验证契约"。两类话术不能互相挤占额度——复杂题往往不是
+  // 缺分析，而是分析完没有落到 run_python 骨架，必须单独留出 2 次催促空间。
+  let landNudgeCount = 0;
+  // "零新数据"催促计数（P0.3）：前三级都在催"继续挖/落地"，但若模型连一次真实字节/数值
+  // 都没带回来，任何话术都会被它改写成同一段概括性描述。这一层只催"去取数"，额度 2 次，
+  // 与前面三层分开计，避免互相挤占。
+  let dataNudgeCount = 0;
   // 重复调用计数（工具名+参数签名 → 次数）：同一调用重复 ≥4 次时警告换路，防"原地打转"卡死
   const dupCounter = new Map();
   // 脚本类工具的"同思路"签名池（归一化文本 → 出现次数）：截住"换写法重跑"
@@ -5921,6 +5960,7 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
 
   while (maxIterations > 0) {
     maxIterations--;
+    roundsUsed++;
 
     // ── 上下文维护（每轮开头）──
     // 1) 微压缩：旧工具结果换成占位串（零模型调用，成本≈0）
@@ -5943,6 +5983,63 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
       }
     } catch (e) { compactFailures++; }
 
+
+    // 骨架先行检查（P0.2，第 16 轮）：只在"整个会话一次脚本都没跑过"时催。
+    // 为什么按整个会话而不是本轮：AI 常见的病是连续十几轮只做反编译/读字节，
+    // 每轮单独看都"有工具调用"，只有跨轮累计才看得出它从没动过手。
+    // 为什么催两次就停：脚本工具本身可能不可用（run_python 起不来），
+    // 无限催促会把剩下的预算全烧在同一句话术上，比不催更糟。
+    // 与 SPRINT_AT 的冲刺各管一段：这里管"有没有开始写"，冲刺管"该收尾了"。
+    const scriptCallsSeen = conversationHistory.reduce((n, m) => n + (m.role === 'assistant' && Array.isArray(m.content)
+      ? m.content.filter(c => c.type === 'tool_use' && SCRIPT_TOOL_RE.test(c.name)).length : 0), 0);
+    // sawScriptTool 是跨压缩的兜底：上下文压缩会丢掉早期的 assistant 消息，
+    // 只扫 history 会在第 16 轮把"其实已经跑过脚本"误判成没跑过，白催一次。
+    const hasScriptCall = sawScriptTool || scriptCallsSeen > 0;
+    const skeletonNudge = roundsUsed >= SKELETON_AT && !hasScriptCall
+      && skeletonNudgeCount < 2 && conversationHistory.length > 2;
+    if (skeletonNudge) {
+      skeletonNudgeCount++;
+      const skeletonLastChance = skeletonNudgeCount >= 2;
+      conversationHistory.push({
+        role: 'user',
+        content: [{ type: 'text', text:
+          '⏱ **骨架催促**（第 ' + roundsUsed + ' 轮）：你到目前为止**一次脚本都没跑过**'
+          + '（run_python/bash 调用记录为空），侦察阶段该结束了。\n'
+          + (skeletonLastChance
+            ? '⏰ **最后一次提醒**：不要再解释你还缺什么，**把已经读到的函数地址、常量、字节偏移先写成一个最小脚本跑起来**。'
+              + '逻辑不完整没关系——先让脚本输出"当前能做到哪一步"（读到的字节、还原的中间值、校验比较结果），'
+              + '拿到真实输出后再迭代。现在就用 run_python 执行。'
+            : '请立刻用 run_python 写一个**可跑的最小骨架**：把已读到的函数地址/常量/偏移写成变量，'
+              + '先跑通"读文件 → 定位数据 → 打印中间值"这条链，哪怕还解不出最终 flag。'
+              + '骨架跑起来后再继续补逻辑；不要继续只做静态阅读。')
+        }]
+      });
+      console.log(`[Tool Use] 骨架催促：第 ${roundsUsed} 轮仍无脚本调用（第 ${skeletonNudgeCount} 次）`);
+      try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('claude-tool-event', { phase: 'gate', tool: 'gate', message: `[Tool Use] 骨架催促：第 ${roundsUsed} 轮仍无脚本调用（第 ${skeletonNudgeCount} 次）` }); } catch (e) { /* 闸日志旁路失败不影响判据 */ }
+    }
+
+    // 收敛催促（P0.2，第 45 轮）：剩余轮次只够"收口"，不够再开新战场。
+    // 与冲刺（SPRINT_AT=50）区分：这里只要求开始收敛到契约形态，冲刺才要求停掉全部分析。
+    const hasContractSoFar = /\[FLAG\]|\[VERIFY\]|\[HYPOTHESES\]|待人工验证/.test(collectedText || '');
+    const convergeNudge = !convergeNudged && roundsUsed >= CONVERGE_AT
+      && !hasContractSoFar && conversationHistory.length > 2;
+    if (convergeNudge) {
+      convergeNudged = true;
+      conversationHistory.push({
+        role: 'user',
+        content: [{ type: 'text', text:
+          '⏱ **收敛催促**（第 ' + roundsUsed + ' 轮）：到目前为止你**还没有产出任何契约**——'
+          + '既没有 [FLAG]，也没有 [VERIFY]，也没有 [HYPOTHESES]。剩余约 ' + Math.max(0, MAX_TOOL_ITERATIONS - roundsUsed) + ' 轮。\n'
+          + '从现在起停止扩大侦察范围，只做收口：\n'
+          + '① 用 run_python 把已有发现跑一遍，贴出真实输出；\n'
+          + '② 把验证过的算法/密钥/变换写成 [VERIFY] 契约；\n'
+          + '③ 若还有多组候选（算法/字节序/密钥变体），按可信度排序写成 [HYPOTHESES][...][/HYPOTHESES]；\n'
+          + '④ 若确实做不出，写清卡在哪一步、已排除哪些路线——但必须给出上述三种契约之一，不能只写概括性描述。'
+        }]
+      });
+      console.log(`[Tool Use] 收敛催促：第 ${roundsUsed} 轮仍无契约，要求收口到 [VERIFY]/[HYPOTHESES]`);
+      try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('claude-tool-event', { phase: 'gate', tool: 'gate', message: `[Tool Use] 收敛催促：第 ${roundsUsed} 轮仍无契约，要求收口到 [VERIFY]/[HYPOTHESES]` }); } catch (e) { /* 闸日志旁路失败不影响判据 */ }
+    }
 
     // 冲刺阶段：到达 SPRINT_AT 后注入一次强制收尾指令——停止一切新分析，落地结论/脚本。
     // （复杂题 4 轮实测均耗尽预算于"写最终脚本之前"，靠提示词自约不够，代码强制兜底。）
@@ -6034,6 +6131,130 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
           + '若本轮确实无法执行（工具不可用），就明确说明并给出当前最优结论。' }] });
         continue;
       }
+
+      // ── "读完就收工"识别（v1.7.5）──
+      // 实测（CrackMe5）：AI 只调了 6 次工具（scan_crypto + 3 次 decompile + list + get_bytes），
+      // 7 秒后返回一段描述性文字——既没有 [FLAG]、也没有 [VERIFY]、更没有 [HYPOTHESES]，
+      // 流程就此结束，整题判失败。这类"浅尝辄止"和"只说不做"是两回事：
+      //   · 只说不做：还没执行，需要催促去执行；
+      //   · 读完就收工：执行了，但只读了几个函数就认为"没什么可做的"。
+      // 判据：本轮已经发生过工具调用（collectedText 期间有过 toolCalls），且
+      //       ① 结论里没有任何可验证输出（无 FLAG/VERIFY/HYPOTHESES），
+      //       ② 仍未用完预算（剩余 > 1/3），
+      //       ③ 还没催促过这种类型（最多 2 次，防死循环），
+      //       ④ 手里还没有可落地的具体进展（有进展时交给下一层"落地检查单"，见下）。
+      // 注意：不能对"明确说明卡点"的收工也催——那会把有价值的失败结论变成空转。
+      const statedBlocker = /无法|不能|缺少|需要.{0,10}(提供|工具|文件)|卡在|blocked|unable|requires?\s+(a|the)?\s*(tool|file)/i.test(response.text);
+      const didUseTools = conversationHistory.some(m => m.role === 'assistant' && Array.isArray(m.content)
+        && m.content.some(c => c.type === 'tool_use'));
+      const budgetLeft = maxIterations / MAX_TOOL_ITERATIONS;
+      // "进展明确"的判据（分层收尾第二级的入口）：
+      // 86 题实测里 57% 的失败不是 AI 没读代码，而是它已经读到了地址/常量/变换，
+      // 却把结论写成"程序做了什么"就收工——这类题催"继续挖"没用，该催"把已知量落地"。
+      // 所以这里认的是"可见文本里已经出现能直接写进脚本的东西"（地址/函数名/偏移/常量/变换），
+      // 而不是工具调用次数：调用次数多但原地打转的题同样存在（见下方 dupCounter 的教训）。
+      // 同时要求至少发生过 2 次工具调用，避免"只声明了一个地址就宣称有进展"。
+      const toolUseCount = conversationHistory.reduce((n, m) => n + (m.role === 'assistant' && Array.isArray(m.content) ? m.content.filter(c => c.type === 'tool_use').length : 0), 0);
+      const concreteEvidence = /0x[0-9a-f]{2,}|\bsub_[0-9a-f]+\b|RVA|偏移|地址|常量表|字节序列|密钥流|已验证|transform|offset\s*=\s*0x/i.test(collectedText || '');
+      const hasConcreteProgress = didUseTools && toolUseCount >= 2 && concreteEvidence;
+      // 三级判定的两个入口显式命名，便于单测按源码抽取判据（见 tests/test_land_nudge.js）：
+      // 第一级由 !gaveConclusion 挡住；第二级只看"有进展但无契约"；第三级是剩下的无进展收工。
+      const shallowGiveUp = didUseTools && !gaveConclusion && !statedBlocker && budgetLeft > 0.33 && shallowNudgeCount < 2 && !hasConcreteProgress;
+      const landNudge = hasConcreteProgress && !gaveConclusion && !statedBlocker && budgetLeft > 0.33 && landNudgeCount < 2;
+      if (shallowGiveUp) {
+        shallowNudgeCount++;
+        conversationHistory.push({ role: 'assistant', content: response.content && response.content.length ? response.content : [{ type: 'text', text: response.text }] });
+        conversationHistory.push({ role: 'user', content: [{ type: 'text', text:
+          '（检测到你只读了几处就准备收工，但**既没有给出 flag、也没有给出可验证的 [VERIFY] 契约**。）\n'
+          + '工具预算还很充足（剩余约 ' + Math.round(budgetLeft * 100) + '%）。请不要停在这里：\n'
+          + '① 若你已经有明确假设（算法/密钥/变换），**立即用 run_python 写脚本实测**，并附 [VERIFY] 契约；\n'
+          + '② 若还不确定，继续追关键路径：交叉引用（ida_get_xrefs）→ 校验函数 → 常量表（ida_get_bytes）；\n'
+          + '③ 若确认当前层是壳/loader，把下一层提取出来并调 switch_to_next_stage；\n'
+          + '④ 若确实已穷尽手段，请明确写出「卡在哪一步、缺什么信息」，而不是只给概括性描述。\n'
+          + '只输出"程序做了什么"的说明不算完成——必须落到可验证的结论。' }] });
+        console.log(`[Tool Use] 浅层收工检测：已用工具但无结论，催促继续（第 ${shallowNudgeCount} 次）`);
+        try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('claude-tool-event', { phase: 'gate', tool: 'gate', message: `[Tool Use] 浅层收工检测：已用工具但无结论，催促继续（第 ${shallowNudgeCount} 次）` }); } catch (e) { /* 闸日志旁路失败不影响判据 */ }
+        continue;
+      }
+
+      // ── 分层收尾第二级：已用工具、有明确进展，但仍没有契约（v1.8.0 / P0.1）──
+      // 实测（86 题中 49 道失败）：AI 已经把函数地址、常量、字节偏移都读出来了，
+      // 最后只输出一段"程序先做 A 再做 B"的说明就返回——它缺的不是分析，而是
+      // 把已知量固化成可执行脚本这一步。对这类收工继续催"去挖更多证据"是错位的：
+      // 证据已经够了，该催的是"落地"。所以单独开一层，话术换成"落地检查单"，
+      // 并要求脚本哪怕跑不出最终 flag，也必须能跑出"当前能做到哪一步"，
+      // 因为只有可跑的骨架才会暴露出下一步真正的分歧点（与最终契约的差距）。
+      // 计数与 shallowNudgeCount 分开：旧层额度已被"继续挖"消耗过的题，仍然需要
+      // 单独 2 次"落地"机会，否则复杂题会在旧额度耗尽后直接收工。
+      if (landNudge) {
+        landNudgeCount++;
+        conversationHistory.push({ role: 'assistant', content: response.content && response.content.length ? response.content : [{ type: 'text', text: response.text }] });
+        const lastChance = landNudgeCount >= 2;
+        conversationHistory.push({ role: 'user', content: [{ type: 'text', text:
+          '（检测到你已收集到具体进展，但**还没有把结论落成可验证的 [VERIFY] 契约**。）\n'
+          + '不要再写"程序做了什么"的描述了。请立刻做一次**落地检查单**：\n'
+          + '① 把当前所有已知量逐条列出来：函数地址（如 0x.../sub_...）、常量、字节偏移、已验证的变换（算法/密钥/轮数）；\n'
+          + '② 用这些已知量写一段 **run_python 直接可跑的脚本框架**——即使还不能解出最终 flag，'
+          + '也必须能跑出"当前能做到哪一步"（例如：解密到第几字节、校验到哪个分支、还原出哪段中间数据）；\n'
+          + '③ 运行它，把真实输出贴出来；脚本报错就修正后重跑。\n'
+          + '最后**必须**输出 [VERIFY]...[/VERIFY]（可验证的算法/密钥/变换契约）'
+          + '或 [HYPOTHESES][...][/HYPOTHESES]（候选结论，按可信度排序）。'
+          + (lastChance ? '\n⏰ **最后机会**：这一轮若仍无法给出 [VERIFY]，给出 [HYPOTHESES] 候选也行——'
+            + '把最可能的 1-3 个假设连同支持它们的地址/常量一起写出来，不要再用概括性描述收工。' : '') }] });
+        console.log(`[Tool Use] 落地检查单：有进展但无契约，要求写成可跑脚本（第 ${landNudgeCount} 次）`);
+        try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('claude-tool-event', { phase: 'gate', tool: 'gate', message: `[Tool Use] 落地检查单：有进展但无契约，要求写成可跑脚本（第 ${landNudgeCount} 次）` }); } catch (e) { /* 闸日志旁路失败不影响判据 */ }
+        continue;
+      }
+
+      // ── 分层收尾第四级：零新数据拦截（P0.3）──
+      // 还有一类收工既无 flag/契约、也没声明卡点，但文本里连一个本轮真实读到的
+      // 字节/常量/代码片段都没有，只有"程序先做 A 再做 B"的概括。前三级催"继续挖/落地"
+      // 时，模型可以把同一段概括换个说法再交一遍；这里只认"能与工具输出对上的硬数据"，
+      // 没有就逼它先取数。探针取本轮 response.text + 最近一条 tool_result：
+      // tool_result 是模型本轮真正看到的原始输出，能兜住"文本没引用但确实读到了字节"的情况。
+      const recentToolText = (() => {
+        for (let i = conversationHistory.length - 1; i >= 0; i--) {
+          const m = conversationHistory[i];
+          if (m.role === 'user' && Array.isArray(m.content)) {
+            const parts = m.content.filter(c => c.type === 'tool_result')
+              .map(c => String(c.content == null ? '' : c.content));
+            if (parts.length) return parts.join('\n');
+          }
+        }
+        return '';
+      })();
+      const newDataProbe = (response.text || '') + '\n' + recentToolText;
+      // (a) 十六进制串 ≥8 位；纯英文单词（deadbeef/feedback 这类）不算，要求含数字或长到 16 位。
+      const hexLike = (newDataProbe.match(/[0-9a-fA-F]{8,}/g) || []).some(s => /[0-9]/.test(s) || s.length >= 16);
+      // (b) 反编译代码特征：有 ; { } 之一，且有 = 或 (
+      const decompiledLike = /[;{}]/.test(newDataProbe) && /[=(]/.test(newDataProbe);
+      // (c) 计算结果：等号后跟具体数值（十进制或 0x 十六进制）
+      const computedLike = /=\s*(?:0x[0-9a-fA-F]+|\d+)/.test(newDataProbe);
+      // (d) 至少一段 ≥20 字符的引号内字符串（真实读到的表项/密钥/常量串）
+      const quotedLike = /"[^"\r\n]{20,}"|'[^'\r\n]{20,}'/.test(newDataProbe);
+      const hasNewData = hexLike || decompiledLike || computedLike || quotedLike;
+      // 同轮只催一次（取第一命中）：前三层已命中的本轮已在上面 continue，这里再显式排除，
+      // 防止以后调整顺序时两层叠加、把 2 次额度一次烧光。
+      const dataNudge = didUseTools && !gaveConclusion && !statedBlocker && !hasNewData
+        && budgetLeft > 0.33 && dataNudgeCount < 2 && !shallowGiveUp && !landNudge;
+      if (dataNudge) {
+        dataNudgeCount++;
+        conversationHistory.push({ role: 'assistant', content: response.content && response.content.length ? response.content : [{ type: 'text', text: response.text }] });
+        conversationHistory.push({ role: 'user', content: [{ type: 'text', text:
+          '（检测到本轮**没有任何新增的字节级数据**：既没有十六进制字节串、没有反编译代码片段，'
+          + '也没有算出来的数值，只有概括性描述。这样的收工等于整题白做。）\n'
+          + '请立刻取一次真实数据再说话，二选一：\n'
+          + '① 调 ida_get_bytes 读取你刚才提到的关键位置的真实字节——例如校验函数附近引用的常量表地址、'
+          + '输入缓冲区、循环里引用的 .rodata 地址；把返回的十六进制字节原样贴出来；\n'
+          + '② 调 run_python 写一个最小脚本，算出至少一个具体数值（首轮变换结果、长度、校验目标值等），'
+          + '把脚本的真实输出贴出来。\n'
+          + '拿到真实字节/数值后，再基于它们给出 [VERIFY] 契约或 [HYPOTHESES]。'
+          + '不要再用"程序做了什么"的描述收工。' }] });
+        console.log(`[Tool Use] 零新数据拦截：无字节/数值，要求取数（第 ${dataNudgeCount} 次）`);
+        try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('claude-tool-event', { phase: 'gate', tool: 'gate', message: `[Tool Use] 零新数据拦截：无字节/数值，要求取数（第 ${dataNudgeCount} 次）` }); } catch (e) { /* 闸日志旁路失败不影响判据 */ }
+        continue;
+      }
+
       return {
         success: true,
         text: response.text
@@ -6044,6 +6265,8 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
     if (response.toolCalls && response.toolCalls.length > 0) {
       // 限制工具调用数量
       const toolCalls = response.toolCalls.slice(0, 3);
+      // 跨压缩标记：只要本会话出现过脚本工具，就说明"骨架已动手"，第 16 轮的催促不该再触发。
+      if (toolCalls.some(tc => tc && SCRIPT_TOOL_RE.test(tc.name))) sawScriptTool = true;
 
       // ── 多阶段接力：一旦出现 switch_to_next_stage，立即中断本阶段循环 ──
       // 切换涉及 UI 状态 / CASE 目录 / 外部进程管理，必须由渲染层执行；

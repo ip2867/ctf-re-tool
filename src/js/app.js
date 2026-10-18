@@ -241,6 +241,7 @@ function setupToolEventListener() {
     if (info.phase === 'start') startToolRow(info);
     else if (info.phase === 'done') finishToolRow(info, false);
     else if (info.phase === 'error') finishToolRow(info, true);
+    else if (info.phase === 'gate') addLog('warning', info.message || info.label || '闸触发');
   });
 }
 
@@ -10033,6 +10034,46 @@ async function finalizeSolve(aiText, opts = {}) {
   if (neg && neg.refuted.length && !verifiedFlags.length) {
     return { vr, flags, verifiedFlags, refuted: neg.refuted, retryPrompt: neg.retryPrompt };
   }
+
+  // ===== 中间值命中 → 告诉 AI「这个值是什么类型、下一步该做什么」=====
+  // 实测（CrackMe，四道闸上线后）：本地复现命中 `55a54008ad1ba589aa210d2629c1df41`，
+  // 工具只记录"命中中间值/密钥，非 flag"，然后重试 17 秒就结束——因为 AI
+  // 完全不知道这个 32 位 hex 意味着什么。它不是"再解一层"的密文，而是 md5(某输入)，
+  // 正确的下一步是「爆破/字典匹配」，不是「换算法再解」。
+  // 这类"形态可判、动作可定"的中间值在 CTF 里极常见，工具应当直接给出下一步。
+  if (!verifiedFlags.length && vr && Array.isArray(vr.hits) && vr.hits.length) {
+    // ── 命中"可打印明文"时先做自动外壳尝试（P0.4b）──
+    // 实测（reverse3）：本地复现命中 `{i_l0ve_you}`，只差 `flag` 前缀就是答案；
+    // 实测（新年快乐）：命中 `HappyNewYear!`；实测（Crackme7）：命中 `THISiSsERIALnUMBER`。
+    // 这三道都被记为"只命中中间值"而失败——工具明明拿到了近乎完整的答案，
+    // 却因为不是 `flag{...}` 形态而不认。这里直接尝试常见外壳，命中即记为已验证。
+    if (wrapPrintableHit(vr.hits)) {
+      verifiedFlags = (state.findings ? state.findings.flags : []).filter(f => f.verified);
+      if (verifiedFlags.length) {
+        addLog('success', `[验证闭环] 可打印明文加常见外壳后命中 flag：${verifiedFlags[0].flag}`);
+        return { vr, flags, verifiedFlags, wrappedFromPrintable: true };
+      }
+    }
+    const typed = classifyIntermediateValues(vr.hits);
+    if (typed.length) {
+      const retry = [
+        '本地验证**成功复现了你的计算**，但解出的值不是 flag 形态的明文。工具已识别出它们的类型：',
+        '',
+        ...typed.map(t => `- \`${t.value}\` → **${t.kind}**：${t.next}`),
+        '',
+        '请按上面的「下一步」直接执行，不要重复已经验证过的这一步：',
+        '· 若是哈希（MD5/SHA）→ 用 run_python 做字典/短串爆破（常见词、数字、题面提示）；',
+        '· 若是密钥/IV → 用它去解**下一层**（找另一段密文，或对当前输入再跑一次解密）；',
+        '· 若是 UUID/路径/URL 形态 → 在二进制与资源里搜同样的串，找引用它的校验逻辑；',
+        '· 若已是可打印明文 → 它可能就是 flag 本体，按题目要求加外壳（如 flag{...}）后用 [VERIFY] 复验。',
+        '',
+        '拿到下一层结果后，必须输出 [VERIFY]（新的算法/密钥/密文）或 [FLAG]。',
+      ].join('\n');
+      addLog('info', `[验证闭环] 命中中间值并识别类型 ${typed.map(t => t.kind).join('/')}，已生成定向下一步提示`);
+      return { vr, flags, verifiedFlags, retryPrompt: retry, intermediateTyped: typed };
+    }
+  }
+
   // ===== 验证失败 → 生成"基于真实输出"的修正提示 =====
   // 这是"举一反三"的核心：AI 不是因为算法不会而失败，而是因为**它看不到自己的假设错在哪**。
   // 把本地复现的真实结果（报错/解出什么/差在哪）回灌，让它带着证据修正，而不是重头再来。
@@ -10071,6 +10112,78 @@ async function finalizeSolve(aiText, opts = {}) {
     return { vr, flags, verifiedFlags, retryPrompt: retry, decodedLayer: dl.count };
   }
   return { vr, flags, verifiedFlags };
+}
+
+// 可打印明文 → 尝试常见外壳，命中即记为已验证 flag。
+// 判据保守：只对"整段都是可打印 ASCII、长度 4~120、不含空白换行"的值尝试，
+// 避免把一段描述性文本误当答案。外壳只试 CTF 里确定存在的几种。
+// 返回是否至少命中一个。
+function wrapPrintableHit(hits) {
+  let any = false;
+  for (const raw of (Array.isArray(hits) ? hits : []).slice(0, 6)) {
+    const v = String(raw == null ? '' : raw).trim();
+    if (v.length < 4 || v.length > 120) continue;
+    // 必须整段可打印、无空白（有空白的多半是句子/描述）
+    if (!/^[\x21-\x7e]+$/.test(v)) continue;
+    // 已经是 flag 形态（由 lookFlag 处理），跳过
+    if (looksLikeFlag(v)) continue;
+    const candidates = [];
+    // 已带花括号：{xxx} → flag{xxx}
+    if (/^\{[^{}]+\}$/.test(v)) candidates.push('flag' + v);
+    // 裸明文 → flag{明文}
+    candidates.push('flag{' + v + '}');
+    for (const c of candidates) {
+      if (looksLikeFlag(c)) {
+        recordFlag(c, 'printable-wrap', true);
+        addSolveNote('明文外壳命中', `${v} → ${c}`);
+        any = true;
+        break;
+      }
+    }
+  }
+  return any;
+}
+
+// 识别"中间值"的形态并给出下一步动作。
+// 设计原则：只认**值的形态本身**能确定的类型，不猜题目。
+// 例：32 位 hex 且是合法 md5 → "可能是 md5(某输入)"，下一步是爆破/字典；
+//     但这只是"可能"——所以 next 里必须同时给出"若不是哈希该怎么办"的退路。
+function classifyIntermediateValues(hits) {
+  const out = [];
+  const seen = new Set();
+  const push = (value, kind, next) => {
+    const k = value + '|' + kind;
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push({ value, kind, next });
+  };
+  for (const raw of (Array.isArray(hits) ? hits : []).slice(0, 8)) {
+    const v = String(raw == null ? '' : raw).trim();
+    if (!v || v.length < 4) continue;
+    const hex = /^(0x)?[0-9a-fA-F]+$/.test(v);
+    const hexLen = hex ? v.replace(/^0x/i, '').length : 0;
+    if (hex && hexLen === 32) {
+      push(v, '32 位十六进制（MD5 长度）',
+        '最可能是 **md5(某段输入)**：用 run_python 对「题面提示词 + 常见弱口令 + 程序里的字符串常量」做字典/短串爆破；'
+        + '若爆破无果，它也可能是**未被加密的原始密钥/标识**，直接用于下一层解密或搜索引用');
+    } else if (hex && hexLen === 40) {
+      push(v, '40 位十六进制（SHA1 长度）', '可能是 **sha1(输入)**：同样先字典/短串爆破；也可能是原始字节的 hex 表示');
+    } else if (hex && hexLen === 64) {
+      push(v, '64 位十六进制（SHA256 长度）', '可能是 **sha256(输入)**：字典爆破；或原始 32 字节密钥/摘要');
+    } else if (hex && hexLen >= 8 && hexLen % 2 === 0) {
+      push(v, `${hexLen / 2} 字节的十六进制数据`, '原始字节：尝试按 ASCII/UTF-16 解码看是否可打印；若是密文，用它作为下一层的 ciphertext 继续解');
+    } else if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)) {
+      push(v, 'UUID 形态', '通常是**题目生成的标识/注册码**：在二进制与资源里搜同样的格式或生成逻辑，找到它被校验的位置');
+    } else if (/^https?:\/\//i.test(v)) {
+      push(v, 'URL', '在二进制/资源里搜该 URL 或域名片段，定位与之关联的校验或下载逻辑');
+    } else if (/^[A-Za-z0-9+/]{16,}={0,2}$/.test(v) && v.length % 4 === 0) {
+      push(v, 'Base64 形态', '先 base64 解码看是否得到可打印明文；解不出就把它当下一层的输入');
+    } else if (/^[\x20-\x7e]{6,}$/.test(v)) {
+      push(v, '可打印明文', '它可能就是 flag 本体（若题目要求包裹则加 `flag{...}`），或是一段密钥/提示：'
+        + '先用 [VERIFY] 复验这个明文，再判断是否需要再解一层');
+    }
+  }
+  return out;
 }
 
 // ========== 负面断言反证（Phase 2）==========

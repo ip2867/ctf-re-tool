@@ -24,6 +24,30 @@ EXE/ELF → DIE查壳 → (有壳:脱壳) → IDA静态
 | VMP/Themida | 高熵段、虚拟机字节码 | 动态 dump + 修复 IAT（x64dbg/VMP 分析工具），或绕过不脱壳直接动态分析 |
 | .NET | mscoree 引用 | 转 dnSpy 流程（de4dot 去混淆） |
 
+### 1.1 UPX 脱壳（完整可落地步骤）
+
+1. **查壳**：DIE/ExeinfoPE 确认是 UPX（段名 `UPX0`/`UPX1`/`UPX2`）
+2. **脱壳**：`upx -d <完整路径>`
+3. **失败时修区段名**：UPX 脱壳对区段名敏感；用 010 Editor 打开，把被改过的区段名改回 UPX 原始名（大小写以查壳工具为准），保存后重新 `upx -d`
+4. **脱壳后必须重扫算法指纹**：壳里的 S 盒/常量表此时才可见，重跑 `scan_crypto`
+
+### 1.2 手动脱壳（ESP 定律，非 UPX 壳用）
+
+**适用**：VMP/Themida/自定义壳，或 UPX 脱壳失败。
+**工具**：32 位用 x32dbg，64 位用 x64dbg（OllyDbg 只能 32 位）。
+
+**步骤**：
+1. 拖入调试器，F9 运行到第一个 `push` 指令，记下 ESP 值（如 `61FF78`）
+2. F8 单步，让壳把寄存器压栈
+3. 在内存窗口跟踪**原 ESP 地址**，右键设硬件断点（壳解压完会回到这里）
+4. F9 跑到断点，F8 继续；遇死循环就在循环下方设断点用 F4 跳过
+5. **大跳转通常就是 OEP**（跨段的长跳）
+6. Scylla 插件 Dump → 保存文件
+7. 修 IAT：Scylla 里 `Get Imports` 获取地址 → `Fix Dump` 修复，生成可用文件
+8. 验证运行正常 → 拖入 IDA 分析
+
+**注意**：脱壳只是手段。若只是要拿运行时的常量/密钥，**不脱壳也可以**——直接用 Frida 在壳解密完成后 Hook 取数据（见第 6 节）。
+
 ## 2. IDA 定位关键函数（命中率从高到低）
 
 1. **Strings 窗口**搜 `flag/correct/wrong/success/key/password` → 交叉引用（X键）到使用处
@@ -77,6 +101,115 @@ mingw/gcc 运行时会带一批"长得像关键函数"的噪声，选关键函�
 - 校验常量按**有符号 int8** 存放：`-89` 即 `0xA7`，比较两边都要 `& 0xff`
 - "就地写回" opcode 会覆盖输入缓冲，改变后续读到的值——模拟器不能偷懒跳步骤
 - 字节码表里 `7, x, 7, y, ...` 连续成串的"opcode 7 + 操作数"就是逐字节校验序列，直接给 AI 当靶子
+
+### 4.1 单指令 VM（NAND-only 型）
+
+另一种 VM 形态：**只有一种指令**（典型：`v[a] = ~(v[b] & v[c])`），靠 NAND 完备性构造所有逻辑。
+d3sky 就是这种：没有结构体、没有 vm_init/vm_start，但本质一致。
+
+**识别**：
+- 解释器里没有 switch/dispatch 大循环，只有**一条** `~(x & y)` 赋值在循环里反复执行
+- 输入按 4 字节一组处理（opcode[2772..] 是输入存储区）
+- 有标志位：某位置 1 时输出、置 0 时读输入（opcode[2]/opcode[7]/opcode[19]）
+
+**求解**：
+- 每个输入字节的变换是**独立的 XOR 链**：`cpdata[i] = in[i] ^ in[i+1] ^ in[i+2] ^ in[i+3]`
+- 直接 z3：37 个 BitVec + 34+3 条异或约束（末尾循环回开头）
+- **z3 副本陷阱**（教程实测 10 小时坑）：对 flag 做 encode 时必须先 `encoded = encode(flag.copy())`，
+  否则符号变量与位运算优先级会混乱，解出的值满足约束但不是真 flag
+
+### 4.2 VM 反调试：TLS 回调
+
+除常规 `IsDebuggerPresent` 外，还有**线程回调**：`TlsCallback_0` 在线程创建时先于 main 执行。
+典型对抗：检测调试状态 → 故意触发访问异常（读地址 0）→ 异常处理里跑真逻辑。
+**绕过**：调试器停在 `IsDebuggerPresent` 返回后，把 eax 从 1 改 0；**不要改跳转指令**
+（jz→jnz 会破坏后面的除零异常分支，程序依然起不来）。
+
+### 4.3 模拟器之外的两条正路
+
+教程里的三种解法按场景选择：
+
+| 解法 | 适用 | 关键 |
+|---|---|---|
+| **手撕逆推** | opcode 操作都是可逆的（xor/加减/移位） | 从后往前反着跑 opcode，每步撤销变换 |
+| **z3 约束** | 操作复杂但确定（混合运算/条件分支） | 建符号变量 + 把校验点全部转成约束；**必须先建副本再 encode** |
+| **Frida 插桩爆破** | 单字节/双字节校验、程序能跑起来 | 逐字节试 32~126，看哪一位让"通过计数"增加 |
+
+#### 4.3.1 循环分割识别法（第三篇教程）
+
+打印出来的伪指令往往上千行，但真正有用的结构是**重复块**：
+- 找一个"边界指令"（如 `jmp to fun0`、`R0=R1-->zf=0`、某个固定寄存器被赋值）
+- 以它为界把整段切成 N 个块，每块结构几乎一致（只是下标 +1）
+- 只分析第一块，其余照推——这是把"一千行指令"压缩成"40 个相同块"的关键
+
+#### 4.3.2 Frida 爆破的完整框架（可直接抄）
+
+适用：单字节/双字节校验、程序能正常跑、校验结果可通过某种"计数"区分。
+
+```python
+import subprocess, frida, time
+
+known_flag = b''
+flaglen = 40
+target = r"C:\path\to\vm.exe"
+
+jscode = open("frida/hook.js", "rb").read().decode()
+
+def brute(F):
+    def on_message(message, data):
+        global result
+        if message['type'] == 'send': result = message['payload']
+    process = subprocess.Popen(target, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, universal_newlines=True)
+    session = frida.attach(target.split('\\')[-1])
+    script = session.create_script(jscode)
+    script.on('message', on_message); script.load()
+    process.stdin.write(F.decode()); output, _ = process.communicate()
+    process.terminate()
+    return result
+
+count = len(known_flag)
+new_number = brute(bytearray(known_flag + b' ' * (flaglen - len(known_flag))))
+st = time.time()
+while count < flaglen:
+    flag = bytearray(known_flag + b' ' * (flaglen - len(known_flag)))
+    number = brute(flag)
+    if number != new_number:
+        new_number = number; count += 1
+    else:
+        flag[count] += 1
+        if flag[count] > 127: flag[count] = ord('?'); count += 1
+print("耗时", time.time() - st)
+print(flag.decode())
+```
+
+**关键**：`hook.js` 里 Hook 的是校验函数，把"已通过的字符数"作为 payload 发回 Python；
+爆破侧逐位试，只要返回值变化就说明这一位对了。
+
+#### 4.3.3 z3 的完整约束模板（可直接抄）
+
+```python
+from z3 import *
+
+input = [BitVec('input_%d' % i, 8) for i in range(N)]   # N = flag 长度
+cpdata = [0x0024, 0x000B, ...]                            # 校验值（从二进制读）
+
+solver = Solver()
+for i in range(N-3):
+    solver.add(cpdata[i] == (input[i] ^ input[i+1] ^ input[i+2] ^ input[i+3]))
+# 末尾循环回开头（如有）
+solver.add(cpdata[N-3] == (input[N-3] ^ input[N-2] ^ input[N-1] ^ input[0]))
+solver.add(cpdata[N-2] == (input[N-2] ^ input[N-1] ^ input[0] ^ input[1]))
+solver.add(cpdata[N-1] == (input[N-1] ^ input[0] ^ input[1] ^ input[2]))
+# 末位限制（题目给定，如最后一位是 ~）
+solver.add(input[N-1] == 126)
+
+if solver.check() == sat:
+    m = solver.model()
+    print(bytes([m[input[i]].as_long() for i in range(N)]))
+```
+
+**副本陷阱**：对 flag 做变换时必须先 `encoded = transform(flag.copy())`，否则位运算优先级混乱。
 
 ## 5. 反调试常见点（详见 ctf-antidebug skill）
 

@@ -78,5 +78,30 @@ console.log('\nG) 空输出/空候选不崩');
   ok(attributeFailure(null, null).total === 0, 'null 输入不崩');
 }
 
+console.log('\nH) 解出机器码 → 归因为"这是下一层代码"，而不是"换算法"（CrackMe3 实测）');
+{
+  // 真实输出：AI 用自定义 RC4 变体解出一段 x86 函数（sub esp,0x18 … ret nop nop）
+  const x86 = '83ec18b065b163884424048844240d88442410884424128d442400b273884c2402884c2403884c240e8b4c241c5088542404885424098854240a6a00b2726a0c51c644241175c644241721c644241879c64424196fc644241a75c644241b618854241cc644241f6cc64424217688542423c644242400ff54243083c418c39090';
+  const out = [
+    '[MISS] attempt=0 algo=custom keyenc=ascii stage=verify result=no-flag preview=' + x86.slice(0, 96),
+    '[OUT] attempt=0 keyenc=ascii: ' + x86,
+  ].join('\n');
+  const r = attributeFailure(out, [{ algo: 'custom', key_encoding: 'ascii', key: '771535' }]);
+  ok(r.summary.decodedLayer >= 1, `识别出解码层 ${r.summary.decodedLayer} 处`);
+  ok(/可执行机器码/.test(r.text), '归因指出解出的是机器码');
+  ok(/不要换算法/.test(r.text), '明确禁止换算法');
+  ok(/switch_to_next_stage/.test(r.text), '给出接力下一层的具体动作');
+  // 关键：不能同时出现"优先换算法族"这种反向建议
+  ok(!/优先换算法族/.test(r.text), '不出现反向建议（换算法族）');
+}
+
+console.log('\nI) 普通明文不可被误判为机器码');
+{
+  const out = '[MISS] attempt=0 algo=aes_ecb keyenc=ascii stage=verify result=no-flag preview=flag{hello_world_123}';
+  const r = attributeFailure(out, attempts);
+  ok(r.summary.decodedLayer === 0, '明文不触发解码层归因');
+  ok(!/可执行机器码/.test(r.text), '不误报机器码');
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

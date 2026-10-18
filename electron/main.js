@@ -412,9 +412,33 @@ ipcMain.handle('detect-file-type', async (event, filePath) => {
 
     // 读取文件头（魔数）
     const buffer = Buffer.alloc(16);
-    const fd = fs.openSync(filePath, 'r');
-    fs.readSync(fd, buffer, 0, 16, 0);
-    fs.closeSync(fd);
+    let fd;
+    try {
+      fd = fs.openSync(filePath, 'r');
+      fs.readSync(fd, buffer, 0, 16, 0);
+    } catch (openErr) {
+      // Windows Defender 等杀软会拦截对特定样本的**任何**读取，Node 报的是
+      // `UNKNOWN: unknown error, open '...'`（无 errno，极易被当成路径错误）。
+      // 实测（CrackMe4）：解压成功、文件在盘上，但整题 1 秒"跳过"，报告里记为工具失败。
+      // 这里显式识别并给出可操作诊断，让调用方能把它归为**环境阻断**而不是解题失败。
+      const msg = String(openErr && openErr.message || '');
+      const blocked = /UNKNOWN|EPERM|EACCES|operation not permitted/i.test(msg) | (openErr && openErr.code === 'UNKNOWN');
+      if (blocked && fs.existsSync(filePath)) {
+        const st = (() => { try { return fs.statSync(filePath); } catch (e) { return null; } })();
+        return {
+          success: false,
+          blocked: true,
+          fileType: 'BLOCKED',
+          error: `文件存在但无法读取（${st ? st.size + ' 字节' : '大小未知'}）——典型原因是被杀软/Defender 实时保护拦截。`
+            + `请在 Windows 安全中心把该目录（${path.dirname(filePath)}）加入排除项后重试；`
+            + `本工具无法绕过系统级文件访问拦截。`,
+          rawError: msg,
+        };
+      }
+      throw openErr;
+    } finally {
+      if (fd !== undefined) { try { fs.closeSync(fd); } catch (e) {} }
+    }
 
     const magic = buffer.toString('hex', 0, 4).toUpperCase();
     console.log('Magic:', magic);
@@ -558,7 +582,9 @@ const CRYPTO_FP = [
   ['TEA-DELTA', 'b9 79 37 9e', 'TEA/XTEA delta 0x9E3779B9（小端）'],
   ['TEA-DELTA-INV', '47 c8 86 61', 'TEA delta 取反 0x61C88647（小端）'],
   ['CRC32-POLY', '20 83 b8 ed', 'CRC32 多项式 0xEDB88320（小端）'],
-  ['RC4-ID', '00 01 02 03 04 05 06 07 08 09', 'RC4 KSA 初值/常见排列'],
+  // ⚠️ 旧条目 '00 01 02 03 04 05 06 07 08 09' 已删除：这 10 个字节几乎出现在每个程序里
+  // （栈/结构体/索引数组的初始化），实测 20 题里 12 题被打上"RC4（疑）"，全是误报，
+  // 反而把 AI 引向错误算法族。RC4 的确定性特征是**完整 0..255 递增表**，见下方 rc4TableHit。
   ['B64-STD', '41 42 43 44 45 46 47 48 49 4a 4b 4c 4d 4e 4f 50 51 52 53 54 55 56 57 58 59 5a 61 62 63 64 65 66 67 68 69 6a 6b 6c 6d 6e 6f 70 71 72 73 74 75 76 77 78 79 7a 30 31 32 33 34 35 36 37 38 39 2b 2f', '标准 Base64 表'],
 ];
 
@@ -1087,6 +1113,26 @@ function payloadRecipe(p) {
 function payloadDescription(p, count) {
   const off = '0x' + p.offset.toString(16);
   const e = p.encode || { kind: 'none' };
+
+  // 编码表（Base64/Base91 变表）不是"载荷"：它是**算法数据**，不能得出"本层是 loader"的结论。
+  // 实测（cnbragon / kanxue-ctf-gxustudent）：Data 段里一张 Base91 变表被 typeName 兜底成
+  // "shellcode"，summary 直接断言"本层是 loader、必须提取下一层"，而同一份扫描里 AES 已是 high
+  // 置信度——AI 因此放着确定的主逻辑不逆，去 dump 一个不存在的 payload，整题烧完预算。
+  if (p.type === 'table') {
+    return {
+      algo: p.label || '编码变表',
+      confidence: p.confidence || 'medium',
+      evidence: `在文件偏移 ${off} 处发现 ${p.length} 字节的**编码字符表**（${p.head}…）`
+        + (typeof e.key === 'number' ? `，与标准表相同位置 ${e.key}/${p.length}` : '')
+        + '。这是**算法的数据表**，不是可执行载荷。',
+      note: '含义：程序很可能使用**自定义表**的 Base64/Base91 编码（改表不改算法，标准库直接解会失败）。'
+        + '按反编译确认：① 该表被哪个函数引用；② 编码是 4→3（Base64）还是 13 位分组（Base91）；'
+        + '③ 把标准实现里的表替换成本表。'
+        + '⚠️ 这张表不是可执行载体：不要因为它的存在去 dump 内存里的所谓下一阶段代码；'
+        + '若同时命中 AES/SM4 等算法常量，主逻辑就在本层。',
+    };
+  }
+
   const typeName = p.type === 'pe' ? 'PE' : p.type === 'elf' ? 'ELF' : p.type === 'dex' ? 'DEX' : 'shellcode';
   let how;
   switch (e.kind) {
@@ -1102,7 +1148,7 @@ function payloadDescription(p, count) {
   }
   const strideNote = (e.kind !== 'none' && e.stride > 1) ? `每项占 ${e.stride} 字节、只取低字节；` : '';
   const lenTxt = p.length ? `，推算长度 ${p.length} 字节` : '';
-  const isContainer = p.type !== 'shellcode';
+  const isContainer = p.type !== 'shellcode' && p.type !== 'table';
   const evidence = `在文件偏移 ${off} 处发现**${how}**的 ${typeName} 载荷（${strideNote}故明文搜头部搜不到）：解码后为合法可执行载荷${lenTxt}`
     + (count > 1 ? `；另有 ${count - 1} 处候选` : '');
   const note = isContainer
@@ -2318,6 +2364,29 @@ function scanCryptoFingerprints(filePath) {
     }
   }
 
+  // 1.5) RC4 初值表：必须是**完整 0..255**（连续字节或 dword 步长）才算证据。
+  // 只匹配 "00 01 02 03..." 这种前缀会把几乎所有程序（索引数组/结构体初始化）都误判成 RC4。
+  {
+    let rc4Off = -1, rc4Stride = 0;
+    for (let off = 0; off + 256 <= size && rc4Off < 0; off++) {
+      if (buf[off] !== 0 || buf[off + 255] !== 255) continue;
+      let ok = true;
+      for (let i = 0; i < 256; i++) { if (buf[off + i] !== i) { ok = false; break; } }
+      if (ok) { rc4Off = off; rc4Stride = 1; }
+    }
+    if (rc4Off < 0) {
+      for (let off = 0; off + 1024 <= size && rc4Off < 0; off++) {
+        if (buf[off] !== 0 || buf[off + 1020] !== 255) continue;
+        let ok = true;
+        for (let i = 0; i < 256; i++) {
+          if (buf[off + i * 4] !== i || buf[off + i * 4 + 1] !== 0) { ok = false; break; }
+        }
+        if (ok) { rc4Off = off; rc4Stride = 4; }
+      }
+    }
+    if (rc4Off >= 0) out.push({ fp: 'RC4-ID', desc: `完整 0..255 初值表（stride=${rc4Stride}）`, offset: '0x' + rc4Off.toString(16), algo: 'RC4' });
+  }
+
   // 2) 256 项双射表（S 盒候选：0..255 每值恰出现一次）
   //    ⚠️ 必须同时扫**定长步长**形态：C 代码里 S 盒常声明为 `unsigned int sbox[256]`，
   //    即使值域只有 0..255 也占 4 字节/项（`8e 00 00 00 2f 00 00 00 ...`）。
@@ -2543,7 +2612,7 @@ function scanCryptoFingerprints(filePath) {
   if (has('MD5-IV')) summary.push({ algo: 'MD5', confidence: 'medium', evidence: 'MD5 IV', note: '哈希：爆破/碰撞/截断比较。' });
   if (has('SHA256-IV')) summary.push({ algo: 'SHA256', confidence: 'medium', evidence: 'SHA256 IV', note: '哈希：同上。' });
   if (has('CRC32-POLY')) summary.push({ algo: 'CRC32', confidence: 'medium', evidence: 'CRC32 多项式', note: '短输入可碰撞爆破（注意自定义初值/异或）。' });
-  if (has('RC4-ID')) summary.push({ algo: 'RC4（疑）', confidence: 'low', evidence: '出现 00 01 02.. 连续初值（RAM 初始化特征，非铁证）', note: '需在代码中确认 KSA/PRGA。' });
+  if (has('RC4-ID')) summary.push({ algo: 'RC4', confidence: 'medium', evidence: '完整 0..255 初值表（KSA 初始化特征）', note: '按 RC4 解；仍需在代码中确认 KSA 循环（`j=(j+S[i]+key[i%len])&0xff`）。' });
   if (has('B64-STD')) summary.push({ algo: 'Base64', confidence: 'low', evidence: '标准 Base64 表', note: '编码非加密；可能是自定义表 Base64 的对照。' });
 
   // 4.5) 无任何算法指纹 → 关键判定（实测 Disguise：第一层是 XOR 编码的内嵌 PE + decoy 表，
@@ -4763,7 +4832,12 @@ ipcMain.handle('ctf2-unzip', async (event, zipPath) => {
     const tmpZip = /\.(zip)$/i.test(zipPath) ? zipPath : path.join(app.getPath('temp'), 'ctf2_unzip_' + Date.now().toString(36) + '.zip');
     if (tmpZip !== zipPath) { try { fs.copyFileSync(zipPath, tmpZip); } catch (e) { return { success: false, error: '复制为 .zip 失败: ' + e.message }; } }
     try {
-      execSync('powershell -NoProfile -Command "Expand-Archive -Path \'' + tmpZip + '\' -DestinationPath \'' + dir + '\' -Force"', { timeout: 90000, stdio: 'ignore' });
+      // ⚠️ 路径里的 [ ] 会被 PowerShell 当通配符（题目名常含 [GUET-CTF2019] 这类方括号）：
+      // 实测 Expand-Archive -Path 'E:\...[GUET-CTF2019]re\attachment.zip' 直接失败，
+      // 整道题在解压步骤就结束。用 -LiteralPath 并转义单引号。
+      const psq = (s) => "'" + String(s).replace(/'/g, "''") + "'";
+      execSync('powershell -NoProfile -Command "Expand-Archive -LiteralPath ' + psq(tmpZip) + ' -DestinationPath ' + psq(dir) + ' -Force"',
+        { timeout: 90000, stdio: 'ignore' });
     } finally {
       if (tmpZip !== zipPath) { try { fs.rmSync(tmpZip, { force: true }); } catch (e) {} }
     }
@@ -5806,6 +5880,13 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
   // 25 次总在"写最终脚本"之前耗尽。放宽到 60，可用环境变量 CTF_MAX_TOOL_ITER 覆盖。
   const MAX_TOOL_ITERATIONS = parseInt(process.env.CTF_MAX_TOOL_ITER, 10) || 60;
   const SPRINT_AT = parseInt(process.env.CTF_SPRINT_AT, 10) || 50; // 冲刺触发点
+  // 墙钟预算：轮数上限只约束"轮"，不约束每轮耗时（单轮可含 3 次工具调用，
+  // run_python 单次上限 300s）。实测（CrackMe2/CrackMe5）AI 用 unicorn 单步模拟，
+  // 60 轮远未用完就已跑到批量驱动的 10 分钟硬超时，连"当前进展"都没机会输出。
+  // 这里给循环一个软截止：到点后**不再发新的分析轮**，而是注入一次收尾指令，
+  // 强制模型把已有发现落成结论/接力请求。默认 8 分钟（驱动超时 10 分钟，留 2 分钟余量）。
+  const DEADLINE_AT = Date.now() + (parseInt(process.env.CTF_TOOL_BUDGET_MS, 10) || 8 * 60 * 1000);
+  let deadlineNudged = false;
   let maxIterations = MAX_TOOL_ITERATIONS;
   let lastResponse = null;
   let collectedText = '';
@@ -5870,6 +5951,25 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
       conversationHistory.push({
         role: 'user',
         content: [{ type: 'text', text: '⏱ 冲刺指令：工具预算还剩 ' + (SPRINT_AT) + ' 轮。**立即停止一切新的分析/反编译**，把你已有的全部发现落成最终脚本（run_python）并跑出结果；若脚本失败就修正后重跑。最后必须输出 [FLAG]...[/FLAG] 或 [HYPOTHESES][...][/HYPOTHESES]。' }]
+      });
+    }
+
+    // 墙钟预算到点：同样注入收尾指令（只注入一次）。与轮数冲刺互补——
+    // 慢题（unicorn 单步模拟类）往往轮数没烧完、时间先到，必须靠时间触发收尾，
+    // 否则外层批量驱动的超时会直接把整轮结果丢弃（连"卡在哪"都看不到）。
+    if (!deadlineNudged && Date.now() > DEADLINE_AT && conversationHistory.length > 2) {
+      deadlineNudged = true;
+      const usedMin = Math.round((Date.now() - (DEADLINE_AT - (parseInt(process.env.CTF_TOOL_BUDGET_MS, 10) || 8 * 60 * 1000))) / 60000 * 10) / 10;
+      console.log(`[Tool Use] 墙钟预算用尽（${usedMin} 分钟），注入收尾指令`);
+      conversationHistory.push({
+        role: 'user',
+        content: [{ type: 'text', text:
+          '⏰ **时间预算已用尽**（已运行 ' + usedMin + ' 分钟）。现在**不要再调用任何分析/反编译工具**，'
+          + '只做两件事之一，并立刻结束：\n'
+          + '① 已有足够证据 → 直接给出 [FLAG]...[/FLAG]（附 [VERIFY]）；\n'
+          + '② 已解出下一层可执行内容 → 用 run_python 把它写盘，然后调用 `switch_to_next_stage` 接力；\n'
+          + '③ 都没把握 → 明确写出「当前进展 + 卡点 + 下一步该做什么」，不要空转。'
+        }]
       });
     }
 

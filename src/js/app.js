@@ -8210,8 +8210,30 @@ async function toolUseDeepSolveBinary(analysisData, fileType) {
     sideFilesBlock = `\n## 同包伴生文件（${sideFiles.length} 个${inlined.length ? `，其中 ${inlined.length} 个已内联全文` : ''}）\n${parts.join('\n')}\n⚠️ 输入样例/输出样例/说明文档往往就是解题钥匙——上面对象已给出，**不要凭记忆推演，直接用**。\n`;
   }
   // 平台题目描述（含官方用法说明，如 "Run with pppp -n ..."）：此前被丢弃，AI 每轮都在猜参数语义
+  //
+  // 额外：描述里常直接规定 flag 的**形态**（"提取完整邮箱即为 flag"、"flag 是 32 位 md5"、
+  // "答案为 base64 解码后的字符串"）。这类句子是最高价值的检索目标——实测（相册）题目明确说
+  // "提取完整邮箱即为 flag"，AI 却只拿 flag{test} 去试 UI，从未在二进制里搜邮箱正则。
+  // 这里把描述里能识别的形态抽成清单，要求 AI 按该形态去搜。
+  const descRaw = String(state._platformChallengeDesc || '');
+  const shapeRules = [
+    [/邮箱|e-?mail/i, '邮箱地址 → 在字符串/常量里搜 `[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}`，包成 flag{邮箱}'],
+    [/md5|32\s*位/i, 'MD5/32 位十六进制 → 搜 32 位 hex 串，或对候选明文做 md5'],
+    [/base64/i, 'Base64 → 对可疑串做 base64 解码（注意自定义字符表）'],
+    [/二维码|qr/i, '二维码 → 从图片/资源里解码 QR'],
+    [/十六进制|hex/i, '十六进制串 → 尝试 hex 解码'],
+    [/异或|xor/i, 'XOR → 找单字节/循环 key 做反演'],
+    [/手机号|电话/i, '手机号 → 搜 1[3-9]\\d{9} 形态'],
+    [/邮箱|account|账号/i, '账号类 → 搜资源文件/字符串里的账号字段'],
+  ];
+  const shapes = [...new Set(shapeRules.filter(([re]) => re.test(descRaw)).map(([, s]) => s))];
   const platDesc = state._platformChallengeDesc
     ? `\n## 题目描述（平台官方，含运行用法）\n${String(state._platformChallengeDesc).slice(0, 2000)}\n`
+      + (shapes.length
+        ? `\n### ⚠️ 描述里规定了 flag 的形态——按此定向检索，不要只猜常见 flag 格式\n${shapes.map(s => '- ' + s).join('\n')}\n`
+          + '提示：先在全文件/资源/字符串里按上述形态**正则搜索**（用 run_python 直接读字节扫），\n'
+          + '找到候选后再验证它是否能被程序逻辑复现；不要先假定 flag 是 `flag{...}` 形态去试。\n'
+        : '')
     : '';
   // 成长闭环③：本题历史失败档案注入——已排除的路先摆出来，AI 优先换路而非重蹈覆辙
   const failHint = state._platformChallenge ? await failureHintSection(state._platformChallenge.name) : '';
@@ -8845,14 +8867,34 @@ async function caseAddEvidence(kind, label, content, ext = 'txt') {
 // 诱饵（decoy）过滤：多阶段题**普遍**在某一层埋假 flag 诱导（实测 Disguise 第一层的校验表
 // 解出 "This is a fake flag"，工具却把"中间值命中"当成 ✅ 记下来，看起来像"解出来了"）。
 // 真 flag 不会是这种自曝身份的串——按形态直接剔除，避免"假成功"污染结论与经验库。
-const DECOY_FLAG_RE = /(fake|decoy|dummy|placeholder|not[\s_-]*the[\s_-]*real|try[\s_-]*again|wrong[\s_-]*flag|假\s*flag|这不是|诱饵)/i;
+const DECOY_FLAG_RE = /(fake|decoy|dummy|placeholder|not[\s_-]*(the[\s_-]*)?real|try[\s_-]*again|wrong[\s_-]*flag|假\s*flag|这不是|诱饵)/i;
 function isDecoyFlag(s) {
   return DECOY_FLAG_RE.test(String(s || ''));
 }
+// 常见哈希的"退化输入"摘要：空串/全零/单字符等，说明输入根本没取到，不是解出 flag。
+// 实测（findKey）：工具算出 `d41d8cd98f00b204e9800998ecf8427e` 并当成 flag 提交，
+// 而那是**空字符串的 MD5**——真实含义是"待哈希的输入为空"。
+const DEGENERATE_DIGESTS = new Set([
+  'd41d8cd98f00b204e9800998ecf8427e',   // md5("")
+  'da39a3ee5e6b4b0d3255bfef95601890afd80709', // sha1("")
+  'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', // sha256("")
+  '00000000000000000000000000000000',
+  '0cc175b9c0f1b6a831c399e269772661',   // md5("a")
+  '900150983cd24fb0d6963f7d28e17f72',   // md5("abc") —— 常被用作占位
+]);
+
+function isDegenerateDigest(s) {
+  const t = String(s || '').toLowerCase();
+  // 同时接受 flag{...} 包裹的形态
+  const inner = (t.match(/\{([^}]+)\}/) || [, t])[1];
+  return DEGENERATE_DIGESTS.has(inner.trim());
+}
+
 function looksLikeFlag(v) {
   const s = String(v == null ? '' : v).trim();
   if (!s || s.length < 5 || s.length > 300) return false;
   if (isDecoyFlag(s)) return false;                       // 诱饵串不进 flag 库
+  if (isDegenerateDigest(s)) return false;                // 退化哈希（空输入）不是 flag
   // 标准 flag 形态：prefix{...}
   if (/^[A-Za-z][A-Za-z0-9_]*\{[^}]{1,250}\}$/.test(s)) return true;
   // 带明确 flag 前缀（flag/ctf/NCTF/SCTF...）

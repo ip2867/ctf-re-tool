@@ -66,10 +66,14 @@ function persistToolResult(text, opts = {}) {
 
 // 只清理"内容可重取"的工具；不动 is_error（错误信息是模型纠错的依据），
 // 不动最近 keepRecent 条（模型当前推理的现场）。
+//
+// ⚠️ ida_list_functions 必须**不在**白名单里：它的输出是判断"IDA 到底加载了哪个文件"
+// 的关键证据（实测跨题串台时，正是一模一样的函数列表暴露了问题）。
+// 重新获取代价虽低，但一旦被清掉，"上一题的库被当成本题证据"就再也无法回溯。
 const COMPACTABLE_TOOLS = new Set([
   'read_file', 'bash', 'run_python', 'run_command', 'grep', 'glob',
   'scan_crypto', 'extract_payload', 'analyze_structure',
-  'ida_decompile', 'ida_get_bytes', 'ida_list_functions', 'ida_xrefs',
+  'ida_decompile', 'ida_get_bytes', 'ida_xrefs',
   'gen_block_cipher_solver', 'gen_sm4_solver', 'bash_output',
 ]);
 
@@ -84,12 +88,18 @@ function toolResultSlots(history) {
   return slots;
 }
 
-function microcompact(history, keepRecent = 6) {
+function microcompact(history, keepRecent = 6, toolNameById) {
   const slots = toolResultSlots(history);
   const drop = slots.slice(0, Math.max(0, slots.length - keepRecent));
   let cleared = 0;
   for (const { block } of drop) {
     if (block.is_error) continue;
+    // 白名单过滤：只清"内容可重取"的工具。此前完全没有检查白名单，
+    // 12 条 ida_find_strings 结果被清掉 8 条（其注释明确写着"永不清"）。
+    if (toolNameById && typeof toolNameById.get === 'function') {
+      const name = toolNameById.get(block.tool_use_id);
+      if (name && !COMPACTABLE_TOOLS.has(name)) continue;
+    }
     const body = typeof block.content === 'string' ? block.content
       : JSON.stringify(block.content);
     if (body && body.includes(CLEARED)) continue;
@@ -97,6 +107,19 @@ function microcompact(history, keepRecent = 6) {
     cleared++;
   }
   return { cleared, total: slots.length, kept: slots.length - cleared };
+}
+
+// 从历史里建 tool_use_id → 工具名 映射，供 microcompact 按白名单过滤。
+function buildToolNameMap(history) {
+  const map = new Map();
+  if (!Array.isArray(history)) return map;
+  for (const m of history) {
+    if (!m || m.role !== 'assistant' || !Array.isArray(m.content)) continue;
+    for (const b of m.content) {
+      if (b && b.type === 'tool_use' && b.id) map.set(b.id, b.name);
+    }
+  }
+  return map;
 }
 
 // ---------- B1/B2：重复调用与失败环 ----------
@@ -412,6 +435,7 @@ module.exports = {
   headTailPreview,
   persistToolResult,
   microcompact,
+  buildToolNameMap,
   signatureOf,
   normalizeErrorCategory,
   DoomLoopGuard,

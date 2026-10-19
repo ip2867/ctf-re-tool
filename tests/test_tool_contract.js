@@ -110,5 +110,23 @@ console.log('\nG) toolLabel 的 case 必须对应真实工具名');
   for (const t of MUST) ok(caseNames.includes(t), `toolLabel 覆盖 ${t}`);
 }
 
+console.log('\nH) MCP 字节读取的参数形态与解析（从 tool-result.js require）');
+{
+  const { buildGetBytesAttempts, pyExecArgs } = require('../electron/tool-result.js');
+  const at = buildGetBytesAttempts('0x401000', 16);
+  ok(at.length === 5, `五形态（实际 ${at.length}）`);
+  ok(at[0].regions && at[0].regions[0].addr === '0x401000' && at[0].regions[0].size === 16,
+    '形态1 = regions[{addr,size}]（实测形态优先）');
+  // 新版插件 regions 元素是对象但可能不接受 size：单独一档试探，
+  // 否则"只认 {addr} 对象形态"的服务端会在第 1 档失败后直接跳到裸串形态。
+  ok(at[1].regions && at[1].regions[0].addr === '0x401000' && !('size' in at[1].regions[0]),
+    '形态2 = regions[{addr}]（无 size 的对象形态）');
+  ok(Array.isArray(at[2].regions) && at[2].regions[0] === '0x401000', '形态3 = regions[{addr}] 的字符串简写');
+  ok(at[3].address === '0x401000' && at[3].size === 16 && !('count' in at[3]), '形态4 = {address,size}');
+  ok(at[4].address === '0x401000' && at[4].count === 16 && !('size' in at[4]), '形态5 = {address,count}');
+  const py = pyExecArgs('X');
+  ok(Object.keys(py).length === 1 && py.file_path === 'X', 'pyExecArgs 深等于 {file_path:"X"}');
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

@@ -8,9 +8,18 @@ const https = require('https');
 const { Client: SshClient } = require('ssh2');
 // Agent 运行时（上下文压缩/重复调用护栏/会话持久化），详见 electron/agent-runtime.js
 const {
-  persistToolResult, microcompact, DoomLoopGuard, FailureLoopGuard,
+  persistToolResult, microcompact, buildToolNameMap, DoomLoopGuard, FailureLoopGuard,
   estimateTokens, SessionLog, sanitizeHistoryForResume, compactHistoryDeterministic, pruneDir,
 } = require('./agent-runtime');
+// 去重闸的地址目标指纹层（纯函数，无 Electron 依赖）
+const { createDedupState, checkDedup, setScriptSimilarity } = require('./script-dedup');
+// 工具结果的形态解析与失败判定（纯函数，测试可在无 Electron 的 Node 下直接跑）
+const {
+  ToolCallError, toToolResult,
+  idaGetBytes, scanCryptoCase, runBash,
+} = require('./tool-result');
+// 编译器产物层面的确定性指纹：散落的 MD5 K 轮常量、多 lane 存放的双射表（rank 6）
+const { detectMd5RoundConstants, detectLaneBijectionTables } = require('./crypto-detect');
 
 // ============ 全局异常兜底（防闪退） ============
 // 之前主进程没有任何 uncaughtException/unhandledRejection 处理：任意一个后台任务
@@ -1319,7 +1328,7 @@ function classifySbox(table) {
   return results;
 }
 
-function analyzeCustomBlockConstants(buf, size, sboxOff, sboxStride) {
+function analyzeCustomBlockConstants(buf, size, sboxOff, sboxStride, valueLane) {
   const notes = [];
   const table = [];
   for (let i = 0; i < 256; i++) table.push(buf[sboxOff + i * sboxStride] & 0xff);
@@ -1380,8 +1389,11 @@ function analyzeCustomBlockConstants(buf, size, sboxOff, sboxStride) {
   const sboxRelation = related.length ? related[0] : null;
 
   // ---- 2) 在 S 盒附近搜 32 项 dword 表（SM4 CK 形态）----
-  // 搜索范围：S 盒前后 0x4000 字节，按 4 字节对齐
-  const lo = Math.max(0, sboxOff - 0x4000), hi = Math.min(size - 128, sboxOff + 0x4000);
+  // 搜索范围：S 盒前后 0x4000 字节，按 4 字节对齐。
+  // sboxOff 是**值读取起点**（可能 = 窗口起点 + valueLane），dword 表只能从窗口起点
+  // 按 4 字节对齐开始，否则会错位扫出 unaligned 的假 CK/FK 候选。
+  const windowOff = sboxOff - (valueLane || 0);
+  const lo = Math.max(0, windowOff - 0x4000), hi = Math.min(size - 128, windowOff + 0x4000);
   const looksLikeCK = (off) => {
     // CK 形态判据（放宽）：32 个 dword，且**同一字节位上的增量一致**。
     // 标准 SM4 CK 每项 = 前项 + 0x07070707（四字节各 +7）；魔改题常整体加常量，
@@ -1515,8 +1527,13 @@ function analyzeCustomBlockConstants(buf, size, sboxOff, sboxStride) {
   }
 
   // ---- 4) 字节序线索 ----
+  // valueLane > 0 时值不在 dword 的低字节（cnbragon 是 `00 v v v`，值在 lane 1），
+  // 此时必须明确写出值 lane，否则 AI 会按"低字节"读表得到全 0/错位表。
   if (sboxStride === 4) {
-    notes.push('S 盒按 **dword 数组**存放（每项 4 字节、值在低字节）→ 读表时必须按 4 字节步长取低字节，不能当连续 256 字节读');
+    notes.push(valueLane
+      ? `S 盒按 **dword 数组**存放，值在 **lane ${valueLane}**（窗口起点 0x${(sboxOff - valueLane).toString(16)}）` +
+        `→ 读表用 \`d[0x${sboxOff.toString(16)} + i*4]\`，不要按低字节读`
+      : 'S 盒按 **dword 数组**存放（每项 4 字节、值在低字节）→ 读表时必须按 4 字节步长取低字节，不能当连续 256 字节读');
   }
   if (ckOff >= 0) {
     const asBE = [];
@@ -2437,7 +2454,7 @@ function scanCryptoFingerprints(filePath) {
     for (let i = 0; i < 256; i++) for (let k = 1; k < stride; k++) if (buf[off + i * stride + k] !== 0) return false;
     return true;
   };
-  for (const stride of [1, 4, 2]) {
+  for (const stride of [1, 2]) {
     // 对每个余数类 r，用**定长滑窗**（窗口=256 项）维护 XOR 与和，O(1) 内存、O(n) 时间。
     // 置换窗口满足 XOR=0 且 Sum=32640（必要条件）；通过者才做完整双射检查。
     for (let r = 0; r < stride && sboxCands.length < 6; r++) {
@@ -2457,17 +2474,38 @@ function scanCryptoFingerprints(filePath) {
         if (stride > 1 && !highBytesZero(off, stride)) continue;
         if (isTrivialTable(off, stride)) continue;
         const head = Array.from({ length: 4 }, (_, i) => buf[off + i * stride].toString(16).padStart(2, '0')).join('');
-        sboxCands.push({ off, stride, head });
+        sboxCands.push({ off, stride, head, valueLane: 0 });
         if (sboxCands.length >= 6) break;
       }
     }
     if (sboxCands.length >= 6) break;
   }
-  for (const { off, stride, head } of sboxCands) {
+  // 2.5) 多 lane 双射表：`00 v v v`（cnbragon）与 `v 00 00 00`（dword 数组）是同一类形态。
+  // 旧实现只认"高字节全 0"，把 `00 70 70 70` 直接排除了 → CUSTOM-BLOCK 从未产生。
+  // 判据见 electron/crypto-detect.js：所有承载值的 lane 必须逐项相同，其余 lane 恒定。
+  if (sboxCands.length < 6) {
+    for (const h of detectLaneBijectionTables(buf, 6 - sboxCands.length)) {
+      if (sboxCands.some(c => Math.abs(c.off - h.off) < 1024)) continue;
+      const head = Array.from({ length: 4 }, (_, i) => buf[h.off + i * 4 + h.valueLane].toString(16).padStart(2, '0')).join('');
+      sboxCands.push({
+        off: h.off, stride: 4, head, valueLane: h.valueLane,
+        // 表项实际取值位置：window 基准 + 值 lane
+        valueOff: h.off + h.valueLane,
+        constLanes: h.constLanes,
+      });
+    }
+  }
+  for (const { off, stride, head, valueLane, valueOff, constLanes } of sboxCands) {
     const isSM4 = head.startsWith('d690e9fe');
     const isAES = head.startsWith('637c777b');
     const isAESInv = head.startsWith('52096ad5');
-    const strideNote = stride === 1 ? '' : `（表项按 ${stride} 字节步长存放，值在低字节）`;
+    // 值不一定落在低字节：cnbragon 的真实布局是 `00 70 70 70`（值在 lane 1）。
+    // 旧文案统一写"值在低字节"会让 AI 按错误位置读表。
+    const lane = (valueLane === undefined) ? 0 : valueLane;
+    const strideNote = stride === 1 ? ''
+      : `（表项按 ${stride} 字节步长存放，值在 lane ${lane}${lane === 0 ? '（低字节）' : ''}）`;
+    const readOff = (valueOff === undefined) ? off : valueOff;
+    // 窗口起点（off）里含 lane 位置；值读取起点是 readOff。分析函数按 readOff 取表。
     const item = {
       fp: 'SBOX-256', algo: isSM4 ? 'SM4' : (isAES ? 'AES' : (isAESInv ? 'AES' : 'CUSTOM-BLOCK')),
       desc: isSM4 ? 'SM4 标准 S 盒（256 项双射）'
@@ -2475,6 +2513,8 @@ function scanCryptoFingerprints(filePath) {
         : (isAESInv ? 'AES 逆 S 盒（解密码表）'
         : `自定义分组密码 S 盒（256 项双射，非常见算法）${strideNote}`)),
       offset: '0x' + off.toString(16), head, stride,
+      valueLane: lane,
+      ...(constLanes && constLanes.length ? { constLanes } : {}),
     };
     // 自定义 S 盒 → 做**常量差分分析**（纯确定性推导，不猜算法）：
     // 逐个比对标准 SM4/AES 表，找出"是否只是字节变换"，并搜索附近的轮常量表推算差分关系。
@@ -2482,19 +2522,33 @@ function scanCryptoFingerprints(filePath) {
     // 字节序怎么摆；而这些关系全都可以由工具一次性算出来。
     if (item.algo === 'CUSTOM-BLOCK') {
       try {
-        const analysis = analyzeCustomBlockConstants(buf, size, off, stride);
+        // readOff = 窗口起点 + 值 lane：生成的脚本按 `d[readOff + i*stride]` 取表
+        const analysis = analyzeCustomBlockConstants(buf, size, readOff, stride, lane);
         if (analysis) {
           item.constantAnalysis = analysis;
           // 附加"可直接跑"的多骨架解密脚本：按结构推理分发到 SM4 / AES 骨架
           // （SM4 已实战验证；AES 为 Phase C 新增。DES/Blowfish 明确不支持，不假装能解）
           try {
-            const sk = attachBlockCipherSolver(buf, size, analysis, off);
+            const sk = attachBlockCipherSolver(buf, size, analysis, readOff);
             if (sk) analysis.decryptScript = sk;
           } catch (e) { /* 生成失败不影响主结论 */ }
         }
       } catch (e) { /* 分析失败不影响主结论 */ }
     }
     out.push(item);
+  }
+
+  // 2.7) 内联 MD5 轮常量：K 表允许**散落**（CrackMe2 的 64 个 K 分布在 0xB2F~ 各处），
+  //      连续 8 字节匹配必然 0 命中。判据是"K 命中数 ≥48 且标准 IV 基本不在"。
+  {
+    const md5 = detectMd5RoundConstants(buf);
+    if (md5.hit) {
+      out.push({
+        fp: 'MD5-K', algo: 'MD5', desc: '内联 MD5 轮常量 K 表（散落存放，无标准 IV）',
+        offset: md5.firstOffset >= 0 ? '0x' + md5.firstOffset.toString(16) : '0x0',
+        kHits: md5.hits, ivHits: md5.ivHits,
+      });
+    }
   }
 
   // 3) 高熵常量块（16/24/32 字节，疑似 key/密文）——只报前几个，避免噪声。
@@ -2609,21 +2663,47 @@ function scanCryptoFingerprints(filePath) {
   }
   if (has('SM3-IV')) summary.push({ algo: 'SM3', confidence: 'high', evidence: 'SM3 IV（铁证）', note: '哈希不可逆：按"SM3(候选)==目标"爆破/长度扩展。' });
   if (has('TEA-DELTA') || has('TEA-DELTA-INV')) summary.push({ algo: 'TEA/XTEA/XXTEA', confidence: 'high', evidence: 'TEA delta 常量', note: `按 TEA 族解；delta 大小端/正负见偏移。` });
-  if (has('MD5-IV')) summary.push({ algo: 'MD5', confidence: 'medium', evidence: 'MD5 IV', note: '哈希：爆破/碰撞/截断比较。' });
+  // MD5：K 轮常量命中比连续 IV 更强（IV 可能被省略/内联改写，K 表是算法本体）。
+  // 证据形态写成 "K 常量命中 N/64，IV M/4"，便于 AI 自己判断可信度。
+  {
+    const kHit = out.find(o => o.fp === 'MD5-K');
+    if (kHit) {
+      summary.push({
+        algo: 'MD5', confidence: 'high',
+        evidence: `内联 MD5 轮常量：K 常量命中 ${kHit.kHits}/64，IV ${kHit.ivHits}/4，首个 K @${kHit.offset}`,
+        note: '确认是本层内联的 MD5（不是"可能是哈希"）。哈希不可逆：按 `MD5(候选)==目标` 爆破（字典/规则/长度扩展）；' +
+          '若被截断比较，比对长度与比较点。⚠️ K 表散落说明实现是手写/内联的，可能存在**轮数/IV/输出字节序**改动，' +
+          '先在反编译里确认 IV 与轮数，再决定用标准 MD5 还是按其实现照抄。',
+      });
+    }
+  }
+  if (!out.some(o => o.fp === 'MD5-K') && has('MD5-IV')) summary.push({ algo: 'MD5', confidence: 'medium', evidence: 'MD5 IV', note: '哈希：爆破/碰撞/截断比较。' });
   if (has('SHA256-IV')) summary.push({ algo: 'SHA256', confidence: 'medium', evidence: 'SHA256 IV', note: '哈希：同上。' });
   if (has('CRC32-POLY')) summary.push({ algo: 'CRC32', confidence: 'medium', evidence: 'CRC32 多项式', note: '短输入可碰撞爆破（注意自定义初值/异或）。' });
   if (has('RC4-ID')) summary.push({ algo: 'RC4', confidence: 'medium', evidence: '完整 0..255 初值表（KSA 初始化特征）', note: '按 RC4 解；仍需在代码中确认 KSA 循环（`j=(j+S[i]+key[i%len])&0xff`）。' });
   if (has('B64-STD')) summary.push({ algo: 'Base64', confidence: 'low', evidence: '标准 Base64 表', note: '编码非加密；可能是自定义表 Base64 的对照。' });
 
-  // 4.5) 无任何算法指纹 → 关键判定（实测 Disguise：第一层是 XOR 编码的内嵌 PE + decoy 表，
-  //      常量全在 stage2 里，本层零指纹）。此时必须提示"先找/提取下一层"，而不是让 AI 在当前层硬猜算法。
+  // 4.5) 无任何算法指纹 → 中性结论。
+  // 旧文案直接断言"本层极可能是壳/加载器/decoy，算法常量在下一层"。
+  // 实测（CrackMe2）该断言与事实相反：真实算法是 MD5（sub_4016B0），
+  // K 表就在本层，payloads 为空（没有任何内嵌载荷）——扫描器只是没认出来。
+  // 把"没认出来"说成"一定是壳"，等于用工具的盲区给 AI 指定错误方向。
   if (!summary.length) {
+    // ⚠️ 旧实现读 `out.payloads`，但这个数组从来没有被赋值（载荷在局部变量 payloads 里）
+    // → hasPayload 恒为 false，零指纹分支永远只能说"本层没有内嵌载荷"。直接用 payloads。
+    const hasPayload = (Array.isArray(payloads) && payloads.length > 0);
     summary.push({
       algo: '(未发现算法指纹)', confidence: 'n/a',
       evidence: `扫描 ${size} 字节，未命中任何已知算法常量（SM4/AES/SM3/MD5/SHA/TEA/CRC32 S盒表均无）`,
-      note: '本层极可能是**壳/加载器/decoy**：算法常量在下一层（内嵌/解密后的文件）里。'
-        + '请先找"内嵌 PE/解密逻辑/资源段"，提取出下一层后**对新文件重跑本扫描**；'
-        + '切勿在当前层盲猜算法或硬逆它的 VM。'
+      note: hasPayload
+        ? '未识别到已知算法常量。本层**确实存在内嵌载荷**（见下方载荷列表）：'
+          + '算法可能在下一层，先提取再对**新文件**重跑本扫描。'
+        : '未识别到已知算法常量。这不等于"是壳"：可能是**自实现算法**、'
+          + '**常量布局非常规**（表被拆分/加花、表项按非标准步长或 lane 交错存放、'
+          + '或只用了扫描器还不认识的轮常量）、或算法写在其它函数里。'
+          + '本层没有内嵌载荷，建议优先在本层找逐字节比较/位运算循环与内联常量表，'
+          + '不要仅凭"扫描无命中"就断定存在下一层。',
+      noPayload: !hasPayload,
     });
   }
 
@@ -3178,6 +3258,104 @@ ipcMain.handle('read-file', async (event, filePath) => {
   try {
     if (isSensitivePath(filePath)) return { success: false, error: '拒绝读取受保护文件（含凭据）' };
     return { success: true, content: fs.readFileSync(path.resolve(filePath), 'utf8') };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// 抽取文件里的可打印字符串，供中间值自动推进（哈希爆破）当字典用。
+// 为什么必须从目标文件取：CTF 的 key/口令几乎总以字符串常量出现在二进制/资源里，
+// 通用字典命中率有限；文件内常量才是本题真正的候选空间。
+ipcMain.handle('extract-strings', async (event, filePath) => {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return { success: false, error: '文件不存在: ' + filePath };
+    const buf = fs.readFileSync(path.resolve(filePath));
+    const { extractStringsFromBuffer } = require('./intermediate-advance');
+    // 大文件只取前 8MB：字符串常量集中在头部/节表附近，全量扫没有必要且拖慢启动
+    const slice = buf.length > 8 * 1024 * 1024 ? buf.subarray(0, 8 * 1024 * 1024) : buf;
+    const strings = extractStringsFromBuffer(slice, { minLen: 4, maxCount: 6000 });
+    return { success: true, strings };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// 解析二进制的映像范围与节表（PE/ELF）。渲染层没有 require('path') 也没有 readUInt32LE，
+// 所有路径规范化与字节读取都在主进程做，渲染层只传原始路径。
+ipcMain.handle('file-image-map', async (event, filePath) => {
+  try {
+    if (!filePath) return { success: false, error: '路径为空' };
+    const abs = path.resolve(filePath);
+    if (!fs.existsSync(abs)) return { success: false, error: '文件不存在: ' + abs };
+    const buf = fs.readFileSync(abs);
+    const { parseImageMap } = require('./binary-map');
+    const map = parseImageMap(buf);
+    if (!map) return { success: false, error: '无法解析为 PE/ELF 映像' };
+    return { success: true, path: abs.replace(/\\/g, '/').toLowerCase(), map };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+function isPlainObject(v) {
+  return v != null && typeof v === 'object' && !Array.isArray(v);
+}
+
+// 查询 IDA 当前实际加载的是哪个文件。
+// 只在端口已监听时才调用；插件不提供 server_health 时返回 success:false，
+// 调用方据此走"身份未知 → 安全重载"策略（比拿别人的库当本题证据安全）。
+ipcMain.handle('ida-identity', async () => {
+  try {
+    const r = await idaMcpCallTool('server_health', {});
+    const data = r && (r.result !== undefined ? r.result : r);
+    let obj = {};
+    if (isPlainObject(data)) obj = data;
+    else if (typeof data === 'string') {
+      try { const j = JSON.parse(data); if (isPlainObject(j)) obj = j; } catch (e) { /* 非 JSON：按未知处理 */ }
+    }
+    const pick = (...keys) => {
+      for (const k of keys) {
+        if (obj[k] != null && String(obj[k]).trim()) return String(obj[k]).trim();
+      }
+      return '';
+    };
+    const input_path = pick('input_path', 'inputPath', 'path', 'file', 'filename');
+    const idb_path = pick('idb_path', 'idbPath', 'database');
+    const module = pick('module', 'module_name', 'moduleName');
+    const imagebase = pick('imagebase', 'image_base', 'imageBase');
+    if (!input_path && !idb_path && !module) {
+      return { success: false, error: 'server_health 未返回可用的加载对象信息' };
+    }
+    return {
+      success: true,
+      input_path: input_path.replace(/\\/g, '/').toLowerCase(),
+      idb_path: idb_path.replace(/\\/g, '/').toLowerCase(),
+      module,
+      imagebase,
+      raw: obj,
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// P2：中间值自动推进（哈希爆破 / Base64 / hex / 单字节 XOR）。
+// 放主进程的理由：renderer 关了 nodeIntegration，拿不到 crypto；且爆破要跑几十万次哈希，
+// 不该占用 UI 线程。filePath 可选，提供时把文件内字符串并入字典。
+ipcMain.handle('advance-intermediates', async (event, hits, filePath) => {
+  try {
+    const { advanceIntermediates, extractStringsFromBuffer, buildDictionary } = require('./intermediate-advance');
+    let extraStrings = [];
+    if (filePath && fs.existsSync(filePath)) {
+      try {
+        const buf = fs.readFileSync(path.resolve(filePath));
+        const slice = buf.length > 8 * 1024 * 1024 ? buf.subarray(0, 8 * 1024 * 1024) : buf;
+        extraStrings = extractStringsFromBuffer(slice, { minLen: 3, maxCount: 6000 });
+      } catch (e) { /* 读不到就用通用字典 */ }
+    }
+    const needsDictionary = (Array.isArray(hits) ? hits : []).some(h => /^(0x)?[0-9a-fA-F]{32,64}$/.test(String(h || '').trim()));
+    const results = advanceIntermediates(hits, needsDictionary ? { dictionary: buildDictionary(extraStrings) } : {});
+    return { success: true, results };
   } catch (err) {
     return { success: false, error: err.message };
   }
@@ -4190,7 +4368,8 @@ let burpMcpState = {
   endpointUrl: null,    // SSE message endpoint（含 sessionId）
   endpointWaiters: [],
   pending: new Map(),   // SSE 模式下 id -> {resolve,reject,timer}
-  reqSeq: 0
+  reqSeq: 0,
+  autoLaunchTried: false // 本次会话是否已尝试自动拉起 Burp（防止反复拉）
 };
 
 function burpResetConnection() {
@@ -4199,10 +4378,47 @@ function burpResetConnection() {
     clearTimeout(p.timer);
     p.reject(new Error('Burp MCP 连接已重置'));
   }
+  const autoLaunchTried = burpMcpState.autoLaunchTried;
   burpMcpState = {
     transport: null, sessionId: null, toolMap: null, baseUrl: config.mcp.burp, ready: false,
-    sseRes: null, endpointUrl: null, endpointWaiters: [], pending: new Map(), reqSeq: 0
+    sseRes: null, endpointUrl: null, endpointWaiters: [], pending: new Map(), reqSeq: 0,
+    autoLaunchTried
   };
+}
+
+// 无人值守拉起 Burp + MCP Server。
+// 只做「通用」的事，不针对某题：
+//   1) 清掉 %TEMP%\burp*.tmp —— 残留临时工程会让 Burp 弹 "Delete old temporary files?" 阻塞启动；
+//   2) 走安装目录自带的 MCP_Burp.bat（已带 --project-file，跳过欢迎界面的项目选择对话框；
+//      不能加 --use-defaults，那会跳过用户配置导致扩展列表不加载、MCP 永不启动）；
+//   3) 配置缺失时回退到 java -jar + 同样参数。
+// 首次仍需人工点一次 MCP 页签的 "Always Allow HTTP history"（授权会持久化，之后不再询问）。
+async function launchBurpForMcp() {
+  const burpPath = config.tools && config.tools.burp;
+  if (!burpPath || !fs.existsSync(burpPath)) {
+    return { success: false, error: `未配置 Burp 启动器（tools.burp = ${burpPath || '空'}）` };
+  }
+  try {
+    // 1) 清残留临时工程目录
+    try {
+      const tmp = app.getPath('temp');
+      for (const ent of fs.readdirSync(tmp, { withFileTypes: true })) {
+        if (ent.isDirectory() && /^burp.*\.tmp$/i.test(ent.name)) {
+          try { fs.rmSync(path.join(tmp, ent.name), { recursive: true, force: true }); } catch (e) {}
+        }
+      }
+    } catch (e) { /* 清理失败不阻塞 */ }
+
+    // 2) 启动
+    const child = /\.(bat|cmd)$/i.test(burpPath)
+      ? spawn('cmd', ['/c', 'start', '', burpPath], { shell: false, detached: true, stdio: 'ignore', windowsHide: true })
+      : spawn(burpPath, [], { shell: false, detached: true, stdio: 'ignore' });
+    child.on('error', (err) => console.error('Burp 启动失败:', err.message));
+    child.unref();
+    return { success: true, message: '已拉起 Burp（等待 MCP 端口就绪）' };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
 }
 
 // ---------- Streamable HTTP 传输（社区扩展常见） ----------
@@ -4420,6 +4636,44 @@ async function burpEnsureReady() {
     burpResetConnection();
   }
 
+  // 端口没在监听 = Burp 压根没起来。这里自动拉起一次（每次会话最多一次，避免反复拉）。
+  // 为什么必须自动拉：MCP 9876 只有 Burp 进程活着且 MCP 扩展加载后才存在，
+  // 靠“用户先手动开 Burp”会让所有 web 题静默退化成无流量可读。
+  if (!burpMcpState.autoLaunchTried) {
+    const listening = await new Promise((resolve) => {
+      try {
+        const u = new URL(config.mcp.burp);
+        const socket = require('net').connect({ host: u.hostname, port: Number(u.port) || 80 }, () => {
+          socket.destroy(); resolve(true);
+        });
+        socket.setTimeout(1200, () => { socket.destroy(); resolve(false); });
+        socket.on('error', () => resolve(false));
+      } catch (e) { resolve(false); }
+    });
+    if (!listening) {
+      burpMcpState.autoLaunchTried = true;
+      const launched = await launchBurpForMcp();
+      if (launched.success) {
+        // 启动到端口就绪通常 20-40s（Burp 本体较重）；按 1s 轮询，最多等 90s
+        const deadline = Date.now() + 90000;
+        while (Date.now() < deadline) {
+          const ok = await new Promise((resolve) => {
+            try {
+              const u = new URL(config.mcp.burp);
+              const socket = require('net').connect({ host: u.hostname, port: Number(u.port) || 80 }, () => {
+                socket.destroy(); resolve(true);
+              });
+              socket.setTimeout(1200, () => { socket.destroy(); resolve(false); });
+              socket.on('error', () => resolve(false));
+            } catch (e) { resolve(false); }
+          });
+          if (ok) break;
+          await sleep(1000);
+        }
+      }
+    }
+  }
+
   const doToolsList = async () => {
     const resp = burpMcpState.transport === 'sse'
       ? await burpSseRequest('tools/list', {}, 20000)
@@ -4432,7 +4686,10 @@ async function burpEnsureReady() {
       if (t && t.name) defs[t.name] = t;
     }
     const candidates = {
-      history: ['get_http_history', 'http_history', 'get_proxy_history', 'proxy_history', 'list_history', 'search_history', 'burp_http_history'],
+      // 官方 PortSwigger MCP 扩展实际工具名是 get_proxy_http_history（实测 27 个工具）；
+      // 其余是社区实现/旧版本的命名，保留以兼容。
+      history: ['get_proxy_http_history', 'get_http_history', 'http_history', 'get_proxy_history', 'proxy_history', 'list_history', 'search_history', 'burp_http_history'],
+      historyRegex: ['get_proxy_http_history_regex', 'search_http_history', 'search_history_regex'],
       message: ['get_http_message', 'http_message', 'get_request_response', 'get_message', 'get_request', 'burp_get_message']
     };
     const map = { _all: realNames, _defs: defs };
@@ -4518,7 +4775,30 @@ function adaptBurpArgs(toolDef, args) {
 }
 
 async function burpMcpCallTool(logicalName, args) {
-  const knownLogical = ['history', 'message'];
+  const knownLogical = ['history', 'historyRegex', 'message'];
+  // 官方扩展没有独立取报文的工具，但 get_proxy_http_history 本身就成对返回 request+response。
+  // 因此 message 逻辑名在缺工具时降级为「按索引从历史里取那一条」，而不是直接把 AI 卡死。
+  if (logicalName === 'message' && !(burpMcpState.toolMap && burpMcpState.toolMap.message)) {
+    await burpEnsureReady();
+    if (!burpMcpState.toolMap || !burpMcpState.toolMap.message) {
+      const idx = Math.max(0, Number(args && (args.index != null ? args.index : args.id)) || 0);
+      const count = Math.max(1, idx + 1);
+      const hist = await burpMcpCallTool('history', { count, offset: 0 });
+      const text = String(hist || '');
+      let picked = '';
+      if (idx === 0) {
+        picked = text;
+      } else {
+        // 历史条目是逐行 JSON；按行取第 idx 条
+        const lines = text.split('\n').filter(l => l.trim());
+        picked = lines[idx] || '';
+      }
+      if (!picked) {
+        throw new Error(`历史中不存在第 ${idx} 条报文（按 get_proxy_http_history 索引）`);
+      }
+      return picked;
+    }
+  }
   const doCall = async () => {
     await burpEnsureReady();
     const map = burpMcpState.toolMap || {};
@@ -4762,12 +5042,23 @@ ipcMain.handle('ctf2-cleanup-tools', async () => {
   const targets = [
     'ida.exe', 'ida64.exe',           // IDA
     'jeb-wincon.exe', 'jeb.exe',      // JEB（jeb_wincon.bat 的实际进程名）
-    'java.exe'                        // jadx/unluac/apktool 等 Java 系（JEB 也走 java？JEB 用自带 jvm 进程名同上）
+    'java.exe'                        // jadx/unluac/apktool 等 Java 系（Burp/JEB 都是 java 进程）
   ];
   const killed = [];
   for (const name of targets) {
     try { execSync('taskkill /F /IM ' + name, { stdio: 'ignore', timeout: 15000 }); killed.push(name); } catch (e) { /* 进程不存在 → 忽略 */ }
   }
+  // 收工一并清掉 Burp 的临时工程目录，避免下一题启动时弹
+  // "Delete old temporary files?" 阻塞 MCP 扩展加载（实测会卡死在欢迎界面）。
+  try {
+    const tmp = app.getPath('temp');
+    for (const ent of fs.readdirSync(tmp, { withFileTypes: true })) {
+      if (ent.isDirectory() && /^burp.*\.tmp$/i.test(ent.name)) {
+        const p = path.join(tmp, ent.name);
+        try { fs.rmSync(p, { recursive: true, force: true }); } catch (e) {}
+      }
+    }
+  } catch (e) { /* 清理失败不阻塞 */ }
   return { success: true, killed };
 });
 
@@ -5937,6 +6228,10 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
   const dupCounter = new Map();
   // 脚本类工具的"同思路"签名池（归一化文本 → 出现次数）：截住"换写法重跑"
   const scriptSigs = new Map();
+  // 去重闸的地址目标指纹层（rank 1）：结构相似还不够，观测地址也要重叠才算同一实验。
+  // 旧判据单靠归一化文本相似度，把"反汇编另一个函数区间"算成 100% 相同并永久拦截。
+  const dedupState = createDedupState();
+  setScriptSimilarity(scriptSimilarity);
   // 连续相同调用拦截（借鉴 openclaude doomLoop）：阈值 3，签名变化即重置
   const doomGuard = new DoomLoopGuard(3);
   // 跨轮失败环（按 工具+错误类别 / 类别 / 路径 累计）：第 2 次 advisory，第 3 次要求换路线
@@ -5964,7 +6259,8 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
 
     // ── 上下文维护（每轮开头）──
     // 1) 微压缩：旧工具结果换成占位串（零模型调用，成本≈0）
-    try { microcompact(conversationHistory, 6); } catch (e) { /* 忽略 */ }
+    //    按 COMPACTABLE_TOOLS 白名单过滤：ida_list_functions 等"身份证据"永不清。
+    try { microcompact(conversationHistory, 6, buildToolNameMap(conversationHistory)); } catch (e) { /* 忽略 */ }
     // 2) 超预算 → 摘要压缩（失败熔断：连续 3 次失败后冷却 5 分钟）
     try {
       const used = estimateTokens(conversationHistory);
@@ -6298,10 +6594,15 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
         // ── 重复调用检测（防"原地打转"卡死）──
         // 实测（Disguise）：AI 把同一个"读 stage2 常量表"脚本跑了 30 次，每次都因手算 RVA→offset
         // 换算错误拿不到数据，就换个写法再试，整个任务卡死。
-        // 两层检测：
-        //   A) 完全相同（完整 sha1 签名）→ 第 4 次拦。
-        //   B) **同思路换写法**（脚本归一化后高度相似，>88%）→ 第 3 次拦。
-        //      实测"换个写法重跑"绕过了 A（签名不同），必须靠相似度才能截住。
+        //
+        // 但**只用文本相似度会误杀**（实测 CrackMe2 / CrackMe5 / not-baby-parallelism）：
+        // normalizeScript 把地址与数字折叠成 ` N `，于是"反汇编另一个函数区间"的脚本
+        // 归一化后相似度 = 1.000，第 3 次起被永久拦截 → AI 放弃静态分析。
+        //
+        // 现在的判据是两层同时成立才算同一实验：
+        //   A) 参数逐字节相同（完整 sha1 签名）
+        //   B) 结构相似度 > 88% **且** 观测地址集合重叠 >= 50%
+        // 状态机在 electron/script-dedup.js（纯函数，可单测）。
         const dupWarn = (extra) => `⚠️ 检测到**重复劳动**：\n${extra}\n`
           + '这说明当前做法拿不到预期结果，**继续重试同一调用不会有新结果**。请立即换路径：\n'
           + '①若是在做 RVA→文件偏移换算：不要手算，改用 pefile.PE(path).get_offset_from_rva(rva) 或 pe.get_memory_mapped_image()[va]（按虚拟地址直接索引，一次就对）；\n'
@@ -6313,34 +6614,53 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
           catch (e) { return String(toolCall.input); }
         })();
         const isScriptTool = /^(run_python|bash|run_command)$/.test(toolCall.name);
-        const cnt = (dupCounter.get(sig) || 0) + 1;
-        dupCounter.set(sig, cnt);
-        // 脚本类工具：字节完全相同的脚本重跑必然得到相同输出，第 2 次即拦；
-        // 其它工具（read_file/ida_get_bytes 等）允许 4 次（"读→改→再读"是合理模式）。
-        if (cnt >= (isScriptTool ? 2 : 4)) {
-          toolResults.push({ tool_use_id: toolCall.id, content: dupWarn(`同一个 ${toolCall.name} 调用（参数**完全相同**）已出现 ${cnt} 次，且脚本/命令内容**逐字节相同**。`), is_error: true });
+        const scriptRaw = String((toolCall.input && (toolCall.input.script || toolCall.input.command)) || '');
+        // 上一轮这条调用的结果是否已被微压缩清空 → 允许重取一次（否则"数据被清→重取被拦"死锁）
+        const wasCleared = (() => {
+          try {
+            for (let i = conversationHistory.length - 1; i >= 0; i--) {
+              const m = conversationHistory[i];
+              if (!m || m.role !== 'user' || !Array.isArray(m.content)) continue;
+              for (const b of m.content) {
+                if (b && b.type === 'tool_result' && b.tool_use_id === toolCall.id) {
+                  const body = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
+                  return !!(body && body.indexOf('[Old tool result content cleared]') >= 0);
+                }
+              }
+            }
+          } catch (e) { /* 查不到就当未清空 */ }
+          return false;
+        })();
+        const dedupVerdict = checkDedup(dedupState, {
+          name: toolCall.name,
+          sig,
+          isScriptTool,
+          script: scriptRaw,
+          norm: isScriptTool ? normalizeScript(scriptRaw) : '',
+          cleared: wasCleared,
+        });
+        if (dedupVerdict.reason) {
+          console.log(`[去重] ${dedupVerdict.reason}`);
+          try {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('claude-tool-event', { phase: 'gate', tool: 'gate', message: `[去重] ${dedupVerdict.reason}` });
+            }
+          } catch (e) { /* 闸日志旁路失败不影响判据 */ }
+        }
+        if (dedupVerdict.blocked) {
+          toolResults.push({
+            tool_use_id: toolCall.id,
+            content: dupWarn(dedupVerdict.layer === 'A'
+              ? `同一个 ${toolCall.name} 调用（参数**完全相同**）已第 ${dedupVerdict.count} 次提交。`
+              : `你**第 ${dedupVerdict.count} 次**提交了"同一思路、同一观测目标"的脚本（${dedupVerdict.reason}）。`),
+            is_error: true,
+          });
           continue;
         }
-        // B) 脚本类工具的"同思路"相似度检测
+        // 旧结构保留只用于排障对照（判据已移到 script-dedup 状态机）
         if (isScriptTool) {
-          const raw = String((toolCall.input && (toolCall.input.script || toolCall.input.command)) || '');
-          const norm = normalizeScript(raw);
-          if (norm.length >= 40) {
-            let similarHit = null;
-            for (const [k, v] of scriptSigs.entries()) {
-              if (k === sig) continue;
-              if (scriptSimilarity(norm, v.norm) > 0.88) { similarHit = v; break; }
-            }
-            if (similarHit) {
-              similarHit.count++;
-              if (similarHit.count >= 3) {
-                toolResults.push({ tool_use_id: toolCall.id, content: dupWarn(`你**第 ${similarHit.count} 次**提交了"同一思路、仅换写法"的脚本（归一化后相似度 >88%）。`), is_error: true });
-                continue;
-              }
-            } else {
-              scriptSigs.set(sig, { norm, count: 1 });
-            }
-          }
+          const norm = normalizeScript(scriptRaw);
+          if (norm.length >= 40) scriptSigs.set(sig, { norm, count: dedupVerdict.count || 1 });
         }
 
         // B1) 连续相同调用拦截（工具名 + 完整入参的 sha256）。
@@ -6388,10 +6708,8 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
         }
 
         try {
-          const result = await executeToolCall(toolCall.name, toolCall.input);
-          const rawText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
-          // A1) 大输出落盘：只截头会丢掉尾部的错误堆栈/flag，改为 60/40 头尾预览 + 落盘路径。
-          const resultText = persistToolResult(rawText, {
+          const out = toToolResult(await executeToolCall(toolCall.name, toolCall.input));
+          const resultText = persistToolResult(out.text, {
             maxChars: parseInt(process.env.CTF_TOOL_RESULT_MAX, 10) || 24000,
             dir: path.join(app.getPath('userData'), 'tool-results'),
             id: toolCall.id,
@@ -6399,11 +6717,22 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
           toolResults.push({
             tool_use_id: toolCall.id,
             content: resultText,
-            is_error: false
+            is_error: out.isError
           });
-          emitToolEvent('done', { chars: resultText.length });
-          failGuard.recordSuccess(toolCall.name, toolCall.input && toolCall.input.path);
-          doomGuard.reset();   // 成功且有状态变化 → 重置连续计数
+          emitToolEvent(out.isError ? 'error' : 'done', out.isError ? { error: out.text.split('\n')[0] } : { chars: resultText.length });
+          if (out.isError) {
+            failGuard.recordFailure(toolCall.name, out.text, toolCall.input && toolCall.input.path);
+            // advisory 必须在本条结果里消费掉：留在队列里会被下一个无关的工具错误
+            // 顺手取走，变成"张冠李戴"的建议（复核指出的滞留问题）。
+            const advisories = failGuard.takeAdvisories();
+            if (advisories.length) {
+              toolResults[toolResults.length - 1].content =
+                toolResults[toolResults.length - 1].content + '\n\n💡 ' + advisories.join('\n');
+            }
+          } else {
+            failGuard.recordSuccess(toolCall.name, toolCall.input && toolCall.input.path);
+            doomGuard.reset();   // 成功且有状态变化 → 重置连续计数
+          }
         } catch (err) {
           const errMsg = `工具调用失败: ${err.message}`;
           emitToolEvent('error', { error: err.message });
@@ -7040,55 +7369,8 @@ async function executeToolCall(toolName, input) {
       case 'ida_get_xrefs':
         return await callIdaMcp('xrefs_to', { addr: input.address });
 
-      case 'ida_get_bytes': {
-        // 真实 ida-pro-mcp 的 get_bytes schema 实测是 { regions: [{address,size}] }；
-        // 不同实现可能是 {address,size}。两种形态都试，参数被拒（missing/invalid）则换下一种，
-        // 全失败再回退 py_exec_file 跑 IDAPython（终兜底）。
-        const addr = String(input.address || '').trim();
-        const size = Math.min(parseInt(input.size, 10) || 256, 65536);
-        const isBad = (r) => !r || /missing|required param|invalid|error|失败|Expected/i.test(String(r).slice(0, 300));
-        const addrNum = /^[0-9a-fA-Fx]+$/.test(addr) ? '0x' + addr.replace(/^0x/i, '') : addr;
-        const attempts = [
-          { regions: [{ address: addrNum, size }] },
-          { regions: [addrNum] },
-          { address: addrNum, size },
-          { address: addrNum, count: size }
-        ];
-        let lastResp = '';
-        for (const args of attempts) {
-          try {
-            const r = await callIdaMcp('get_bytes', args);
-            lastResp = String(r || '');
-            if (!isBad(lastResp)) return r;
-          } catch (e) { lastResp = e.message; }
-        }
-        // 终兜底：py_exec_file 跑 IDAPython
-        try {
-          const py = `import ida_bytes
-ea=${/^[0-9a-fA-F]+$/.test(addr.replace(/^0x/i, '')) ? '0x' + addr.replace(/^0x/i, '') : JSON.stringify(addr)}
-n=${size}
-data=ida_bytes.get_bytes(ea,n) or b''
-print('BYTES '+data.hex())
-`;
-          const tmp = path.join(app.getPath('temp'), 'ctf_get_bytes.py');
-          fs.writeFileSync(tmp, py, 'utf8');
-          const r = await callIdaMcp('py_exec_file', { path: tmp });
-          const mm = String(r || '').match(/BYTES\s+([0-9a-f]+)/i);
-          if (mm) {
-            const buf = Buffer.from(mm[1], 'hex');
-            const lines = [];
-            for (let i = 0; i < buf.length; i += 16) {
-              const seg = buf.slice(i, i + 16);
-              const ascii = [...seg].map(b => (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b) : '.').join('');
-              lines.push(('0000' + i.toString(16)).slice(-4) + '  ' + seg.toString('hex').replace(/(..)/g, '$1 ').trim() + '  ' + ascii);
-            }
-            return lines.join('\n');
-          }
-          return r;
-        } catch (e2) {
-          return 'ida_get_bytes 全部形态失败（最后错误: ' + lastResp.slice(0, 150) + '）。替代方案：用 run_python 直接解析本地 ELF 文件读该地址（文件在 ' + (state && state.currentFile) + '）';
-        }
-      }
+      case 'ida_get_bytes':
+        return await idaGetBytes({ callMcp: callIdaMcp, writeTemp: writeTempFile, topLevelDir: currentWorkDir }, input);
 
       // ========== 浏览器 MCP 工具 ==========
       case 'browser_search':
@@ -7151,68 +7433,8 @@ print('BYTES '+data.hex())
         return await callBurpMcp(input.tool, input.args || {});
 
       // ========== 确定性分析能力（供 AI 主动调用）==========
-      case 'scan_crypto': {
-        const f = String(input.path || '').trim();
-        if (!f) return '参数错误：path 为空';
-        if (!fs.existsSync(f)) return `文件不存在: ${f}`;
-        const r = scanCryptoFingerprints(f);
-        if (!r.success) return `扫描失败: ${r.error}`;
-        // 输出为结构化文本，便于 AI 直接阅读；不放原始 JSON（token 更省、重点更突出）
-        const lines = [];
-        lines.push(`文件: ${f}  (${r.size} 字节)`);
-        lines.push('');
-        lines.push('## 主结论');
-        for (const s of (r.summary || [])) {
-          lines.push(`- 【${s.algo}】置信度 ${s.confidence}`);
-          if (s.evidence) lines.push(`  证据: ${s.evidence}`);
-          if (s.note) lines.push(`  建议: ${String(s.note).replace(/\n/g, '\n        ')}`);
-        }
-        if ((r.payloads || []).length) {
-          lines.push('');
-          lines.push('## 内嵌载荷（可用 extract_payload 提取）');
-          for (const p of r.payloads) {
-            const e = p.encode || {};
-            lines.push(`- ${String(p.type).toUpperCase()} @0x${p.offset.toString(16)}` +
-              ` 编码=${e.kind || 'none'}${e.key != null ? ' key=0x' + Number(e.key).toString(16) : ''}` +
-              `${e.stride ? ' stride=' + e.stride : ''}${p.length ? ' len=' + p.length : ''}` +
-              ` 置信度=${p.confidence || 'high'}`);
-          }
-        }
-        const ca = (r.fingerprints || []).map(x => x.constantAnalysis).filter(Boolean);
-        if (ca.length) {
-          lines.push('');
-          lines.push('## 常量差分分析（确定性推导）');
-          for (const c of ca) {
-            for (const n of (c.notes || [])) lines.push(`- ${n}`);
-            if (c.decryptScript) {
-              lines.push(`- 已生成 SM4 变体解密脚本（可用 gen_sm4_solver 取用）`);
-              lines.push(`  密文候选: ${(c.decryptScript.ciphertextCandidates || []).map(x => x.offset + '(' + x.length + 'B)').join('、')}`);
-            }
-          }
-          // 结构推理（Phase B）：给 AI 一个"骨架假设 + 置信度"，由 AI 决定路线
-          const structs = inferCipherStructure(buf, size, ca[0]);
-          if (structs.length) {
-            lines.push('');
-            lines.push('## 结构推理（假设，按证据强度排序——最终判断由你做）');
-            for (const st of structs) {
-              lines.push(`- 【${st.skeleton} 骨架】置信度 ${st.confidence}`);
-              lines.push(`  证据: ${st.evidence}`);
-              lines.push(`  建议: ${st.advice}`);
-            }
-          }
-        }
-        if ((r.fingerprints || []).length) {
-          lines.push('');
-          lines.push('## 原始命中（前 20）');
-          lines.push((r.fingerprints || []).slice(0, 20).map(x => `${x.fp || x.algo}@${x.offset}${x.stride ? '(stride' + x.stride + ')' : ''}`).join('  '));
-        }
-        if ((r.highEntropy || []).length) {
-          lines.push('');
-          lines.push('## 高熵常量块（疑似 key/密文）');
-          lines.push((r.highEntropy || []).map(h => `${h.offset}(${h.len}B) ${h.hex}`).join('\n'));
-        }
-        return lines.join('\n');
-      }
+      case 'scan_crypto':
+        return scanCryptoCase({ fs, scanCrypto: scanCryptoFingerprints, inferCipherStructure }, input);
 
       case 'extract_payload': {
         const f = String(input.path || '').trim();
@@ -7348,6 +7570,9 @@ print('BYTES '+data.hex())
         return `未知工具: ${toolName}`;
     }
   } catch (err) {
+    // 工具内部已经判定失败（并希望保留类型化异常）时，原样上抛给主循环；
+    // 只有真正的意外异常才改写成文本。
+    if (err && err.__toolError) throw err;
     return `工具调用失败: ${err.message}`;
   }
 }
@@ -7357,7 +7582,7 @@ async function callIdaMcp(method, params) {
   try {
     return await idaMcpCallTool(method, params);
   } catch (err) {
-    return `IDA MCP调用失败: ${err.message}`;
+    throw new ToolCallError(`IDA MCP调用失败: ${err.message}`);
   }
 }
 
@@ -7489,24 +7714,21 @@ async function browserMcpOpenTool(url) {
 // 当前工作目录（渲染层加载题目文件时同步，AI 的 glob/grep 由此定位）
 let currentWorkDir = null;
 
+function writeTempFile(name, content) {
+  const tmp = path.join(app.getPath('temp'), name);
+  fs.writeFileSync(tmp, content, 'utf8');
+  return tmp;
+}
+
 // 执行命令
+// 在"当前案件工作目录"下执行，避免模型反复用绝对路径试探；Windows 下走 cmd.exe。
+// 超时 120s（旧值 30s 对编译/大脚本/批量处理不够；同样会误导 AI"命令失败"而换路）。
 async function execCommandAsync(command) {
-  // 在"当前案件工作目录"下执行，避免模型反复用绝对路径试探；Windows 下走 cmd.exe
-  // 超时 120s（旧值 30s 对编译/大脚本/批量处理不够；同样会误导 AI"命令失败"而换路）
-  const opts = { timeout: 120000, maxBuffer: 32 * 1024 * 1024 };
-  if (currentWorkDir && fs.existsSync(currentWorkDir)) opts.cwd = currentWorkDir;
-  return new Promise((resolve) => {
-    exec(command, opts, (error, stdout, stderr) => {
-      if (error) {
-        const timedOut = error.killed || /timed out|ETIMEDOUT/i.test(error.message || '');
-        resolve(timedOut
-          ? `命令执行超时（120s 上限，已终止）。请改用更省时的命令或拆分执行。\n${truncateOutput(stderr)}`
-          : `命令执行失败: ${error.message}\n${truncateOutput(stderr)}`);
-      } else {
-        resolve(stdout ? truncateOutput(stdout) : '命令执行成功（无输出）');
-      }
-    });
-  });
+  return runBash({
+    exec,
+    tempDir: app.getPath('temp'),
+    cwd: (currentWorkDir && fs.existsSync(currentWorkDir)) ? currentWorkDir : undefined,
+  }, command);
 }
 
 // 执行Python脚本（唯一临时文件名，避免并发覆盖）
@@ -8102,6 +8324,46 @@ function findVmxFile() {
   return null;
 }
 
+// 解析 vmrun.exe 的绝对路径。
+// 为什么需要：vmrun 默认不在 PATH（实测本机装在 E:\xnj\，Windows 的 PATH 里没有它），
+// spawn('vmrun') 找不到就报 ENOENT → Kali 从未被真正启动过，
+// 历次日志里的 "Timed out while waiting for handshake" 全是这一个根因。
+// 解析顺序：PATH → VMware 注册表 InstallPath → 常见安装目录。
+function findVmrunPath() {
+  const pathMod = require('path');
+  const execSync = require('child_process').execSync;
+  // 1) PATH 里能找到就直接用
+  try {
+    const out = execSync('where vmrun 2>nul', { encoding: 'utf8', windowsHide: true, timeout: 5000 }).trim();
+    if (out) return out.split(/\r?\n/)[0];
+  } catch (e) { /* 不在 PATH */ }
+  // 2) VMware 注册表 InstallPath（本机实测在 HKLM\SOFTWARE\WOW6432Node\VMware, Inc.\VMware Workstation）
+  try {
+    const reg = execSync('reg query "HKLM\\SOFTWARE\\WOW6432Node\\VMware, Inc.\\VMware Workstation" /v InstallPath',
+      { encoding: 'utf8', windowsHide: true, timeout: 5000 });
+    const m = reg.match(/InstallPath\s+REG_SZ\s+(\S+)/);
+    if (m) {
+      const p = pathMod.join(m[1].trim(), 'vmrun.exe');
+      if (fs.existsSync(p)) return p;
+    }
+  } catch (e) { /* 注册表键不存在 */ }
+  try {
+    const reg = execSync('reg query "HKLM\\SOFTWARE\\VMware, Inc.\\VMware Workstation" /v InstallPath',
+      { encoding: 'utf8', windowsHide: true, timeout: 5000 });
+    const m = reg.match(/InstallPath\s+REG_SZ\s+(\S+)/);
+    if (m) {
+      const p = pathMod.join(m[1].trim(), 'vmrun.exe');
+      if (fs.existsSync(p)) return p;
+    }
+  } catch (e) { /* 同上 */ }
+  // 3) 常见安装目录兜底
+  for (const d of ['C:\\Program Files (x86)\\VMware\\VMware Workstation', 'C:\\Program Files\\VMware\\VMware Workstation']) {
+    const p = pathMod.join(d, 'vmrun.exe');
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
 // 启动Kali虚拟机
 ipcMain.handle('kali-start-vm', async (event) => {
   try {
@@ -8111,8 +8373,13 @@ ipcMain.handle('kali-start-vm', async (event) => {
     }
 
     // 等待 spawn 结果：vmrun 不存在/不可执行时如实报错，而不是假成功
+    // vmrun 用绝对路径（见 findVmrunPath 的说明：PATH 里通常没有它）
+    const vmrunExe = findVmrunPath();
+    if (!vmrunExe) {
+      return { success: false, error: '未找到 vmrun.exe（PATH、注册表 InstallPath、常见目录都没有）。请确认已安装 VMware Workstation。' };
+    }
     const spawnErr = await new Promise((resolve) => {
-      const child = spawn('vmrun', ['start', vmxFile, 'nogui'], { shell: false, windowsHide: true });
+      const child = spawn(vmrunExe, ['start', vmxFile, 'nogui'], { shell: false, windowsHide: true });
       const t = setTimeout(() => resolve(null), 3000); // 3秒无 error 视为已拉起
       child.on('error', (err) => { clearTimeout(t); resolve(err.message); });
     });
@@ -8138,7 +8405,9 @@ ipcMain.handle('kali-stop-vm', async (event) => {
       return { success: false, error: `未找到 .vmx 文件，无法关闭虚拟机（kali.vmxPath: ${config.kali.vmxPath}）` };
     }
 
-    const child = spawn('vmrun', ['stop', vmxFile, 'soft'], { shell: false, windowsHide: true });
+    // 同 start：vmrun 用绝对路径（findVmrunPath）
+    const vmrunExe = findVmrunPath() || 'vmrun';
+    const child = spawn(vmrunExe, ['stop', vmxFile, 'soft'], { shell: false, windowsHide: true });
     child.on('error', (err) => {
       console.log('VMware关闭失败:', err.message);
     });

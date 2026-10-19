@@ -11,14 +11,18 @@ const end = mainSrc.indexOf("ipcMain.handle('scan-crypto-fingerprints'");
 if (start < 0 || end < 0) throw new Error('未能在 electron/main.js 中定位扫描器代码块');
 const body = mainSrc.slice(start, end);
 const electronDir = p.join(__dirname, '..', 'electron');
-// 模拟 CommonJS require：把 './crypto-tables' 解析到 electron/crypto-tables.js
+// 模拟 CommonJS require：把相对模块解析到 electron/ 目录
 const localRequire = (name) => {
   if (name === './crypto-tables') return require(p.join(electronDir, 'crypto-tables.js'));
+  if (name === './crypto-detect') return require(p.join(electronDir, 'crypto-detect.js'));
   throw new Error('scanner_loader 未支持的 require: ' + name);
 };
 const mod = { exports: {} };
+const cryptoDetect = require(p.join(electronDir, 'crypto-detect.js'));
 // eslint-disable-next-line no-new-func
 new Function('fs', 'path', 'module', 'exports', 'require',
+  'detectMd5RoundConstants', 'detectLaneBijectionTables',
   body + '\nmodule.exports = { scanCryptoFingerprints, CRYPTO_FP, classifySbox, gf2AffineFit, analyzeCustomBlockConstants, inferCipherStructure, findCiphertextCandidate };'
-)(fs, p, mod, mod.exports, localRequire);
+)(fs, p, mod, mod.exports, localRequire,
+  cryptoDetect.detectMd5RoundConstants, cryptoDetect.detectLaneBijectionTables);
 module.exports = mod.exports;

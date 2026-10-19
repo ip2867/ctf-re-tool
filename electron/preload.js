@@ -33,6 +33,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 写入文件（供脚本保存/VS Code 打开）
   writeFile: (filePath, content) => ipcRenderer.invoke('write-file', filePath, content),
   readFile: (filePath) => ipcRenderer.invoke('read-file', filePath),
+  // 抽取文件内可打印字符串（中间值自动推进做字典用）
+  extractStrings: (filePath) => ipcRenderer.invoke('extract-strings', filePath),
+  // 解析 PE/ELF 映像范围与节表（IDA 落界校验用）
+  fileImageMap: (filePath) => ipcRenderer.invoke('file-image-map', filePath),
+  // 查询 IDA 当前实际加载的是哪个文件（身份绑定）
+  idaIdentity: () => ipcRenderer.invoke('ida-identity'),
+  // P2：中间值自动推进（哈希爆破 / Base64 / hex / 单字节 XOR），filePath 可选（补充文件内字典）
+  advanceIntermediates: (hits, filePath) => ipcRenderer.invoke('advance-intermediates', hits, filePath),
   ensureDir: (dirPath) => ipcRenderer.invoke('ensure-dir', dirPath),
   saveFile: (defaultName, content, filters) => ipcRenderer.invoke('save-file', defaultName, content, filters),
 

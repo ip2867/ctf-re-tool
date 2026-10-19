@@ -47,6 +47,8 @@ function newFindings(fileInfo, fileType) {
     notes: [],        // 结构化过程记录 [{section,text,ts}]
     evidence: [],     // 证据文件 [{kind,label,file,ts}]
     flags: [],        // flag 候选 [{flag,verified,source,ts}]
+    // 裸答案（口令/序列号/裸字符串）：不是 flag 形态，但可能是真答案（平台要求自行包壳）
+    answers: [],      // [{value,verified,source,evidence,ts}]
     algorithms: []    // 算法/密钥/密文发现 [{text,ts}]
   };
 }
@@ -675,9 +677,14 @@ async function analyzeFile(filePath, opts = {}) {
     // 换题同时清 lastAiText 与平台上下文：否则上一题的 AI 结论会串进
     // 本题的失败档案（recordFailure）/复盘（postSolveReview）/静态结论注入。
     state.lastAiText = '';
-    state._platformChallenge = null;
-    state._platformChallengeDesc = '';
-    state._platformFiles = null;
+    // 平台流程会在 analyzeFile 之后立即恢复这三项（见 restorePlatformContext）；
+    // 平台题面是最高价值的检索目标（实测 22/22 份会话 prompt 里完全没有它），
+    // 所以平台/zip 路径要能 opt-out 这次清理。
+    if (!opts.keepPlatformContext) {
+      state._platformChallenge = null;
+      state._platformChallengeDesc = '';
+      state._platformFiles = null;
+    }
     // 扫描结果按题缓存：换题必须清空，否则上一题的反证证据会串到本题
     state.lastAlgScan = null;
     // 多阶段接力：接力来的新阶段保留上一阶段摘要；非接力（拖入/选择/平台新题）则清空接力态。
@@ -840,6 +847,11 @@ async function solveOnePlatformRound(opts = {}) {
 
     // 逐个练习场找一个有未解逆向题的（拉不到就换下一个）
     let ground = null, groundId = null, listRaw = null, listTotal = 0;
+    // 定向模式下，点名题目可能不在"题量最大的那个场"里（实测 PlutoChat /
+    // not-baby-parallelism 在 BUUCTF 11 页里都没有，但存在于其它练习场）。
+    // 因此先记下所有场的首页结果，点名题命中哪个场就用哪个场。
+    const groundFirstPage = new Map();
+    const wantNamesForGround = (opts && Array.isArray(opts.wantNames) ? opts.wantNames : []).map(String);
     for (const g of ordered) {
       try {
         const lr = await window.electronAPI.ctf2McpCall('ctf2_list_practice_challenges', {
@@ -849,8 +861,19 @@ async function solveOnePlatformRound(opts = {}) {
         const parsed = ctf2ParsePayload((lr && lr.result !== undefined) ? lr.result : lr);
         const arr = ctf2ExtractList(parsed);
         const cands = arr.filter(ch => ctf2IsReverse(ch) && !ctf2IsSolved(ch) && ch.has_attachments);
+        groundFirstPage.set(String(g.id), { parsed, arr, cands });
         addLog('info', `  场「${g.name}」：返回 ${arr.length} 条（total=${parsed && parsed.total}），可解 ${cands.length} 道`);
-        if (cands.length) { ground = g; groundId = g.id; listRaw = parsed; listTotal = parsed && parsed.total; break; }
+        // 定向优先：该场首页就命中点名题 → 直接选这个场
+        if (wantNamesForGround.length) {
+          const hitHere = arr.some(ch => wantNamesForGround.some(w =>
+            String(ch.name) === w || String(ch.name).toLowerCase() === w.toLowerCase()));
+          if (hitHere) {
+            ground = g; groundId = g.id; listRaw = parsed; listTotal = parsed && parsed.total;
+            addLog('info', `[定向] 点名题在「${g.name}」场首页，改用该场`);
+            break;
+          }
+        }
+        if (cands.length && !ground) { ground = g; groundId = g.id; listRaw = parsed; listTotal = parsed && parsed.total; }
       } catch (e) { /* 换下一个场 */ }
     }
     if (!ground) {
@@ -868,7 +891,51 @@ async function solveOnePlatformRound(opts = {}) {
     let all = ctf2ExtractList(listRaw);
     const excludeSetEarly = (opts && opts.exclude instanceof Set) ? opts.exclude : new Set();
     const attemptedCount = excludeSetEarly.size;
-    if (attemptedCount > 0) {
+    // 定向验证要跨页找题：点名的题可能不在当前页，逐页扫到命中或扫完为止。
+    const wantNamesEarly = (opts && Array.isArray(opts.wantNames) ? opts.wantNames : [])
+      .map(s => String(s || '').trim()).filter(Boolean);
+    if (wantNamesEarly.length) {
+      const found = new Map();
+      // 先在本场逐页找，找不到再换其它练习场（点名题可能不在题量最大的场里）。
+      const searchGrounds = [ground, ...ordered.filter(g => String(g.id) !== String(groundId))];
+      let pagesScanned = 0;
+      for (const g of searchGrounds) {
+        if (found.size >= wantNamesEarly.length) break;
+        const meta = groundFirstPage.get(String(g.id));
+        const maxPageS = Math.ceil(((meta && meta.parsed && meta.parsed.total) || (g === ground ? listTotal : 0) || 0) / 50) || 1;
+        for (let pg = 1; pg <= maxPageS; pg++) {
+          if (found.size >= wantNamesEarly.length) break;
+          try {
+            const pr = await window.electronAPI.ctf2McpCall('ctf2_list_practice_challenges', {
+              practice_ground_id: g.id, category: 'REVERSE', unsolved_only: true, limit: 50, page: pg
+            });
+            const parsed2 = ctf2ParsePayload((pr && pr.result !== undefined) ? pr.result : pr);
+            const arr2 = ctf2ExtractList(parsed2);
+            if (!arr2.length) break;
+            pagesScanned++;
+            for (const w of wantNamesEarly) {
+              const hit = arr2.find(ch => String(ch.name) === w)
+                || arr2.find(ch => String(ch.name).toLowerCase() === w.toLowerCase());
+              if (hit && !found.has(w)) found.set(w, { ch: hit, ground: g });
+            }
+            // 命中题来自别的场：把 ground 切到那个场（同一轮只能用一个 groundId 取详情）
+            if (found.size && g !== ground) {
+              ground = g; groundId = g.id; listRaw = parsed2; listTotal = parsed2 && parsed2.total;
+              addLog('info', `[定向] 点名题在「${g.name}」，已切换练习场`);
+            }
+          } catch (e) { /* 该页拉取失败，继续下一页 */ }
+        }
+      }
+      if (found.size) {
+        // 把命中的题并入 all（去重），后续 candidates 就能选到它们
+        const extras = [...found.values()].map(v => v.ch).filter(ch => !all.some(x => String(x.id) === String(ch.id)));
+        all = all.concat(extras);
+        addLog('info', `[定向] 扫 ${pagesScanned} 页找到 ${found.size}/${wantNamesEarly.length} 道：${[...found.values()].map(v => v.ch.name).join('、')}`);
+      } else {
+        addLog('warning', `[定向] 扫描 ${pagesScanned} 页（含 ${searchGrounds.length} 个练习场）均未找到点名题目：${wantNamesEarly.join('、')}`);
+      }
+    }
+    if (attemptedCount > 0 && !wantNamesEarly.length) {
       const wantPage = Math.floor(attemptedCount / 50) + 1;
       const maxPage = Math.ceil((listTotal || 0) / 50) || 1;
       if (wantPage <= maxPage && wantPage > 1) {
@@ -898,6 +965,32 @@ async function solveOnePlatformRound(opts = {}) {
     const allSkipped = [...new Set([...skipSet, ...excludeSet, ...persistedSkip])];
     const skippedNote = allSkipped.length ? `（已跳过 ${allSkipped.join(', ')}）` : '';
     addLog('info', `平台返回 ${all.length} 道逆向未解题，其中带附件 ${candidates.length} 道${skippedNote}` + (candidates.length ? `：${candidates.map(c => c.name).join(', ')}` : ''));
+
+    // 定向验证：调用方可以点名要跑哪几道（P1 VERIFY_FAIL 复查、回归测试都用它）。
+    // 语义是「优先」而非「只跑」——点名的题不在本页时，会继续往后翻页找，
+    // 找到就提到队首；全都不在本场/本页则退回普通选法，保证批量流程不被打断。
+    const wantNames = (opts && Array.isArray(opts.wantNames) ? opts.wantNames : [])
+      .map(s => String(s || '').trim()).filter(Boolean);
+    if (wantNames.length) {
+      // 点名题不受 skip/exclude 限制：定向复验就是要重跑那些"上次失败"的题
+      const pool = all.filter(ch => ctf2IsReverse(ch) && ch.has_attachments);
+      const hit = wantNames.map(w => pool.find(ch => String(ch.name) === w)
+        || pool.find(ch => String(ch.name).toLowerCase() === w.toLowerCase())).filter(Boolean);
+      if (hit.length) {
+        // 注意：不能写成 `unshift(...hit.filter(ch => !candidates.includes(ch)))` ——
+        // 已在候选里的点名题会被去重过滤掉，等于"点名了却没排到队首"
+        //（实测：日志显示「点名优先: QuiZow」却选中了 cnbragon）。
+        // 正确做法是重建候选顺序：点名题在前（按点名顺序），其余保持原序。
+        const hitIds = new Set(hit.map(c => String(c.id)));
+        const rest = candidates.filter(ch => !hitIds.has(String(ch.id)));
+        candidates.length = 0;
+        candidates.push(...hit, ...rest);
+        addLog('info', `[定向] 点名优先：${hit.map(c => c.name).join('、')}`);
+      } else {
+        addLog('warning', `[定向] 本页未找到点名题目（${wantNames.join('、')}），按普通顺序继续`);
+      }
+    }
+
     if (!candidates.length) {
       addSystemMessage(`**无带附件的逆向未解题**\n\n练习场「${ground.name || groundId}」返回 ${all.length} 道逆向未解题，但均无附件（可能需要靶机）。当前流水线只处理带附件的题。`);
       addLog('warning', '无带附件的逆向未解题');
@@ -993,14 +1086,35 @@ async function solveOnePlatformRound(opts = {}) {
     // 5) 走现有逆向解题流程（analyzeFile 识别类型 → autoAnalyze 分派 → finalizeSolve 验证）
     addLog('info', `[5/6] 交给本地逆向流程解题: ${localFile}`);
     state._platformContext = true;   // 平台上下文：ZIP 附件自动解压取主文件（区别于手动拖 zip）
-    await analyzeFile(localFile);
+    // 题面与伴生文件是平台题最高价值的检索目标，必须在 analyzeFile 的"换题清理"里活下来
+    const savedPlatform = {
+      challenge: state._platformChallenge,
+      desc: state._platformChallengeDesc,
+      files: state._platformFiles,
+    };
+    await analyzeFile(localFile, { keepPlatformContext: true });
+    restorePlatformContext(state, savedPlatform);
     addLog('info', '开始自动分析（现有逆向分流）...');
     await autoAnalyze();
 
     // 6) 收集"已验证"的 flag → 提交平台（必须带 confirmation:true）
     addLog('info', '[6/6] 检查是否产出已验证 flag 并提交平台...');
     const verified = ((state.findings && state.findings.flags) || []).filter(f => f.verified);
-    if (!verified.length) {
+    // 裸答案（口令/序列号/裸字符串）经契约复现确认的，按平台外壳规则包装后一并尝试。
+    // 实测（CrackMe3）：771535 满足 sum==0x2979 且 AI 明确写成 [FLAG]771535[/FLAG]，
+    // 但因为没有 `flag{}` 外壳被整条丢弃，整题记为未解出。
+    const verifiedAnswers = ((state.findings && state.findings.answers) || []).filter(a => a.verified);
+    const submitCandidates = verified.map(f => ({ flag: f.flag, origin: 'flag', ref: f }));
+    for (const a of verifiedAnswers) {
+      const tpl = state._platformWrapTemplate || 'flag{%s}';
+      const wrapped = applyWrap(a.value, tpl);
+      if (!looksLikeFlag(wrapped)) continue;
+      if (submitCandidates.some(x => x.flag === wrapped)) continue;
+      submitCandidates.push({ flag: wrapped, origin: 'answer', ref: a, template: tpl });
+      addLog('info', `[平台] 裸答案 ${a.value} 按题面外壳包装为 ${wrapped}`);
+      addSolveNote('平台提交', `裸答案 ${a.value} → ${wrapped}（模板 ${tpl}）`);
+    }
+    if (!submitCandidates.length) {
       addLog('warning', '未产出「已验证」flag，跳过提交（未验证不提交，避免污染正确率）');
       addSystemMessage(`**${ch.name}**：本地未得到已验证 flag，未提交。\n\n可人工复核后手动提交，或重试。`);
       // note 区分"环境阻断"与"解题失败"：报告里两者的含义完全不同，
@@ -1009,7 +1123,8 @@ async function solveOnePlatformRound(opts = {}) {
       return { ok: false, note, detail: state.lastBlockedReason || '', challenge: { id: cid, name: ch.name, difficulty: ch.difficulty }, verified_flags: [] };
     }
     let submitResult = null;
-    for (const f of verified) {
+    for (const cand of submitCandidates) {
+      const f = { flag: cand.flag };
       const sub = await window.electronAPI.ctf2McpCall('ctf2_submit_flag', {
         challenge_id: cid, practice_ground_id: groundId, flag: f.flag, confirmation: true
       });
@@ -1021,7 +1136,7 @@ async function solveOnePlatformRound(opts = {}) {
       // `{"accepted":false,...}` 时 "accepted" 这个词本身就会命中，导致**错误 flag 被记为成功**
       // （实测「内涵的软件」：accepted=false，驱动仍打印"解出"）。
       const ok = ctf2SubmitAccepted(subData, s);
-      submitResult = { flag: f.flag, correct: ok, raw: s.slice(0, 400) };
+      submitResult = { flag: f.flag, correct: ok, raw: s.slice(0, 400), origin: cand.origin };
       addLog(ok ? 'success' : 'warning', `提交 ${f.flag} → ${s.slice(0, 200)}`);
       addSolveNote('平台提交', `challenge=${ch.name} flag=${f.flag} result=${s.slice(0, 200)}`);
       // 平台笔记：记录解题结果（凭据页要求 result 可回看）
@@ -1029,7 +1144,21 @@ async function solveOnePlatformRound(opts = {}) {
       addSystemMessage(ok
         ? `**🎯 题目「${ch.name}」已解出并提交成功**\n\n\`${f.flag}\``
         : `**题目「${ch.name}」提交结果**\n\n\`${f.flag}\`\n\n平台返回: ${s.slice(0, 300)}`);
-      if (ok) break; // 一道题命中即可
+      if (ok) {
+        if (cand.origin === 'answer') {
+          addLog('success', `[平台] 裸答案经平台外壳规则包装后提交通过（模板 ${cand.template}）`);
+        }
+        break; // 一道题命中即可
+      }
+      // 裸答案包装后提交未通过 → 降级为未验证，避免下一轮误判已解出
+      if (cand.origin === 'answer') {
+        try {
+          cand.ref.verified = false;
+          cand.ref.source = String(cand.ref.source || '') + ',wrap-rejected';
+          persistFindings();
+        } catch (e) { /* 降级失败不阻塞 */ }
+        addLog('warning', `[平台] 裸答案 ${cand.ref.value} 包装后提交未通过，已降级为未验证`);
+      }
     }
     // 提交被平台拒绝时，必须把"已验证"标记降级：否则下一轮会认为这题已解出，
       // 既不再重试，报告里也会把它算成成功（实测「内涵的软件」accepted=false 却记为解出）。
@@ -1172,6 +1301,8 @@ async function __ctfAutoTest(opts = {}) {
   // 否则每题重启后都从第 1 页第 1 道开始，永远在原地打转。
   const seedExclude = Array.isArray(opts.exclude) ? opts.exclude.map(String) : [];
   const attempted = new Set(seedExclude);
+  // 定向验证：调用方点名要跑的题（优先、可跨页找）。队列会被消费掉，跑过的题不再重复优先。
+  const wantQueue = Array.isArray(opts.wantNames) ? opts.wantNames.map(String).filter(Boolean) : [];
 
   for (let i = 0; i < limit; i++) {
     if (state.platformAbort) break;
@@ -1181,7 +1312,10 @@ async function __ctfAutoTest(opts = {}) {
       try {
         // 先传"本次运行产生的"排除集；种子排除集由 solveOnePlatformRound 内部读 config 处理，
         // 这里把两者合并，保证翻页位置也对（attempted.size 决定 page）。
-        const round = await solveOnePlatformRound({ exclude: attempted });
+        const round = await solveOnePlatformRound({
+          exclude: attempted,
+          wantNames: wantQueue.length ? wantQueue.slice() : undefined
+        });
         return round || { ok: false, note: 'null-round' };
       } catch (e) {
         return { ok: false, note: 'exception: ' + e.message };
@@ -1191,6 +1325,11 @@ async function __ctfAutoTest(opts = {}) {
     })();
 
     const name = (r.challenge && r.challenge.name) || '(unknown)';
+    // 定向队列：本轮跑过的题从队列里移除，避免下一轮又优先同一道
+    if (wantQueue.length && name && name !== '(unknown)') {
+      const qi = wantQueue.findIndex(w => w === name || w.toLowerCase() === String(name).toLowerCase());
+      if (qi >= 0) wantQueue.splice(qi, 1);
+    }
     results.push({
       name, ok: !!r.ok, note: r.note || '',
       flag: (r.submitted && r.submitted.flag) || (r.verified_flags && r.verified_flags[0]) || '',
@@ -1204,7 +1343,11 @@ async function __ctfAutoTest(opts = {}) {
 
     // 跨进程去重：把"本轮已尝试过"写进 config.platform.skipChallenges，
     // 否则每题重启工具后 exclude 丢失 → 同一题被反复拉取（实测 not-baby-parallelism 连跑两轮）。
-    if (name && name !== '(unknown)') {
+    // 定向验证（noPersistSkip）不写：定向复验本来就要反复跑同几道题，
+    // 写进跳过清单会污染后续批量选题目录。
+    if (opts.noPersistSkip) {
+      addLog('info', `[自动测试] 定向模式：不把「${name}」写入跳过清单`);
+    } else if (name && name !== '(unknown)') {
       try {
         const cur = ((state.config && state.config.platform && state.config.platform.skipChallenges) || []).slice();
         if (!cur.includes(name)) {
@@ -1365,7 +1508,8 @@ async function analyzeZipHandout(zipPath) {
       await caseAddEvidence('zip_handout_files', '手包全部文件清单', files.join('\n'), 'txt');
     } catch (e) { /* 证据失败不阻塞 */ }
   }
-  await analyzeFile(main);
+  await analyzeFile(main, { keepPlatformContext: true });
+  restorePlatformContext(state, { challenge: state._platformChallenge, desc: state._platformChallengeDesc, files: files.slice() });
   await autoAnalyze();
 }
 
@@ -1685,6 +1829,157 @@ function disableActionButtons() {
   document.getElementById('btn-generate-wp').disabled = true;
 }
 
+// ===== IDA 会话身份判定（rank 3）=====
+// 与 electron/binary-map.js 里同名函数保持同一语义；渲染层不能 require，
+// 因此这里保留一份最小实现，由 tests/test_ida_identity.js 双向比对。
+function normalizePathForCompare(p) {
+  return String(p || '').trim().replace(/\\/g, '/').toLowerCase();
+}
+
+function basenameOf(p) {
+  const s = String(p || '');
+  const i = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+
+function decideIdaAction(input) {
+  const i = input || {};
+  if (!i.listening) {
+    return { action: 'launch', reason: 'not-listening', log: '[IDA] 13337 未监听，启动新实例' };
+  }
+  const id = i.identity || {};
+  if (!id.success) {
+    return {
+      action: 'reload', reason: 'unknown',
+      log: '[IDA] 身份未知（server_health 不可用），按安全策略重载目标文件'
+    };
+  }
+  const loaded = normalizePathForCompare(id.input_path || id.module || id.idb_path);
+  const target = normalizePathForCompare(i.targetPath);
+  if (!loaded || !target) {
+    return {
+      action: 'reload', reason: 'unknown',
+      log: '[IDA] 身份信息不完整（缺少 input_path/module），按安全策略重载'
+    };
+  }
+  if (loaded === target) {
+    return {
+      action: 'reuse', reason: 'same',
+      log: '[IDA] 身份校验通过: ' + basenameOf(id.input_path || id.module)
+    };
+  }
+  return {
+    action: 'reload', reason: 'mismatch',
+    log: '[IDA] 目标不一致：已加载 ' + basenameOf(loaded) + '，当前题需要 ' + basenameOf(target) + '，重载'
+  };
+}
+
+function planPidClose(before, after) {
+  const prev = new Set((before || []).map(Number).filter(Number.isFinite));
+  return (after || []).map(Number).filter(p => Number.isFinite(p) && !prev.has(p));
+}
+
+// 把不属于当前文件地址空间的函数剔除（与 electron/binary-map.js 同一语义）。
+// funcs 支持 [{address|addr|start|ea, name}] 与裸地址数组。
+function parseAddrLoose(v) {
+  if (typeof v === 'number') return v;
+  if (typeof v === 'string') {
+    const m = v.trim().match(/^(?:0x)?([0-9a-fA-F]+)$/);
+    return m ? parseInt(m[1], 16) : NaN;
+  }
+  return NaN;
+}
+
+function isAddrInImageLoose(map, addr) {
+  if (!map || !Number.isFinite(addr) || addr <= 0) return false;
+  const abs = (s) => (map.vaIsAbsolute ? s.va : map.imageBase + s.va);
+  const lo = map.imageBase;
+  const hi = lo + map.sizeOfImage;
+  if (addr < lo || addr >= hi) return false;
+  for (const s of (map.sections || [])) {
+    const start = abs(s);
+    const size = s.vsize || s.rawSize || 0;
+    if (size > 0 && addr >= start && addr < start + size) return true;
+  }
+  return false;
+}
+
+function filterFunctionsInImage(funcs, map) {
+  const kept = [];
+  const dropped = [];
+  if (!Array.isArray(funcs) || !map) return { kept: funcs || [], dropped, mapOk: false };
+  for (const f of funcs) {
+    let raw;
+    if (typeof f === 'number' || typeof f === 'string') raw = f;
+    else if (f && typeof f === 'object') {
+      raw = f.address != null ? f.address : (f.addr != null ? f.addr : (f.start != null ? f.start : f.ea));
+    }
+    const addr = parseAddrLoose(raw);
+    if (!Number.isFinite(addr) || addr <= 0) { dropped.push(f); continue; }
+    if (isAddrInImageLoose(map, addr)) kept.push(f); else dropped.push(f);
+  }
+  return { kept, dropped, mapOk: true };
+}
+
+async function listIdaPids() {
+  const pids = [];
+  for (const img of ['ida.exe', 'ida64.exe']) {
+    try {
+      const r = await window.electronAPI.runToolArgs(['tasklist', '/FI', 'IMAGENAME eq ' + img, '/FO', 'CSV', '/NH'], {});
+      const out = String((r && r.stdout) || '');
+      for (const line of out.split(/\r?\n/)) {
+        const m = line.match(/^"[^"]*","(\d+)"/);
+        if (m) pids.push(Number(m[1]));
+      }
+    } catch (e) { /* 查询失败按无进程处理 */ }
+  }
+  return pids;
+}
+
+// ===== 平台题目契约（rank 4）=====
+// 题面是平台题最高价值的检索目标：实测 22/22 份会话 prompt 里都没有它，
+// 因为 analyzeFile 的"换题清理"把刚写进去的 desc/files 立刻清空了。
+// 平台/zip 流程在 analyzeFile 之后用这个函数把三项恢复回来。
+function restorePlatformContext(target, saved) {
+  const s = target || {};
+  const v = saved || {};
+  if (v.challenge !== undefined) s._platformChallenge = v.challenge;
+  if (v.desc !== undefined) s._platformChallengeDesc = v.desc;
+  if (v.files !== undefined) s._platformFiles = v.files;
+  return s;
+}
+
+// 从题面里识别"答案要包什么外壳"。
+// 实测（CrackMe3）：「注意：得到的 flag 请包上 flag{} 提交」——这句话一直存在，
+// 但旧的 8 条 shapeRules 只认邮箱/md5/base64 等数据形态，匹配不到"包装指令"，
+// 于是 AI 算出的 771535 因不是 flag{...} 形态被静默丢弃。
+function parseWrapDirective(desc) {
+  const s = String(desc || '');
+  if (!s) return null;
+  // 显式模板：flag{...} / flag{} / XXX{}
+  const explicit = s.match(/([A-Za-z][A-Za-z0-9_]{0,15})\s*\{\s*\}/);
+  if (explicit) {
+    const prefix = explicit[1];
+    if (/包上|包裹|包成|加上|套上|外层|格式为|提交格式|wrap/i.test(s)) {
+      return { template: prefix + '{%s}', evidence: explicit[0] };
+    }
+  }
+  // 只说了"包 flag{}"（不带前缀名）
+  if (/包上\s*flag\s*\{\s*\}|包成\s*flag\s*\{\s*\}|flag\s*\{\s*\}\s*提交/.test(s)) {
+    return { template: 'flag{%s}', evidence: (s.match(/[^。\n]{0,30}flag\s*\{\s*\}[^。\n]{0,20}/) || [''])[0] };
+  }
+  return null;
+}
+
+function applyWrap(value, tpl) {
+  const v = String(value == null ? '' : value).trim();
+  const t = String(tpl || 'flag{%s}');
+  if (!v) return v;
+  // 已经是外壳形态就不再套
+  if (/^[A-Za-z][A-Za-z0-9_]*\{[^}]*\}$/.test(v)) return v;
+  return t.replace('%s', v);
+}
+
 // 启动工具
 async function launchTool(toolName, filePath = null) {
   const needFile = ['ida', 'ida64', 'die', 'jadx', 'pycdc', 'pycdas'];
@@ -1736,14 +2031,52 @@ async function launchTool(toolName, filePath = null) {
         addLog('info', mcpScriptPath ? `JEB MCP脚本: ${mcpScriptPath}` : 'JEB MCP脚本路径未配置（跳过 --script）');
       }
     } else if (toolName === 'ida' || toolName === 'ida64') {
-      // 防重复实例：13337 在监听即说明已有 IDA+MCP 在跑，跳过再启动
+      // 防重复实例 + **身份校验**：
+      // 旧实现只判断"13337 在监听"，等于假设"端口后面那个库就是当前文件"。
+      // 实测代价极高：cnbragon / not-baby-parallelism / QuiZow 整轮的分析证据
+      // 都来自上一题的数据库（一个 12KB 的 PE 被反编译出映像外的 0x42F038），
+      // AI 在错误样本上烧满 60 轮。现在必须先问清"你加载的是谁"。
+      let listening = false;
       try {
         const p = await window.electronAPI.checkPort(13337);
-        if (p && p.listening) {
-          addLog('info', '检测到 IDA MCP 已在运行（13337），跳过再次启动 IDA');
-          return;
+        listening = !!(p && p.listening);
+      } catch (e) { /* 探测失败按未监听处理 */ }
+
+      if (listening) {
+        let identity = { success: false };
+        try { identity = await window.electronAPI.idaIdentity(); } catch (e) { identity = { success: false, error: e.message }; }
+        const verdict = decideIdaAction({
+          listening: true,
+          identity,
+          targetPath: fileToOpen || ''
+        });
+        addLog(verdict.action === 'reuse' ? 'info' : 'warning', verdict.log);
+        if (verdict.action === 'reuse') return;
+        // reload：身份未知或目标不一致 —— 先试 open_file 切换，失败再按 PID 重启
+        if (identity && identity.success) {
+          try {
+            const opened = await window.electronAPI.idaMcpCall('open_file', {
+              file_path: fileToOpen, switch: true, autonomous: true
+            });
+            const okOpen = opened && (opened.success !== false);
+            if (okOpen) {
+              addLog('info', '[IDA] 已通过 open_file 切换目标文件: ' + basenameOf(fileToOpen));
+              return;
+            }
+            addLog('warning', '[IDA] open_file 不可用，改为按 PID 重启实例');
+          } catch (e) {
+            addLog('warning', '[IDA] open_file 调用失败（' + e.message + '），改为按 PID 重启实例');
+          }
         }
-      } catch (e) { /* 未运行则继续启动 */ }
+        // 按 PID 只结束"本次启动新增"的实例，绝不动用户自己开的 IDA
+        const before = await listIdaPids();
+        try { await window.electronAPI.runToolArgs(['taskkill', '/F', '/IM', 'ida.exe'], {}); } catch (e) { /* 可能已不存在 */ }
+        try { await window.electronAPI.runToolArgs(['taskkill', '/F', '/IM', 'ida64.exe'], {}); } catch (e) { /* 同上 */ }
+        const after = await listIdaPids();
+        const leftover = planPidClose(before, after);
+        if (leftover.length) addLog('info', '[IDA] 已结束旧实例 PID: ' + leftover.join(','));
+        await new Promise(r => setTimeout(r, 2500));
+      }
 
       const idaPath = state.config.tools[toolName] || state.config.tools.ida;
       // 残留数据库检测：上次 IDA 非正常退出会留下 <file>.id0/.id1 等未打包残件；
@@ -7676,6 +8009,28 @@ async function autoSolveBinaryFlag(fileType) {
       const f2 = (r2 && Array.isArray(r2.result)) ? r2.result : [];
       if (f2.length > funcs.length) { funcs = f2; funcsResult = r2; }
     }
+    // 落界校验：这些地址真的属于当前文件吗？
+    // 实测（QuiZow）IDA 会话串台时返回的 100 个函数里有 62 个落在目标所有 section 之外，
+    // 只校验"数组非空"就记 ✅，会让别人的库一路以成功状态进入提示词与证据落盘。
+    if (funcs.length) {
+      try {
+        const im = await window.electronAPI.fileImageMap(state.currentFile);
+        if (im && im.success && im.map) {
+          const { kept, dropped } = filterFunctionsInImage(funcs, im.map);
+          if (dropped.length) {
+            addLog('warning', `[IDA] 越界地址 ${dropped.length}/${funcs.length} 个不在映像内`
+              + `（ImageBase=0x${im.map.imageBase.toString(16)}, SizeOfImage=0x${im.map.sizeOfImage.toString(16)}），判定为串台，已剔除`);
+            const sample = dropped.slice(0, 3).map(f => {
+              const a = (f && (f.address != null ? f.address : f.addr)) || '?';
+              return String(a);
+            }).join(', ');
+            addLog('warning', `[IDA] 越界样例: ${sample}`);
+            funcs = kept;
+          }
+        }
+      } catch (e) { /* 映像解析失败不阻塞，但也不再声称"地址已验证" */ }
+    }
+
     if (funcsResult && funcsResult.success) {
       analysisData.functions = funcs;
       addLog('success', `✅ 已获取函数列表（${funcs.length} 个）`);
@@ -7879,8 +8234,23 @@ async function autoSolveBinaryFlag(fileType) {
       addLog('success', `[算法扫描] ${sc.summary.map(s => s.algo + '(' + s.confidence + ')').join(', ')}`);
       try { await caseAddEvidence('crypto_scan', '算法指纹扫描结果', JSON.stringify(sc, null, 2), 'json'); } catch (e) {}
     } else {
-      addLog('info', '[算法扫描] 未发现算法指纹（本层可能是壳/加载器/decoy）');
-      algHintText = `\n## ⚙️ 算法指纹扫描：**未发现任何算法常量**\n本层极可能是**壳/加载器/decoy**（SM4/AES/SM3/SHA/TEA/CRC32 常量全无）——算法在**下一层**。\n请先找内嵌/解密逻辑提取下一层，**不要在本层盲猜算法或硬逆它的 VM**。\n`;
+      // 零指纹只说明"扫描器没认出来"，不说明"一定是壳"。
+      // 实测（CrackMe2）真实算法是 MD5、K 表就在本层、没有任何内嵌载荷，
+      // 旧文案却断言"算法在下一层"，把 AI 推向了错误方向。
+      const scAny = state.lastAlgScan || {};
+      const hasPayloadNow = (Array.isArray(scAny.payloads) && scAny.payloads.length > 0)
+        || (Array.isArray(scAny.embeddedPE) && scAny.embeddedPE.length > 0);
+      if (hasPayloadNow) {
+        addLog('info', '[算法扫描] 未发现算法指纹，但本层存在内嵌载荷 → 先提取下一层');
+        algHintText = `\n## ⚙️ 算法指纹扫描：**未发现任何算法常量**\n`
+          + `本层**确有内嵌载荷**（见下方载荷列表）：算法可能在下一层。请先提取，再对**新文件**重跑扫描。\n`;
+      } else {
+        addLog('info', '[算法扫描] 未发现算法指纹（本层无内嵌载荷，优先在本层找自实现算法/轮常量）');
+        algHintText = `\n## ⚙️ 算法指纹扫描：**未发现任何算法常量**\n`
+          + `这不等于"是壳"：可能是**自实现算法**、**常量布局非常规**（表被拆分/加花、按非标准步长或 lane 交错存放）、`
+          + `或算法写在其它函数里。本层**没有内嵌载荷**。\n`
+          + `建议优先在本层找逐字节比较/位运算循环与内联常量表；不要仅凭"扫描无命中"就断定存在下一层。\n`;
+      }
     }
   } catch (e) { addLog('warning', '[算法扫描] 失败（不阻塞）: ' + e.message); }
 
@@ -8228,8 +8598,24 @@ async function toolUseDeepSolveBinary(analysisData, fileType) {
     [/邮箱|account|账号/i, '账号类 → 搜资源文件/字符串里的账号字段'],
   ];
   const shapes = [...new Set(shapeRules.filter(([re]) => re.test(descRaw)).map(([, s]) => s))];
+  // 包装指令：题面明确要求"包成 xxx{...}"时，把模板记下来。
+  // 实测（CrackMe3）：「请包上 flag{} 提交」这句话存在，但旧的 8 条 shapeRules
+  // 只认数据形态（邮箱/md5/base64…），完全匹配不到"包装指令"，
+  // 于是算出的 771535 因不是 flag{...} 形态被静默丢弃。
+  const wrapDirective = parseWrapDirective(descRaw);
+  if (wrapDirective) {
+    state._platformWrapTemplate = wrapDirective.template;
+    addLog('info', `[平台] 检测到包装指令 → ${wrapDirective.template}（依据：${wrapDirective.evidence.slice(0, 40)}）`);
+  }
+  const wrapHint = wrapDirective
+    ? `\n### 🎯 题面规定了答案的外壳——最终答案必须按此包装\n`
+      + `模板：\`${wrapDirective.template}\`（把裸值代入 %s，例如 ${applyWrap('你的结果', wrapDirective.template)}）\n`
+      + `要求：先求出**裸值**（口令/序列号/字符串），再用该模板包装后提交；`
+      + `不要因为"它看起来不像 flag"就丢弃一个已复现成功的值。\n`
+    : '';
   const platDesc = state._platformChallengeDesc
     ? `\n## 题目描述（平台官方，含运行用法）\n${String(state._platformChallengeDesc).slice(0, 2000)}\n`
+      + wrapHint
       + (shapes.length
         ? `\n### ⚠️ 描述里规定了 flag 的形态——按此定向检索，不要只猜常见 flag 格式\n${shapes.map(s => '- ' + s).join('\n')}\n`
           + '提示：先在全文件/资源/字符串里按上述形态**正则搜索**（用 run_python 直接读字节扫），\n'
@@ -8297,12 +8683,26 @@ ${lines.join('\n')}
 ${constraint}`;
       addLog('info', `[算法扫描] 注入深度求解提示：${sc.summary.map(s => s.algo).join(', ')}`);
     } else if (sc && sc.success) {
-      // 零指纹同样是有用信息：本层没有算法常量 → 极可能是壳/加载器/decoy，真算法在下一层
-      algHint = `\n## ⚙️ 工具已确定性扫描算法指纹：**本层未发现任何算法常量**
-含义：当前文件里没有 S 盒/FK/CK/IV/魔数等加密特征 → **本层很可能是壳、加载器或 decoy**，真正的算法在它解出的下一层（内嵌 PE / 解包后的文件）。
-**下一步**：找"释放/解密下一层"的代码（常见：`.data` 大数组按 dword 取低字节 XOR 常量 → 写新缓冲区；或 VirtualAlloc+手工映射），**dump 出下一层并对它重新扫描**；
-不要在本层反复找不存在的加解密逻辑。若本层确有可疑大数组，也可用 \`ida_get_bytes\` 直接读出来自查。\n`;
-      addLog('info', '[算法扫描] 本层零指纹 → 提示 AI 走"找下一层/dump"路线');
+      // 零指纹只说明"扫描器没认出来"。是否有下一层，要看**有没有内嵌载荷**，而不是看有没有常量。
+      const scZero = state.lastAlgScan || sc || {};
+      const hasPayloadZero = (Array.isArray(scZero.payloads) && scZero.payloads.length > 0)
+        || (Array.isArray(scZero.embeddedPE) && scZero.embeddedPE.length > 0);
+      if (hasPayloadZero) {
+        algHint = `\n## ⚙️ 工具已确定性扫描算法指纹：**本层未发现任何算法常量，但本层有内嵌载荷**
+含义：算法可能在载荷解出的下一层。
+**下一步**：按载荷列表把下一层 dump 出来，对**新文件**重新扫描；不要在本层反复找不存在的加解密逻辑。\n`;
+        addLog('info', '[算法扫描] 本层零指纹但有载荷 → 提示 AI 先提取下一层');
+      } else {
+        algHint = `\n## ⚙️ 工具已确定性扫描算法指纹：**本层未发现任何算法常量**
+这不等于"本层是壳"。真实原因可能是：
+① **自实现算法**（S 盒被换成自生成表、或根本不用 S 盒）；
+② **使用非常规常量布局**（例如 K 表被拆分/加花、只有轮常量没有 S 盒/IV，或表项按非标准步长交错存放）；
+③ 算法写在别的函数/别的模块里。
+**本层没有内嵌载荷**，因此"去下一层找"这条路不成立。
+**下一步**：优先在本层找逐字节比较、位运算循环、内联常量表；用 \`ida_get_bytes\` 直接读可疑区域自查。
+只有在确实找到"释放/解密下一层"的代码后，才去 dump 新文件。\n`;
+        addLog('info', '[算法扫描] 本层零指纹且无载荷 → 提示 AI 在本层找自实现算法/轮常量');
+      }
     }
   } catch (e) { /* 扫描失败不阻塞 */ }
   const prompt = `我在解一道 CTF ${fileType || '二进制'} 题，静态固定清单分析未得出 flag。请**使用工具**自主深入分析并求出 flag。
@@ -8445,32 +8845,60 @@ ${sideFilesBlock}
       // v1.7.4 扩展：**验证失败也要重试**。实测 6 道题"有契约但本地复现失败"，
       // 根因多是 AI 的 expected 写错（猜的前缀与实际不符）或参数差一点；
       // finalizeSolve 已把真实解密输出拼成 retryPrompt，此前却没有消费方 → 白丢证据。
-      const shouldRetry = fin && fin.retryPrompt && !vf.length
-        && ((fin.refuted && fin.refuted.length) || fin.vr && fin.vr.failureFeedback);
-      if (shouldRetry) {
-        const reason = (fin.refuted && fin.refuted.length) ? '负面断言已被推翻' : '验证失败（附真实解密输出）';
-        addLog('warning', `[重试] 追加一轮 AI（${reason}，强制基于证据修正）`);
+      //
+      // rank 5：重试改成**循环**（最多 2 轮）。旧实现只跑一轮且把第二次 finalizeSolve
+      // 的返回值直接丢掉——第二轮生成的定向提示（中间值类型/机器码结论）没有任何消费方，
+      // 实测（CrackMe3）日志出现了「已生成定向下一步提示」却不再有第三次调用。
+      const MAX_RETRY_ROUNDS = 2;
+      let retryFin = fin;
+      let retryText = result.text;
+      let retryRefuted = fin && fin.refuted;
+      for (let round = 1; round <= MAX_RETRY_ROUNDS; round++) {
+        const vfNow = (state.findings ? state.findings.flags : []).filter(f => f.verified);
+        const canRetry = retryFin && retryFin.retryPrompt && !vfNow.length
+          && ((retryRefuted && retryRefuted.length) || (retryFin.vr && retryFin.vr.failureFeedback)
+            || retryFin.intermediateTyped || retryFin.machineCodeNote);
+        if (!canRetry) break;
+        const reason = (retryRefuted && retryRefuted.length)
+          ? (round === 1 ? '负面断言已被推翻' : `负面断言已被推翻（第 ${round} 轮）`)
+          : (round === 1 ? '验证失败（附真实解密输出）' : `验证失败（第 ${round} 轮）`);
+        addLog('warning', `[重试] 第 ${round} 轮：追加一轮 AI（${reason}，强制基于证据修正）`);
         const retryMessages = [
           { role: 'user', content: prompt },
-          { role: 'assistant', content: String(result.text || '').slice(0, 20000) },
-          { role: 'user', content: fin.retryPrompt + '\n\n请直接执行上述动作；不要重复之前的否定结论。' },
+          { role: 'assistant', content: String(retryText || '').slice(0, 20000) },
+          { role: 'user', content: retryFin.retryPrompt + '\n\n请直接执行上述动作；不要重复之前的否定结论。' },
         ];
+        let r2 = null;
         try {
-          const r2 = await window.electronAPI.claudeChat(retryMessages, buildSystemPrompt());
-          if (r2 && r2.success && r2.text) {
-            state.lastAiText = r2.text;
-            addSolveNote('求解结果(修正重试)', String(r2.text).replace(/\s+/g, ' ').trim().slice(0, 3000));
-            // 重试里若又请求接力，同样处理
-            if (r2.stageSwitch && r2.stageSwitch.path) {
-              const hr = await runStageHandoff(r2.stageSwitch, r2.text);
-              if (hr.ok) return true;
-            }
-            await finalizeSolve(r2.text, { source: 'ai-deep-retry' });
-            const vf2 = (state.findings ? state.findings.flags : []).filter(f => f.verified);
-            addSystemMessage(`**🎯 Tool-Use 深度求解结果（证据回灌后重试）**\n\n${vf2.length ? `**Flag（✅已验证）**: \`${vf2[0].flag}\`` : ''}\n\n${r2.text}`);
-            return vf2.length > 0;
-          }
-        } catch (e) { addLog('warning', '[重试] 失败（不阻塞）: ' + e.message); }
+          r2 = await window.electronAPI.claudeChat(retryMessages, buildSystemPrompt());
+        } catch (e) {
+          addLog('warning', `[重试] 第 ${round} 轮调用失败（不阻塞）: ${e.message}`);
+          break;
+        }
+        if (!(r2 && r2.success && r2.text)) break;
+        state.lastAiText = r2.text;
+        addSolveNote(`求解结果(修正重试${round > 1 ? ' ' + round : ''})`, String(r2.text).replace(/\s+/g, ' ').trim().slice(0, 3000));
+        addLog('info', `[重试] 第 ${round} 轮定向提示已消费`);
+        // 重试里若又请求接力，同样处理
+        if (r2.stageSwitch && r2.stageSwitch.path) {
+          const hr = await runStageHandoff(r2.stageSwitch, r2.text);
+          if (hr.ok) return true;
+        }
+        // 必须接住返回值：下一轮的 retryPrompt 来自这里
+        retryFin = await finalizeSolve(r2.text, { source: round === 1 ? 'ai-deep-retry' : 'ai-deep-retry-' + round });
+        retryText = r2.text;
+        retryRefuted = retryFin && retryFin.refuted;
+        const vf2 = (state.findings ? state.findings.flags : []).filter(f => f.verified);
+        if (vf2.length) {
+          addSystemMessage(`**🎯 Tool-Use 深度求解结果（证据回灌后重试）**\n\n**Flag（✅已验证）**: \`${vf2[0].flag}\`\n\n${r2.text}`);
+          return true;
+        }
+        if (round === MAX_RETRY_ROUNDS) addLog('info', `[重试] 已达上限（${MAX_RETRY_ROUNDS} 轮）`);
+      }
+      {
+        const vf2 = (state.findings ? state.findings.flags : []).filter(f => f.verified);
+        addSystemMessage(`**🎯 Tool-Use 深度求解结果**\n\n${vf2.length ? `**Flag（✅已验证）**: \`${vf2[0].flag}\`` : ''}\n\n${retryText}`);
+        return vf2.length > 0;
       }
 
       addSystemMessage(`**🎯 Tool-Use 深度求解结果**\n\n${vf.length ? `**Flag（✅已验证）**: \`${vf[0].flag}\`` : ''}\n\n${result.text}`);
@@ -8913,6 +9341,35 @@ function recordFlag(flag, source, verified = false) {
     if (source && !existing.source.includes(source)) existing.source += ',' + source;
   } else {
     state.findings.flags.push({ flag, verified, source: source || 'ai', ts: new Date().toISOString() });
+  }
+  persistFindings();
+}
+
+// 登记"裸答案"（口令/序列号/裸字符串）——**不经** looksLikeFlag 过滤。
+// 为什么需要（CrackMe3）：AI 第一轮就给出并自证了 771535（本地复现 sum==0x2979），
+// recordFlag 因它不是 `xxx{...}` 形态直接 return，最终 flags 为空、整题记为未解出。
+// 但"不是 flag 形态"不等于"不是答案"——平台题面常常要求答题者自己包壳。
+// 是否可信由 verified 标记承担，绝不在这里默认标 verified。
+function recordAnswer(value, opts = {}) {
+  if (!state.findings) return;
+  const v = String(value == null ? '' : value).trim();
+  if (!v || v.length < 2 || v.length > 200) return;
+  // 已经是 flag 形态的走 recordFlag，不重复记
+  if (looksLikeFlag(v)) { recordFlag(v, opts.source || 'ai', !!opts.verified); return; }
+  if (!Array.isArray(state.findings.answers)) state.findings.answers = [];
+  const existing = state.findings.answers.find(a => a.value === v);
+  if (existing) {
+    if (opts.verified) existing.verified = true;
+    if (opts.source && !String(existing.source).includes(opts.source)) existing.source += ',' + opts.source;
+    if (opts.evidence) existing.evidence = opts.evidence;
+  } else {
+    state.findings.answers.push({
+      value: v,
+      verified: !!opts.verified,
+      source: opts.source || 'ai',
+      evidence: opts.evidence || '',
+      ts: new Date().toISOString(),
+    });
   }
   persistFindings();
 }
@@ -9863,6 +10320,44 @@ async function verifyAndRecord(aiText, opts = {}) {
   // augmentSynth：走到这里说明契约已经失败（!vr.verified），
   // 此时即使 AI 给过 [HYPOTHESES]，也要追加工具合成的维度（P1）。
   if (vr && !vr.verified) await runHypotheses(aiText, { synthFrom: vr.contracts, augmentSynth: true });
+
+  // ── 契约驱动的"裸答案"判定（rank 5）──
+  // 记 verified 的条件必须同时成立，绝不把"顺手给的 key"标成已验证：
+  //   ① 值 V 出现在 extractFlags(aiText) 里（AI 明确把它当答案提出，含 [FLAG]V[/FLAG]）；
+  //   ② 存在契约 c 使 String(c.key).trim() === V；
+  //   ③ 该契约的本地复现产生了命中（vr.hits.length > 0）。
+  // 实测（CrackMe3）：V=771535、c.key=771535、契约复现出 shellcode → 三条全中。
+  try {
+    const hits = (vr && Array.isArray(vr.hits)) ? vr.hits : [];
+    const contracts = (vr && Array.isArray(vr.contracts)) ? vr.contracts : [];
+    if (flags.length) {
+      for (const v of flags) {
+        const t = String(v || '').trim();
+        if (!t) continue;
+        const byKey = contracts.some(c => c && String(c.key == null ? '' : c.key).trim() === t);
+        const okVerified = byKey && hits.length > 0;
+        if (okVerified) {
+          recordAnswer(t, {
+            source: 'verify-contract-key',
+            verified: true,
+            evidence: `契约 key=${t} 本地复现命中（${hits.length} 条）`,
+          });
+          addLog('success', `[验证闭环] 裸答案 ${t} 经契约复现确认（contract.key 匹配且本地有命中）`);
+        } else {
+          recordAnswer(t, { source: source, verified: false });
+        }
+      }
+    }
+    // 契约里出现但 AI 没在 [FLAG] 里明确提出的 key：只登记为未验证候选
+    for (const c of contracts) {
+      if (!c || c.key == null) continue;
+      const k = String(c.key).trim();
+      if (!k) continue;
+      if (flags.some(f => String(f || '').trim() === k)) continue;
+      recordAnswer(k, { source: 'verify-contract-key(unstated)', verified: false });
+    }
+  } catch (e) { addLog('warning', '[验证闭环] 裸答案判定异常（已隔离）: ' + e.message); }
+
   flags.forEach(f => addSolveNote(noteSection, f));
   const verifiedFlags = (state.findings ? state.findings.flags : []).filter(f => f.verified);
   return { vr, flags, verifiedFlags };
@@ -10056,15 +10551,90 @@ async function finalizeSolve(aiText, opts = {}) {
         return { vr, flags, verifiedFlags, wrappedFromPrintable: true };
       }
     }
+    // ── 机器码优先于通用 hex 分类（rank 5）──
+    // 实测（CrackMe3）：AI 用自定义 RC4 变体解出 `83ec18b0 65b16388 ... c3 90 90`——
+    // 那是一段完整 x86 函数（sub esp,0x18 … ret nop nop），算法和 key 都对，
+    // 拿到的只是**代码层**。而 classifyIntermediateValues 会把同一段字节判成
+    // "128 字节的十六进制数据 → 当作下一层的 ciphertext 继续解"，方向完全相反。
+    // 机器码是更强的确定性结论，必须先判它，并且即使没有 failureFeedback 也要返回提示。
+    let dlEarly = { count: 0, sample: '' };
+    try { dlEarly = findDecodedLayer(vr.rawOutput || '') || dlEarly; } catch (e) { /* 忽略 */ }
+    if (dlEarly.count > 0) {
+      const mc = [
+        '⛔ 工具从你的解密输出里识别出了可执行机器码（' + dlEarly.count + ' 处）。',
+        '样本：`' + String(dlEarly.sample || '').slice(0, 120) + '`',
+        '这说明**你的算法和密钥是对的**，但解出来的不是明文，而是**下一层代码**。',
+        '因此**不要换算法、不要换 key**。正确动作：',
+        '① 把该字节按 hex 写盘为新文件（run_python: bytes.fromhex(...) → open(...,"wb")）；',
+        '② 读文件头确认魔数（MZ/ELF/或确认为裸 shellcode）；',
+        '③ 用 switch_to_next_stage 接力到新文件，或直接用 capstone/unicorn 分析它。',
+      ].join('\n');
+      addLog('info', '[验证闭环] 机器码结论优先于通用 hex 分类');
+      return { vr, flags, verifiedFlags, retryPrompt: mc, machineCodeNote: mc };
+    }
+
     const typed = classifyIntermediateValues(vr.hits);
     if (typed.length) {
+      // ── P2：先自动推进，而不是只把"这是 MD5"丢回给 AI ──
+      // 实测：AI 拿到"可能是 md5"之后基本不会主动去爆破，整题就卡在这一步。
+      // 能确定性推进的先做掉（爆破/解码），成功就等于直接拿到下一层输入。
+      let advanced = [];
+      try {
+        advanced = await autoAdvanceIntermediates(vr.hits);
+      } catch (e) {
+        addLog('warning', '[中间值] 自动推进异常（已隔离）: ' + e.message);
+      }
+      const solvedByAdvance = advanced.filter(a => a.ok);
+      if (solvedByAdvance.length) {
+        // 解出的明文**只有本身已是 flag 形态**才直接记为已验证。
+        // 不能把 md5("admin")="admin" 这种口令自动包成 flag{admin} 并标 verified：
+        // 那是"未经验证的猜测"冒充确定结论，会污染正确率统计（实测已有此类误报）。
+        // 其余明文一律当作「下一层输入」交回 AI，由它决定是否加外壳再 [VERIFY]。
+        const plaintexts = solvedByAdvance
+          .map(a => String(a.plaintext || '').trim())
+          .filter(Boolean);
+        for (const p of plaintexts) {
+          if (looksLikeFlag(p) && !isDecoyFlag(p) && !isDegenerateDigest(p)) {
+            recordFlag(p, 'intermediate-advance', true);
+          }
+        }
+        const nowVerified = (state.findings ? state.findings.flags : []).filter(f => f.verified);
+        if (nowVerified.length) {
+          addLog('success', `[中间值] 自动推进得到 flag 形态明文：${nowVerified[0].flag}`);
+          return { vr, flags, verifiedFlags: nowVerified, advancedFromIntermediate: advanced };
+        }
+        // 解出了明文但不是 flag 形态 → 把它作为「下一层输入」交给 AI，别再让它重算这一步
+        const advLines = solvedByAdvance.map(a =>
+          `- \`${a.value}\`（${a.kind}）→ ${a.action} 得到明文 \`${a.plaintext}\`（${a.note}）`).join('\n');
+        const retry = [
+          '工具已经**自动完成**了中间值的下一步转换，结果如下：',
+          '',
+          advLines,
+          '',
+          '请**直接使用这些明文**继续往下分析，不要重复爆破/解码：',
+          '· 若某个明文像密钥/口令 → 用它解下一层；',
+          '· 若像注册码/校验值 → 在程序里搜它被比较的位置；',
+          '· 若它本身接近答案但形态不对 → 按题目要求加外壳后用 [VERIFY] 复验。',
+          '',
+          '拿到下一层结果后，必须输出 [VERIFY]（新的算法/密钥/密文）或 [FLAG]。',
+        ].join('\n');
+        addLog('info', `[中间值] 自动推进得到明文（${solvedByAdvance.map(a => a.kind).join('/')}），已交给 AI 继续`);
+        return { vr, flags, verifiedFlags, retryPrompt: retry, intermediateTyped: typed, advancedFromIntermediate: advanced };
+      }
+
+      const failedAdv = advanced.filter(a => !a.ok);
       const retry = [
         '本地验证**成功复现了你的计算**，但解出的值不是 flag 形态的明文。工具已识别出它们的类型：',
         '',
         ...typed.map(t => `- \`${t.value}\` → **${t.kind}**：${t.next}`),
+        ...(failedAdv.length ? [
+          '',
+          '工具已尝试自动推进但**未命中**（这不代表方向错误，只说明当前字典不够）：',
+          ...failedAdv.map(a => `- \`${a.value}\`（${a.kind}）${a.action}：${a.note}`),
+        ] : []),
         '',
         '请按上面的「下一步」直接执行，不要重复已经验证过的这一步：',
-        '· 若是哈希（MD5/SHA）→ 用 run_python 做字典/短串爆破（常见词、数字、题面提示）；',
+        '· 若是哈希（MD5/SHA）→ 用 run_python 做字典/短串爆破；**优先用程序内出现过的字符串常量**作字典（工具通用字典没命中时，答案通常就在文件里）',
         '· 若是密钥/IV → 用它去解**下一层**（找另一段密文，或对当前输入再跑一次解密）；',
         '· 若是 UUID/路径/URL 形态 → 在二进制与资源里搜同样的串，找引用它的校验逻辑；',
         '· 若已是可打印明文 → 它可能就是 flag 本体，按题目要求加外壳（如 flag{...}）后用 [VERIFY] 复验。',
@@ -10072,7 +10642,7 @@ async function finalizeSolve(aiText, opts = {}) {
         '拿到下一层结果后，必须输出 [VERIFY]（新的算法/密钥/密文）或 [FLAG]。',
       ].join('\n');
       addLog('info', `[验证闭环] 命中中间值并识别类型 ${typed.map(t => t.kind).join('/')}，已生成定向下一步提示`);
-      return { vr, flags, verifiedFlags, retryPrompt: retry, intermediateTyped: typed };
+      return { vr, flags, verifiedFlags, retryPrompt: retry, intermediateTyped: typed, advancedFromIntermediate: advanced };
     }
   }
 
@@ -10152,6 +10722,24 @@ function wrapPrintableHit(hits) {
     }
   }
   return any;
+}
+
+// P2：把中间值"形态可判 → 动作可定"的那部分直接执行掉（爆破/解码）。
+// 目标文件路径可提供，用于把文件内字符串常量并入字典（CTF 的 key 几乎都在文件里）。
+async function autoAdvanceIntermediates(hits) {
+  if (!Array.isArray(hits) || !hits.length) return [];
+  if (!window.electronAPI || !window.electronAPI.advanceIntermediates) return [];
+  const filePath = (state.fileInfo && state.fileInfo.filePath) || state.currentFile || '';
+  const r = await window.electronAPI.advanceIntermediates(hits, filePath);
+  if (!r || !r.success) {
+    if (r && r.error) addLog('warning', '[中间值] 自动推进失败: ' + r.error);
+    return [];
+  }
+  const results = Array.isArray(r.results) ? r.results : [];
+  for (const a of results) {
+    if (a.ok) addLog('info', `[中间值] ${a.kind} ${a.action} 命中：${a.value.slice(0, 32)}… → ${String(a.plaintext).slice(0, 80)}（${a.note}）`);
+  }
+  return results;
 }
 
 // 识别"中间值"的形态并给出下一步动作。
@@ -10497,8 +11085,15 @@ async function runVerification(aiText) {
 //   · 附加：RSA 小指数、base64 直接解等"零 key"尝试
 // 全部交给同一份本地求解器跑，命中即记为已验证 flag。
 function synthesizeHypotheses(contracts) {
-  const base = (Array.isArray(contracts) ? contracts : []).filter(c => c && c.ciphertext);
-  if (!base.length) return [];
+  // 只要求「有 key」即可尝试枚举：密文可以来自 AI 的契约，也可以由工具从扫描结果里补。
+  // 旧实现硬性要求 c.ciphertext，实测（CrackMe2/CrackMe3 的 P1 复验）AI 的契约常常是
+  // {algo, key, expected} 而**不写 ciphertext** —— 于是合成器直接返回空，
+  // "举一反三"在最需要它的场景（契约失败）完全没有生效。
+  const all = (Array.isArray(contracts) ? contracts : []).filter(c => c && (c.key || c.ciphertext));
+  if (!all.length) return [];
+  const withCt = all.filter(c => c && c.ciphertext);
+  const noCt = all.filter(c => c && !c.ciphertext);
+  const base = withCt.length ? withCt : noCt;
   const hexLike = (s) => /^[0-9a-fA-F]+$/.test(String(s || '')) && String(s).length % 2 === 0;
   const b64Like = (s) => /^[A-Za-z0-9+/]+={0,2}$/.test(String(s || '')) && String(s).length % 4 === 0;
   const dims = [];
@@ -10519,10 +11114,15 @@ function synthesizeHypotheses(contracts) {
       if (m) m.forEach(pushHex);
     });
   } catch (e) { /* 扫描结果不可用则只用 AI 给的 */ }
+  // 没有 AI 密文时，扫描候选就是唯一来源：多取几条（仍设上限，避免候选爆炸）。
+  const hasAiCt = base.some(c => c.ciphertext);
+  // AI 没给密文、扫描结果也没有 → 无法枚举（没有待解密的数据），明确返回空而不是造空尝试。
+  if (!hasAiCt && !scannedCts.length) return [];
+  const scannedLimit = hasAiCt ? 4 : 10;
   const ctCandidates = [...new Set([].concat(
     base.map(c => String(c.ciphertext || '')),
-    scannedCts.slice(0, 4)
-  ).filter(Boolean))].slice(0, 5);
+    scannedCts.slice(0, scannedLimit)
+  ).filter(Boolean))].slice(0, hasAiCt ? 5 : 12);
 
   for (const c of base.slice(0, 6)) {
     const algo = String(c.algo || '').toLowerCase();

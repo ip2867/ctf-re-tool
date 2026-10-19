@@ -100,8 +100,9 @@ console.log('[边界]');
   setState({ lastAlgScan: null });
   ok(synthesizeHypotheses([]).length === 0, '空契约无候选');
   ok(synthesizeHypotheses(null).length === 0, 'null 不崩');
-  ok(synthesizeHypotheses([{ algo: 'aes_ecb' }]).length === 0, '缺 ciphertext 不产生');
+  ok(synthesizeHypotheses([{ algo: 'aes_ecb' }]).length === 0, '只有 algo 无 key/密文时不产生');
 }
+  ok(synthesizeHypotheses([{ algo: 'aes_cbc', key: 'k', key_encoding: 'ascii' }]).length === 0, '有 key 但无任何密文（AI 与扫描都没有）时不产生空尝试');
 
 console.log(`\n${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

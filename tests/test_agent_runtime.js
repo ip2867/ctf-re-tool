@@ -52,6 +52,39 @@ console.log('\nA2) 微压缩：清旧结果、保留现场与错误');
   ok(blocks.every(b => b.tool_use_id), 'tool_use_id 全部保留（否则 API 400）');
 }
 
+console.log('\nA2b) 微压缩按 COMPACTABLE_TOOLS 白名单过滤（rank 1）');
+{
+  // ida_list_functions 是"IDA 加载了哪个文件"的身份证据，必须永不清
+  ok(R.COMPACTABLE_TOOLS.has('ida_list_functions') === false,
+    'ida_list_functions 不在白名单（跨题串台的身份证据）');
+  ok(R.COMPACTABLE_TOOLS.has('ida_find_strings') === false, 'ida_find_strings 不在白名单');
+  ok(R.COMPACTABLE_TOOLS.has('run_python') === true, 'run_python 可清（内容可重取）');
+  ok(R.COMPACTABLE_TOOLS.has('bash') === true, 'bash 可清');
+
+  const history = [];
+  for (let i = 0; i < 12; i++) {
+    const name = i % 2 === 0 ? 'ida_list_functions' : 'ida_find_strings';
+    const id = 'u' + i;
+    history.push({ role: 'assistant', content: [{ type: 'tool_use', id, name, input: {} }] });
+    history.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'KEEP_' + i }] });
+  }
+  const map = R.buildToolNameMap(history);
+  ok(map.size === 12 && map.get('u3') === 'ida_find_strings', 'buildToolNameMap 建出 id→name');
+
+  const r = R.microcompact(history, 4, map);
+  const blocks = history.flatMap(m => Array.isArray(m.content) ? m.content.filter(b => b.type === 'tool_result') : []);
+  ok(r.cleared === 0, `白名单外的工具一条都不清（实际清 ${r.cleared} 条）`);
+  ok(blocks.every(b => String(b.content).startsWith('KEEP_')), '所有 ida_* 结果内容保持原样');
+
+  const h2 = [];
+  for (let i = 0; i < 8; i++) {
+    h2.push({ role: 'assistant', content: [{ type: 'tool_use', id: 'b' + i, name: 'bash', input: {} }] });
+    h2.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'b' + i, content: 'OUT_' + i }] });
+  }
+  const r2 = R.microcompact(h2, 3, R.buildToolNameMap(h2));
+  ok(r2.cleared > 0, `bash 旧结果仍被清理（${r2.cleared} 条）`);
+}
+
 console.log('\nB1) 连续相同调用：3 次即拦，签名变化重置');
 {
   const g = new R.DoomLoopGuard(3);

@@ -9860,7 +9860,9 @@ async function verifyAndRecord(aiText, opts = {}) {
   // 无契约时必须在此登记，否则 flag 会丢失。recordFlag 自带去重，重复登记无害。
   flags.forEach(f => recordFlag(f, source, false));
   const vr = await runVerification(aiText);
-  if (vr && !vr.verified) await runHypotheses(aiText, { synthFrom: vr.contracts });
+  // augmentSynth：走到这里说明契约已经失败（!vr.verified），
+  // 此时即使 AI 给过 [HYPOTHESES]，也要追加工具合成的维度（P1）。
+  if (vr && !vr.verified) await runHypotheses(aiText, { synthFrom: vr.contracts, augmentSynth: true });
   flags.forEach(f => addSolveNote(noteSection, f));
   const verifiedFlags = (state.findings ? state.findings.flags : []).filter(f => f.verified);
   return { vr, flags, verifiedFlags };
@@ -10117,6 +10119,12 @@ async function finalizeSolve(aiText, opts = {}) {
 // 可打印明文 → 尝试常见外壳，命中即记为已验证 flag。
 // 判据保守：只对"整段都是可打印 ASCII、长度 4~120、不含空白换行"的值尝试，
 // 避免把一段描述性文本误当答案。外壳只试 CTF 里确定存在的几种。
+//
+// ⚠️ 必须排除"纯十六进制串"：实测（CrackMe）中间值 `CBAADEB0A8ABAEB1B4B7BABDC0C3C6C9`
+// 全是大写 hex，字面上确实"可打印"，但它是一段**字节数据**，不是明文答案。
+// 把它包成 flag{...} 提交只会在平台上多一次错误记录，还会污染"已验证"状态。
+// 判据：整串只由 0-9A-Fa-f 组成且长度 ≥16 → 视为 hex 数据，不做外壳尝试
+// （这类值由 classifyIntermediateValues 按"hex 数据"给出下一步，语义更准）。
 // 返回是否至少命中一个。
 function wrapPrintableHit(hits) {
   let any = false;
@@ -10125,6 +10133,8 @@ function wrapPrintableHit(hits) {
     if (v.length < 4 || v.length > 120) continue;
     // 必须整段可打印、无空白（有空白的多半是句子/描述）
     if (!/^[\x21-\x7e]+$/.test(v)) continue;
+    // 纯 hex 串是字节数据，不是明文（详见上方注释）
+    if (/^[0-9a-fA-F]{16,}$/.test(v)) continue;
     // 已经是 flag 形态（由 lookFlag 处理），跳过
     if (looksLikeFlag(v)) continue;
     const candidates = [];
@@ -10492,6 +10502,28 @@ function synthesizeHypotheses(contracts) {
   const hexLike = (s) => /^[0-9a-fA-F]+$/.test(String(s || '')) && String(s).length % 2 === 0;
   const b64Like = (s) => /^[A-Za-z0-9+/]+={0,2}$/.test(String(s || '')) && String(s).length % 4 === 0;
   const dims = [];
+  // 密文候选：AI 给的那条 + 扫描器从二进制抽到的全部十六进制常量。
+  // 为什么需要：实测多道题的失败根因是"AI 抄错了密文"——它从反编译里挑了一条看起来像的，
+  // 而真正被校验函数引用的那条在别处。工具已有确定性扫描结果（state.lastAlgScan 的
+  // highEntropy / 常量命中），把它们一并喂进枚举，等于让工具替 AI 试遍所有候选。
+  const scannedCts = [];
+  try {
+    const sc = state.lastAlgScan || {};
+    const pushHex = (h) => {
+      const v = String(h || '').replace(/[^0-9a-fA-F]/g, '');
+      if (v.length >= 16 && v.length % 2 === 0 && v.length <= 512) scannedCts.push(v);
+    };
+    (sc.highEntropy || []).forEach(h => pushHex(h.hex));
+    (sc.summary || []).forEach(s => {
+      const m = String(s.evidence || '').match(/\b[0-9a-fA-F]{16,}\b/g);
+      if (m) m.forEach(pushHex);
+    });
+  } catch (e) { /* 扫描结果不可用则只用 AI 给的 */ }
+  const ctCandidates = [...new Set([].concat(
+    base.map(c => String(c.ciphertext || '')),
+    scannedCts.slice(0, 4)
+  ).filter(Boolean))].slice(0, 5);
+
   for (const c of base.slice(0, 6)) {
     const algo = String(c.algo || '').toLowerCase();
     const variants = [algo];
@@ -10503,6 +10535,14 @@ function synthesizeHypotheses(contracts) {
     if (/chacha/.test(algo)) variants.push('chacha20_ietf', 'chacha20_original');
     if (/^[a-z0-9_]*_cbc$/.test(algo)) variants.push(algo.replace('_cbc', '_ecb'));
     if (/^[a-z0-9_]*_ecb$/.test(algo)) variants.push(algo.replace('_ecb', '_cbc'));
+    // TEA 族：字节序是最常见的失败点。AI 常只给 algo=tea，而数据可能是大端存放。
+    // Python solver 通过 attempt 的 `variant` 字段选择解包格式（见 buildSolvePython 的
+    // dec_tea/dec_xtea/dec_xxtea 调用），所以这里展开成两档 variant 而不是改 algo 名。
+    // 非 TEA 算法必须保留一个占位（null），否则下面的 for 循环会因空数组而不产生任何尝试。
+    const isTea = /tea/.test(algo);
+    const teaVariantCands = isTea
+      ? [...new Set([c.variant, 'le32', 'be32'].filter(Boolean))]
+      : [c.variant || null];
     // 密钥编码候选：AI 声明的优先，但**不盲信**——密钥形态像 hex/base64 时一并试，
     // 因为 AI 常把 hex 密钥标成 ascii（反之亦然），这是"单契约必然失败"的高频根因。
     const declared = c.key_encoding ? [c.key_encoding] : [];
@@ -10511,20 +10551,36 @@ function synthesizeHypotheses(contracts) {
     if (b64Like(c.key)) guessed.push('base64');
     guessed.push('ascii', 'hex', 'base64');
     const keyEncs = [...new Set(declared.concat(guessed))];
-    for (const ke of keyEncs) {
-      for (const a of variants) {
-        dims.push(Object.assign({}, c, { algo: a, key_encoding: ke }));
+    // IV 候选：声明的 / 全零 / 密文首块。CBC 类最常见失败点是"IV 其实是全零"或"IV 就是密文首块"。
+    // 这三者靠 Python solver 内部的 iv 枚举也能覆盖一部分，但显式列出能让归因更准确
+    // （失败时能区分"IV 错"和"算法错"）。
+    const ivCands = [];
+    if (c.iv) ivCands.push(String(c.iv));
+    ivCands.push('', '0000000000000000');
+    for (const ivv of [...new Set(ivCands)]) {
+      for (const ke of keyEncs) {
+        for (const a of variants) {
+          for (const tv of teaVariantCands) {
+            for (const ct of ctCandidates) {
+              dims.push(Object.assign({}, c, {
+                algo: a, key_encoding: ke, iv: ivv, ciphertext: ct,
+                ...(tv ? { variant: tv } : {}),
+              }));
+            }
+          }
+        }
       }
     }
   }
-  // 去重（algo+key_encoding+key+密文前缀 相同视为同一尝试）
+  // 去重（algo+key_encoding+key+iv+variant+密文前缀 相同视为同一尝试）
+  // ⚠️ variant 必须进键：TEA 族的 le32/be32 是两组不同尝试，漏掉会被误合并成一组。
   const seen = new Set();
   const out = [];
   for (const d of dims) {
-    const k = [d.algo, d.key_encoding, String(d.key || ''), String(d.ciphertext || '').slice(0, 40)].join('|');
+    const k = [d.algo, d.key_encoding, String(d.key || ''), String(d.iv || ''), String(d.variant || ''), String(d.ciphertext || '').slice(0, 32)].join('|');
     if (seen.has(k)) continue;
     seen.add(k); out.push(d);
-    if (out.length >= 24) break;
+    if (out.length >= 40) break;
   }
   return out;
 }
@@ -10718,6 +10774,23 @@ async function runHypotheses(aiText, opts = {}) {
     // 无 [HYPOTHESES] 契约 → 工具自行合成候选矩阵（举一反三，避免原地卡死）
     attempts = synthesizeHypotheses(opts.synthFrom);
     if (attempts.length) addLog('info', `[本地枚举] AI 未给 [HYPOTHESES]，工具自动合成 ${attempts.length} 组候选（算法/编码/模式变体）...`);
+  } else if (attempts.length && Array.isArray(opts.synthFrom) && opts.augmentSynth) {
+    // ── P1：AI 给了 HYPOTHESES，但**已确认这些假设全部失败**时，追加工具合成维度 ──
+    // 为什么需要：AI 的候选往往在同一组假设里打转（同样的 key/编码，只换顺序）。
+    // 工具合成会补上它想不到的维度：全零 IV、扫描器抽到的其他密文、TEA 字节序。
+    // 只在 augmentSynth 显式要求时追加（由"契约已失败"的调用方设置），
+    // 避免在 AI 首次给假设时就把候选池撑爆。
+    const synth = synthesizeHypotheses(opts.synthFrom);
+    if (synth.length) {
+      const seen = new Set(attempts.map(a => [a.algo, a.key_encoding, a.key, a.iv, a.variant, String(a.ciphertext || '').slice(0, 32)].join('|')));
+      let added = 0;
+      for (const s of synth) {
+        const k = [s.algo, s.key_encoding, s.key, s.iv, s.variant, String(s.ciphertext || '').slice(0, 32)].join('|');
+        if (seen.has(k)) continue;
+        seen.add(k); attempts.push(s); added++;
+      }
+      if (added) addLog('info', `[本地枚举] AI 的假设已失败，工具追加 ${added} 组补充维度（IV/密文候选/字节序）`);
+    }
   }
   if (!attempts.length) {
     addLog('warning', '[本地枚举] 无可枚举候选（AI 未给 [HYPOTHESES]，且缺少可合成的密文契约）');

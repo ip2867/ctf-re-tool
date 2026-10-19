@@ -67,11 +67,15 @@ console.log('[不误伤]');
   ok(wrapPrintableHit(['中文答案']) === false, '非 ASCII 不处理');
   ok(wrapPrintableHit(['a'.repeat(200)]) === false, '超长不处理');
   ok(wrapPrintableHit(null) === false, 'null 不崩');
+  // 实测（CrackMe）：CBAADEB0A8ABAEB1B4B7BABDC0C3C6C9 是字节数据不是明文，
+  // 包成 flag{...} 只会在平台留一条错误提交记录。
+  ok(wrapPrintableHit(['CBAADEB0A8ABAEB1B4B7BABDC0C3C6C9']) === false, '纯 hex 串不包外壳');
+  ok(wrapPrintableHit(['55a54008ad1ba589aa210d2629c1df41']) === false, '小写 hex 串不包外壳');
 }
 {
   recorded.length = 0;
-  ok(wrapPrintableHit(['deadbeef', 'cafebabe']) === true, '多个候选逐个尝试');
-  ok(recorded.length >= 1, '至少记录 1 个');
+  ok(wrapPrintableHit(['deadbeefcafebabe', 'THISiSsERIALnUMBER']) === true, '混合候选：跳过 hex、命中明文');
+  ok(recorded.length === 1 && recorded[0].f === 'flag{THISiSsERIALnUMBER}', `只记录明文那个（${recorded[0] && recorded[0].f}）`);
 }
 
 console.log(`\n${pass} 通过 / ${fail} 失败`);

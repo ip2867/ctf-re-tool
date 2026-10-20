@@ -1,4 +1,4 @@
-# CTF-RE-TOOL v1.7.3
+# CTF-RE-TOOL v1.8.0
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -7,16 +7,17 @@
 
 一个基于 Electron 的 **CTF 逆向 AI 解题工作台**（Windows 桌面应用）。把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成一条 AI 可自主驱动的流水线，并通过 MCP 实时接入 **IDA / JEB / Burp**，内置 **11 个逆向方法论技能**（Skills）与**可检索的结构化知识库**（Wiki）。
 
-核心是**解题成功率**，不是功能堆砌：
+设计原则：**AI 是解题主体，工具提供能力**。不是把功能堆在一起，而是让 AI 在解题过程中真正调用工具、识别算法、验证结论。
 
 - **AI 工具循环（Tool-Use）**：AI 自主调用 JEB/IDA/Frida/Python 等工具反复推进，而不是一次性问答；分阶段提示词（①收集 → ②定位算法 → ③写脚本本地验证 → ④结论）。
+- **动态调试闭环**：IDA 调试器可直接下断点、单步、读写内存，覆盖本地 PE 与 Kali 远程 ELF；先静态取数锁定函数，再定向取证。
 - **本地验证闭环**：AI 给出的每个 flag 都附 `[VERIFY]` 契约，工具自动生成 Python 复现脚本本地跑一遍，标注 ✅已验证 / ⚠️未验证——**不靠"AI 说解出来了"就当解出来了**。
-- **结构化知识库**：54 页可检索手法/题解页（含 43 篇历年逆向题，带 `attack_chain` 解法链 / `reasoning_chain` 思维链 / `failed_attempts` 避坑），按关键词结构化加权检索，命中即注入 AI 上下文。
+- **结构化知识库**：50 条可检索条目（43 篇历年题 + 7 篇方法论），每条带 `attack_chain` 解法链 / `failed_attempts` 避坑；按题目特征自动预取，命中即注入 AI 上下文。
 - **经验自进化**：每次解题沉淀的多步攻击链写入经验库，下次同类题自动速查复用。
 
-**下载**：[v1.7.3 便携版 CTF-RE-TOOL.exe](https://github.com/ip2867/ctf-re-tool/releases/download/v1.7.3/CTF-RE-TOOL.exe)（73.9 MB，单文件双击即用，无需安装 / 无需 Node.js）
+**下载**：[v1.8.0 便携版 CTF-RE-TOOL.exe](https://github.com/ip2867/ctf-re-tool/releases/download/v1.8.0/CTF-RE-TOOL.exe)（74.11 MB，单文件双击即用，无需安装 / 无需 Node.js）
 
-> 校验：`SHA256 = 04a7c37e53c1b663379ab8683fb1863facd1e551456fffcc50634670908262d1`
+> 校验：`SHA256 = 0b81078183312a1e8acb31ab1c4f784ad430284c7423ed64b8d3d29ed32ee167`
 >
 > 首次运行请在「设置」页填写 IDA / JEB / jadx 等外部工具路径（本工具是调度框架，不含这些工具）。
 
@@ -152,6 +153,47 @@
 ### 14. 对话滚动与离线可用性（v1.7.3 修复）
 - **修复"流式输出时无法向上滚动"**：旧实现每收到一个 token 就 `scrollTop = scrollHeight`，用户上滑一次立刻被拽回底部。改为 stick-to-bottom（距底 ≤48px 才跟随；滚轮上滑/PageUp/Home 立即脱离），并加"回到底部"悬浮按钮；日志面板同样受保护
 - **图标库本地化**：Font Awesome 全量内置到 `src/vendor/`（约 1MB），CSP 收紧为 `font-src 'self'`。原来依赖 cdnjs，实测超时 16 秒会让 `<link>` 阻塞解析、页面停在 loading（内网/离线环境表现为启动卡死）
+
+### 15. 定向动态调试（v1.8.0 新增）
+
+**核心原则：动态调试是取证手段，不是探索手段。** 它只回答"这个值运行时是多少"，
+不回答"这段代码在干什么"——后者反编译更便宜、更可复现。
+
+四条入场条件全满足才启动调试器：
+
+1. 有函数清单（`list_funcs` 已调用）
+2. 候选函数说得清职责（读输入 / 做变换 / 比对 / 解壳）
+3. **写得出调试假设**：断点地址 + 命中后读哪个表达式 + 期望值 + 判定方式
+4. 有办法把流程逼到那里（入口断点 / 输入触发 / 定时触发 / 改 IP）
+
+写不出第 3 条 = 静态还没读够，回反编译。
+
+| 能力 | 说明 |
+|---|---|
+| 本地 PE | `start` 后停在入口，可直接单步；32 位 WOW64 目标优先 `dbg_write` 改内存 |
+| 远程 ELF | Kali 上跑 IDA 自带 `dbgsrv/linux_server`（不是 gdbserver），自动 suspend + 重定位符号 |
+| 断点 | 变换函数入口/出口 ＞ `memcmp`/`strcmp` 调用点 ＞ 解密循环内部 |
+| 状态机 | `status` 查 STATE：-1 暂停（可单步）/ 0 无进程 / 1 运行中 / 2 已退出 |
+| 取数 | 一次命中批量读寄存器 + 关键内存 + 调用栈，不在同一点反复单步 |
+| SMC | 在解密循环**结束后**下断，dump 后对**新字节**重新静态分析 |
+
+实测：本地 PE 10/10、远程 ELF 11/11（下断点命中 main → 单步 → 命中 check → 读写内存）。
+
+### 16. 知识库真正接进解题链路（v1.8.0 修复）
+
+知识库最常见的失效不是"文件丢了"，而是**写了但自动预取选不到**。
+
+- 题面出现 SMC / 反调试 / GUI / 时间校验等结构特征时，自动预取向对应方法论页
+- 提示词显式点名 7 篇方法论专页（与 43 篇题库区分），不再只列"另有 40+ 篇"
+- 技能分流表新增"需要运行时值"路由，卡住时有明确去处
+
+实测 5 类真实题面特征均把方法论页排到检索第 1 位，普通算法题不误命中。
+
+### 17. 离线加解密与变换链（v1.8.0 新增）
+
+- `crypto`：AES / SM4 / DES / 3DES / RC4 / TEA 系 / 哈希 / HMAC，数据不出本机
+- `recipe`：CyberChef 式变换链，一次调用跑完 base64→xor→反转→解压，每层给 printable/entropy/hex
+- 标准向量自测 35/35（NIST AES、GB/T SM4、RFC 4231 HMAC）
 
 ## 环境要求
 
@@ -298,7 +340,6 @@ npm start
 
 应用会自动请求 `${ANTHROPIC_BASE_URL}/v1/messages`。如果你的服务提供的是完整 `/v1/messages` URL，请去掉该后缀。若从 CCSwitch 启动本应用，请确认 Electron 子进程继承了这些环境变量；否则将变量设置为 Windows 用户环境变量或使用同一 PowerShell 启动。
 
-
 本项目默认使用 **夜神模拟器 Nox（Android 9）**，不是雷电（LDPlayer）。默认配置为：
 
 - ADB：`127.0.0.1:62025`
@@ -341,8 +382,46 @@ frida -H 127.0.0.1:27042 -n "包名或进程名" -l hook.js
 
 Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是两套独立服务，所以 APK 正常不代表 IDA 已启动。
 
-
 ## 更新日志
+
+### v1.8.0 (2026-10-20) — 动态调试打通 + 知识库可达性修复
+
+这一版只有一件事：**让工具真的能参与解题**，而不是只把能力写进文档。
+
+**动态调试从"看起来能用"变成"实测能用"**
+
+三个被误判了很久的实现缺陷：
+
+1. 进程状态语义判反 —— `get_process_state()` 的 `-1` 是**已暂停**、`1` 是**运行中**。
+   之前把 1 当暂停去等、把 -1 当无状态，于是所有单步都"失败"。
+2. `continue`/`run_to` 是**异步投递** —— 插件返回的 IP 是投递前的旧值，
+   必须轮询到进程真正停下。GUI 程序进消息循环后 STATE 恒为 1，这是正常状态而非错误。
+3. `start_process("")` 在路径为空时返回 **0（启动被取消）**。
+   以前"能用"是因为进程选项里残留着上次的目标路径；做过一次远程调试后残留变成
+   Linux 路径，本地启动就稳定失败——这才是"本地调试时好时坏"的真正原因。
+
+远程调试另有三处与本地不同：`start` 后不会停在入口（需主动 suspend）、
+PIE 断点必须用重定位后的地址、`dbg_add_bp` 对远程段恒返回 False（改用 `idaapi.add_bpt`）。
+
+实测：本地 PE 10/10、远程 ELF 11/11。
+
+**知识库从"写了"变成"用得上"**
+
+审计发现方法论页写完后，自动预取**根本拉不到**（5 个真实题面特征全部落榜）：
+特征词表没有动态调试信号、检索词退化成 `native`、提示词清单只列非 `reverse/` 页、
+技能描述里也没提。修复后 5 类特征均排到第 1 位，普通算法题不误命中。
+
+**新增能力**
+
+- `ida_dbg` 增加 `status` / `suspend`，`start` 幂等
+- 运行态下 `step`/`run_to`/`write` 被前置拦截并给出可执行下一步
+- `crypto` 离线加解密（AES/SM4/DES/RC4/TEA/哈希/HMAC，标准向量 35/35）
+- `recipe` 变换链（CyberChef 式，一次跑完多层）
+- `gui_input` 标准控件喂输入 + 回读校验
+- `remote_exec` Kali SSH 透传退出码，错误分类为 TIMEOUT/AUTH/REFUSED/UNCONFIGURED
+
+**回归**：单元测试 78/78；新增两个手工验收脚本
+（`manual_dbg_local.js` 10/10、`manual_dbg_remote.js` 11/11）。
 
 ### v1.7.3 (2026-10-18) — AI Agent 运行时 + 对话滚动修复 + 分组密码能力补齐
 
@@ -498,7 +577,6 @@ IDA 采集器，而 PE/ELF 主路径只读"被反编译函数引用"的地址。
 
 **五、测试**：新增 `tests/`（扫描器 11 项 + 解密枚举回归 6 项 + 脚本去重 10 项）+ `run_all.js` 运行器。
 
-
 ### v1.5.2 (2026-10-16) — 修复"模型文本形态工具调用未执行"（AI 空转绕圈根因）+ 多阶段接力 + 长任务超时
 
 **一、文本形态工具调用未被解析（严重：AI 全程空转）**
@@ -526,7 +604,6 @@ AI 误判方向后换路重试，烧光预算）；`bash` 30s → 120s。超时�
 识别为"16 字节分组 + S 盒查表 + 多轮"（AES 变体/微指令 VM 加密）时，**不硬逆**——写出正向模拟器用
 `enc(候选)==目标` 验证（块密码双射，正演验证等价且简单得多）；符号求解一次只解 1 个块、S 盒用常量数组。
 
-
 ### v1.5.1 (2026-10-16) — 修复消息路由误拦 + 全局中文输出
 
 实战反馈两个问题，均修复。
@@ -543,7 +620,6 @@ AI 误判方向后换路重试，烧光预算）；`bash` 30s → 120s。超时�
 AI 的推理叙述常输出英文（"I'll start by analyzing this PE file…"），可读性差。
 
 **修复**：在主进程请求构造处（`sendClaudeRequest` / `sendClaudeRequestWithTools`）**单点注入**语言约束——所有 AI 调用路径（聊天、Tool-Use、分级快慢模型、复盘、题解、动态 Hook 决策）100% 覆盖。约束只针对自然语言叙述；代码、变量名、flag、路径、命令行、寄存器名保持原样不翻译。
-
 
 ### v1.5.0 (2026-10-15) — CTF² 平台 8 题实战打磨：验证闭环三修 + 新题型分流 + 题目隔离
 
@@ -567,7 +643,6 @@ AI 的推理叙述常输出英文（"I'll start by analyzing this PE file…"）
 **求解器增强**
 - AI Tool-Use 提示词加预算纪律（60 轮上限 + 冲刺指令）与「伴生文本必须 read_file 读全文」纪律。
 - max_tokens 截断自动续写；IDA `-o` 参数坑规避（同目录建库）。
-
 
 ### v1.4.0 (2026-10-14) — 修复 Frida Hook 证据被噪音淹没 / 降噪失效 / 经验跨阶段丢失
 
@@ -626,7 +701,6 @@ Hook 输出回灌 AI 前，旧逻辑把 `[DATA]`/`[FLAG]` 真证据与 `[HIT]` �
 - v1.3.9：验证闭环 7 处复制粘贴收敛为 `verifyAndRecord()`（纯重构）。
 - v1.3.10：修复该重构遗漏 —— `autoSolveFlag`/`autoSolveBinaryFlag` 只解构 `verifiedFlags` 却引用裸 `flags`，导致 `ReferenceError: flags is not defined`。
 
-
 ### v1.3.5 (2026-10-13) — 结构化知识库 + 解题成功率优化
 - **知识库重构为「结构化 + RAG 友好」**：新增全局检索索引 `AI-SEARCH-INDEX.md` 与速查表 `PAYLOAD-CHEATSHEET.md`
 - **历年逆向题条目库**：新增 `wiki/reverse/`，**43 篇**纯逆向题（从 132 候选筛选、剔除 PWN/杂项），每题带 `attack_chain`（解法链）/`reasoning_chain`（思维链）/`failed_attempts`（避坑）等 YAML meta
@@ -639,104 +713,8 @@ Hook 输出回灌 AI 前，旧逻辑把 `[DATA]`/`[FLAG]` 真证据与 `[HIT]` �
 - **隐私与安全**：移除源码/文档中硬编码的私有 AI 中转地址（Base URL 默认留空，未配置时明确报错）；`git-filter-repo` 抹除历史中的私有域名与本机路径；清理构建残留与一次性调试脚本
 - **发现并修复**：`wikiSearch` 结构化 meta 解析失效（见上）；`baseUrl` 为空时由 `Invalid URL` 改为明确的中文配置提示
 
-### v1.3.4 (2026-10-09) — 知识库扩充 + 固件逆向 + 开源发布
-- **知识库技能 8→11**：新增 `ctf-reverse-tooling`（Z3/angr/Unicorn 自动化求解 + 迷宫题）、`ctf-reverse-langs`（Python 字节码/Go/Rust/Lua 语言特定逆向）、`ctf-iot-firmware`（固件提取/解包/QEMU 仿真）
-- **知识库 Wiki**：`wiki/` 可检索手法页（`wiki_list`/`wiki_search`/`wiki_read`），系统提示只注入页面索引；内置 Frida 专题 + 固件解包/仿真专题
-- **Hook 进程内解密直接出 flag**：把已求解的 key/iv/密文注入 Hook 脚本，运行时捕获明文，绕过关卡直接解出；滚动窗口抓取（每来数据续 60s，绝对上限 10min）
-- **命令注入收口**：新增参数化执行原语 `run-tool-args`（argv 数组，无 shell 解析）、纯 Node `zip-list`/`grep-in-dir`，渲染层不再拼接 PowerShell/cmd 命令字符串
-- **文件 IPC 边界**：`write-file`/`read-file`/`ensure-dir`/`append-file` 加写入根约束（userData/应用目录/临时目录/CASE 目录），并屏蔽读取工具自身凭据配置
-- **Electron 加固**：`webPreferences` 启用 `sandbox`，拦截 `will-navigate` 与 `setWindowOpenHandler`（外部链接一律交系统浏览器）
-- **界面**：暖白简约主题；键盘焦点环（`:focus-visible`）+ 减少动效支持；移除说明书弹窗
-- **打包**：electron-builder 输出便携单文件 `CTF-RE-TOOL.exe`（含应用图标）
-- **仓库卫生**：`node_modules`/`HANDOFF.md`/`.zcode` 计划/一次性调试脚本取消入库，重写 `.gitignore`
 
-### v1.3.3 (2026-09-12) — 第四轮复审（自动化流程专项）
-- P0：processUserMessage 的 hasWord 在声明前使用（TDZ），英文消息含 "script" 一词即静默崩溃 → 提升至函数顶部
-- P1：analyzeWebJS 全程占锁（轮询阶段此前不加锁，可并发双流程造成流错乱）；两个轮询循环可通过再点发送键中止（flowAbortRequested）
-- P1：Burp 传输探测双重 initialize（严格 Streamable 服务器会拒绝导致误判回落 SSE）→ 复用 burpHttpEnsureSession
-- P2：tools/call 超时不再重试（防非幂等重复执行）；SSE 连接失败路径补 waiter 清理；JS 文件读证失败不再中断流程；AI 空结果单列提示；experience.md 表头判断修正（read-file 返回 {success:false} 而非抛异常）
-- 知识库：ctf-dispatch 分流表补 Web/JS/加密参数 → ctf-jsreverse 路由 + 下一步菜单模式 + 经验库优先原则
-
-### v1.3.2 (2026-09-12) — Web/JS 逆向全自动工作流
-- **像 IDA/JEB 一样自动拉起工具链**：说"分析这个站的加密参数"即触发——自动探测 Burp（9876）→ 未运行自动启动 MCP_Burp.bat 并轮询就绪（150s）→ 自动连 MCP → 无流量自动拉起**走 Burp 代理的隔离浏览器**（Chrome/Edge 自动探测 + 独立 user-data-dir 保证代理生效 + 忽略证书告警）→ 后台轮询等流量（90s）→ AI 接手按 ctf-jsreverse 五阶段分析
-- 新增 IPC：burp-probe（TCP 快探）/ open-proxy-browser（代理浏览器）；新增 web 配置组（浏览器路径/Burp 代理端口，设置页可视化）
-- .js/.mjs/.html 拖入即走 Web 流程（JS 原文自动存 evidence）；`burp 启动` 现在启动后自动连接 MCP
-- 逻辑单测：路由正则触发/不触发用例、历史空判断（结构化 JSON 检测，10 用例）、浏览器候选探测
-
-### v1.3.1 (2026-09-12) — Burp MCP 实装完成
-- 本地 Burp 2025.11.2 全链路实装官方 MCP Server 扩展（burp-suite v1.1.2）：jar 下载 → mcp_user_options.json 免 GUI 自动加载（MCP_Burp.bat 追加 --config-file）→ GUI 勾选 Loaded/Enabled/历史免审批
-- 客户端重写为双传输自适应（auto：先 Streamable HTTP 社区扩展，失败转经典 SSE 官方扩展）；SSE 端点路径多候选（/sse 与 /）；notification 不占 pending 超时；URL 变更自动重置传输探测
-- 实测：9876 监听 ✓、initialize/tools/list 握手 ✓、27 个工具全部发现（get_proxy_http_history / send_http2_request / get_scanner_issues / Repeater / Collaborator / 编解码）
-- 参数适配单测 6 场景全过；tools.burp 默认启动器改为 MCP_Burp.bat
-
-### v1.3.0 (2026-09-12)
-Burp MCP 集成 + JS 逆向能力（工作思路参考 reverse-skill 与 hello_js_reverse_skill，择优吸收）：
-- Burp MCP 客户端（逻辑名映射：history/message + 任意工具透传），MCP 栅格/工具区/聊天命令三处入口；.bat/.vbs 启动器支持
-- 新增 ctf-jsreverse 技能：五阶段流程、路径A算法追踪四板斧、路径B环境伪装、JSVMP/瑞数/obfuscator 判型、案例坑库
-- 验证闭环支持 node_js 契约：AI 还原的 JS 函数本地 node 复现（修复 argv 取参 bug 并端到端实测）
-- 全局经验库：解题成功**自动入库**（内容级去重）/ `经验 <内容>` 手动回写 / `查经验` 查看 / 自动注入 AI 系统提示（近15条）
-- 参考来源：[reverse-skill](https://github.com/zhaoxuya520/reverse-skill)（MIT）
-
-### v1.2.2 (2026-09-12)
-第三轮复审（CSS/UI 层 + 知识库技术细节）：
-- P1：Frida 输出面板换行丢失+长 hex 行被裁剪（补 pre-wrap/break-all）；日志长 token 同样裁剪；聊天气泡长 base64/哈希撑破面板 + 行内 code 无样式
-- P2：流式光标闪烁动画；"分析结果"tab 标题/段落/flag 候选排版（此前被全局 margin 归零挤压）；说明书 help-note 提示框样式；移除分析 tab 双层嵌套 padding；MainActivity 识别支持 activity-alias；自动求解中止提示优化；findings.json 串行化写队列防并发交错
-- 知识库：SM4 描述修正（非平衡 Feistel）；7 个 SKILL.md 机器校验（frontmatter/代码围栏闭合/交叉引用/乱码）全部通过；密码学常量与反调试偏移逐项人工复核
-
-### v1.2.1 (2026-09-12)
-系统性架构+知识库复审（独立代理交叉审查）修复：
-- P0：PE/ELF"详细分析"传入空对象导致 `otherFunctions.length` TypeError，Tool-Use 深度分析必挂
-- P1：CSP 使内联 onclick 失效（清空日志按钮同时会折叠面板）；解密模板中 xxtea 实现错误（TEA 风格轮函数，解出乱码）改为正确 MX 算法；`[VERIFY]`/`[HYPOTHESES]` 契约解析遇 custom 代码中的 `}`/`]` 截断（改匹配闭合标签）；Python 求解器契约改 base64 内嵌（三引号守护本就无效）
-- P2：验证命中只标命中 flag；AI 中止显示为提示而非错误；聊天路由 pe/tea/md5/crc 等改词边界（"open/steal"不再误触发）；移除 data-collapse 死代码；grep 默认根目录对齐工作目录；browser_search/open 从占位接为真实调用；流式重试不再造成文本重复；PYC 魔数收紧（校验第 2 字节 0x0D）；移除无效 defaultFilter；kali 启动失败如实报错；Frida 17 API 兼容 shim 内置到全部模板；设置页新增"测试AI连接"；安装 APK 前设备就绪轮询
-- 知识库：ctf-crypto-identify 契约算法清单与求解器实现对齐；ctf-frida-dynamic 补充 Frida 17+ API 变更说明
-
-### v1.2.0 (2026-09-11)
-- Agent Skills 引擎：7 个内置中文方法论 skill（写题解/Android/二进制/算法识别/反调试/Frida/调度），AI 经 `read_skill` 按需加载，用户可自装
-- CASE 证据体系：每题独立目录（evidence/scripts/timeline.jsonl/findings.json），MCP 采集物自动落盘
-- 验证闭环：`[VERIFY]` 契约 → 自动生成 Python 本地复现 → flag 标注 ✅已验证/⚠️未验证
-- 本地枚举：`[HYPOTHESES]` 契约 → 组合枚举一键跑完（TEA/XTEA/XXTEA/RSA字节序/密钥编码歧义等），验证失败自动触发
-- WP 双轨：模板轨升级为 findings 驱动（证据清单+验证状态自动填充）；AI 轨（`aiwp`）按 ctf-writeup 技能产出提交级题解，失败自动回退
-- 参考 [ljagiello/ctf-skills](https://github.com/ljagiello/ctf-skills)（MIT）与 [anthropics/skills](https://github.com/anthropics/skills) 的 SKILL.md 组织方式
-
-### v1.1.0 (2026-09-11)
-**缺陷修复**
-- 修复 JEB MCP 一键启动读取错误配置键（`mcp.jeb` → `mcp.jebMcpScript`）的问题
-- 修复聊天/日志/Frida 输出的 HTML 注入（XSS）漏洞
-- 修复 MainActivity 误识别：现在精确解析 Manifest 中的 LAUNCHER activity
-- 修复 APK 自动分析结果虚假成功提示：每步真实汇报 ✅/❌
-- 修复 PYC 魔数只认旧版本、`.zip` 一律当 APK、kali-stop-vm 空 vmx 等问题
-- 修复设置保存丢失 nox_path/mcp/kali 配置段、WP 保存后脚本类型错乱等问题
-
-**健壮性与体验**
-- AI 回复 SSE 流式输出 + 发送按钮一键停止
-- JEB/IDA MCP 连接改为就绪轮询；模拟器等待不再固定 60 秒
-- 429/5xx 指数退避重试；`max_tokens` 可在设置中调整（默认 8192）
-- `saveScript` 实现系统保存对话框；聊天工具栏按钮接线；新增"分析结果"标签页
-- 设置页新增 AI 接口 / MCP 地址 / Kali SSH / 输出目录 配置
-- 硬编码路径与端口（frida 27042、ADB 62025、scripts 目录、VS Code、JEB MCP 脚本）全部进配置
-
-**解题能力扩展**
-- 文件分流新增：JAR/.class（jadx）、.NET（dnSpy/ilspycmd 指引）、Unity IL2CPP（Il2CppDumper 指引）、Lua 字节码（unluac）、Mach-O 指引
-- 解密模板新增：SM4、3DES、自定义码表 Base64、RSA（小指数/factordb/Wiener/共模）、Z3、angr
-- 新增 Windows PE 反调试绕过 Frida 脚本、smali 重打包签名批处理脚本
-- RC4 动态脚本参数化（模块名/RVA 弹窗输入，不再硬编码 2.exe）
-- WP 报告增强：多格式 flag 提取（flag/ctf/NSSCTF/SCTF…）、关键结论区块、真实连接状态
-- flag 统一提取函数，支持 `[FLAG]...[/FLAG]` 输出契约
-
-**安全加固**
-- adb/frida/launch-tool/vmrun 全部改为 spawn 参数数组，消除命令注入面
-- Kali SSH 改用 ssh2 库（原 sshpass 方案在 Windows 不可用）；密码不再写死在源码
-- `shell.openExternal` 仅允许 http/https；新增 CSP；FontAwesome 加 SRI
-- 工具输出统一 8000 字符截断（IPC 与 AI 上下文双重保护）
-
-### v1.0.0 (2026-07-23)
-- 初始版本发布
-- 支持文件拖入和自动识别
-- 集成 IDA、DIE、JEB、jadx、UPX、apktool、pycdc 等工具
-- Frida Hook 脚本生成（基于ctf-agent模板）
-- Python 解密脚本生成（支持多种算法）
-- 反调试绕过脚本生成（支持多种绕过技术）
-- 响应式窗口布局
+> v1.3.4 及更早版本见 [CHANGELOG-ARCHIVE.md](CHANGELOG-ARCHIVE.md)。
 
 ## 许可证
 

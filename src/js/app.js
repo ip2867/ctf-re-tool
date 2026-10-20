@@ -9030,7 +9030,12 @@ ${constraint}`;
         smcBlock = `\n## SMC/自修改特征
 ${smc.summary}
 **先走静态/离线路线**（直接反汇编该节、读解包后字节、离线模拟）；只有在静态路线拿不到解包后字节时，
-才建议动态：\`ida_dbg: start → bp_add(写节循环) → run_to/continue → ida_dbg_mem read → 重新反编译\`。
+才走动态。动态的正确顺序（**不是**直接 start 然后单步）：
+1. 静态定位**解密循环**（写该节的循环）与它的**结束地址**——这一步必须静态完成
+2. \`ida_dbg(start)\` → 在解密循环**结束后**的那条指令 \`bp_add\` → \`continue\` 等命中
+3. 命中后用 \`ida_dbg_mem read\` 把解密后的整节 dump 出来
+4. 对 **dump 出来的新字节**重新反编译/扫描算法——不要继续在密文上纠缠
+
 ⚠️ **W+X ≠ 必须动态调试**；W+X 节存在但算法可静态判定时（如常量/结构已经明确），不要为了"看一眼运行时"烧预算。
 ⚠️ 若 ret 目标不是调用方压入的返回地址，按间接分支继续执行，**不得判定函数返回**；必须报告总指令数与最后 8 条 PC。\n`;
       } else {
@@ -9540,8 +9545,22 @@ function buildSystemPrompt() {
   //（逐条列名会白白吃掉上下文，且文件名长、对定位无帮助）。只列"手法页"清单。
   const wikiPages = state.wikiPages || [];
   const revCount = wikiPages.filter(p => String(p.rel || '').startsWith('reverse/')).length;
+  // reverse/ 下的方法篇（不是某道题的 writeup）必须**点名**，否则 AI 只看到"40+ 篇题库"，
+  // 不会想到里面还有方法论页——这是"写了却用不上"的典型。
+  const METHOD_PAGES = [
+    'reverse/method_static_first_dynamic.md',
+    'reverse/method_runtime_challenges.md',
+    'reverse/method_parallel_scan_inversion.md',
+    'reverse/method_excel_formula_verifier.md',
+    'reverse/method_short_ciphertext_triage.md',
+    'reverse/method_gm_crypto.md',
+    'reverse/method_pe_loader_vm_obfuscation.md',
+  ].filter(rel => wikiPages.some(p => p.rel === rel));
+  const methodList = METHOD_PAGES.length
+    ? `\n**方法论专页（reverse/ 下，不是题库）**：\n${METHOD_PAGES.map(r => '- ' + r).join('\n')}\n`
+    : '';
   const wikiIndex = wikiPages.length
-    ? `\n## 知识库 Wiki（解题前先检索）\n**首选**：\`wiki_read(path=AI-SEARCH-INDEX.md)\` 读全局检索索引（按技术标签定位资源）；速查用 \`wiki_read(path=PAYLOAD-CHEATSHEET.md)\`。\n手法页（用 wiki_search 按关键词检索 / wiki_read 读整页）：\n${wikiPages.filter(p => !String(p.rel || '').startsWith('reverse/')).map(p => `- ${p.rel}`).join('\n')}\n${revCount ? `另有**历年逆向题条目库 ${revCount} 篇**（含 attack_chain 解法链 / reasoning_chain 思维链 / failed_attempts 避坑）：用题目特征词（算法名/混淆方式/工具/大赛名）\`wiki_search\` 检索，或先读 \`reverse/_INDEX.md\` 看总表。\n` : ''}遇到具体手法/踩坑（Frida 进程内解密、native 常量反演、IV 编码坑、多阶段 APK）先 wiki_search 检索，命中即 wiki_read 取完整片段。\n`
+    ? `\n## 知识库 Wiki（解题前先检索）\n**首选**：\`wiki_read(path=AI-SEARCH-INDEX.md)\` 读全局检索索引（按技术标签定位资源）；速查用 \`wiki_read(path=PAYLOAD-CHEATSHEET.md)\`。\n手法页（用 wiki_search 按关键词检索 / wiki_read 读整页）：\n${wikiPages.filter(p => !String(p.rel || '').startsWith('reverse/')).map(p => `- ${p.rel}`).join('\n')}\n${methodList}${revCount ? `另有**历年逆向题条目库 ${revCount} 篇**（含 attack_chain 解法链 / reasoning_chain 思维链 / failed_attempts 避坑）：用题目特征词（算法名/混淆方式/工具/大赛名）\`wiki_search\` 检索，或先读 \`reverse/_INDEX.md\` 看总表。\n` : ''}遇到具体手法/踩坑（Frida 进程内解密、native 常量反演、IV 编码坑、多阶段 APK）先 wiki_search 检索，命中即 wiki_read 取完整片段。\n需要**动不起来/静态读不动**时，先读 \`reverse/method_static_first_dynamic.md\`（动态调试入场条件），再决定是否启动调试器。\n`
     : '';
   let prompt = `你是 CTF 逆向解题专家，就像在 Claude Code 中一样工作。
 
@@ -12239,7 +12258,13 @@ async function prefetchKnowledge(haystack, fileType, extra = []) {
       // Lua 字节码类
       'luac', 'unluac', 'luaopcode',
       // Web/JS 逆向类
-      'jsencrypt', 'cryptojs', 'sign', 'token', 'x-bogus', 'a_bogus', '_0x', 'sm2', 'sm3', 'wasm', 'jsvmp', '瑞数'];
+      'jsencrypt', 'cryptojs', 'sign', 'token', 'x-bogus', 'a_bogus', '_0x', 'sm2', 'sm3', 'wasm', 'jsvmp', '瑞数',
+      // 动态调试类：命中即把「先静态取数、锁定函数再定向调试」的方法论拉进提示词。
+      // 不补这些词的话，新方法论页只能靠 AI"主动想起来"去查——实测等于没写。
+      '动态调试', '调试', '断点', '单步', 'smc', '自修改', '反调试', 'ptrace', 'isdebuggerpresent',
+      'self-modifying', '自解码', '解密后执行', 'virtualprotect', 'mprotect', '运行时解密',
+      'gui', 'dialogbox', 'winmain', '消息循环', '窗口', 'crackme',
+      'tickcount', 'getsystemtime', '时间相关', '环境检测'];
     const hits = POOL.filter(t => hay.includes(t));
     // ── 按"常量/结构特征"反查算法（关键增强）──
     // 教训（Disguise 实测）：魔改/VM 化的标准算法题，代码里**没有算法名字面量**（无 "sm4"/"aes"），
@@ -12268,6 +12293,17 @@ async function prefetchKnowledge(haystack, fileType, extra = []) {
       // 大常量表 = S 盒候选（64 个 int32 ≈ 256 字节 S 盒；也接受 256 项的大表）
       [/共 (64|128|256) 个/, 's盒 分组密码 sm4 aes 查表'],
       [/分组密码|16 字节块|每 16 字节|轮密钥|round.?key/i, '分组密码 魔改sm4 轮密钥 sm4 aes'],
+      // ── 动态调试信号（命中即把「先静态取数、锁定函数再定向调试」的方法论拉进提示词）──
+      // 这些特征意味着"静态读不动 / 必须拿运行时值"，正是该动态调试的题。
+      // 之前特征表完全没有这一类，导致新方法论页自动预取 0 命中（实测 5/5 落榜）。
+      [/virtualprotect|mprotect|page_execute_readwrite|self-?modif|自修改|自解码|解密后执行|smc\b/i,
+       '动态调试 静态先行 断点 smc 自修改代码 窗口期'],
+      [/isdebuggerpresent|checkremotedebuggerpresent|ntqueryinformationprocess|ptrace|tracerpid|反调试|antidebug/i,
+       '动态调试 静态先行 断点 反调试 窗口期'],
+      [/dialogboxparam|winmain|wndproc|wm_command|消息循环|getdlgitemtext|对话框/i,
+       '动态调试 静态先行 断点 gui 窗口期 32位 改内存'],
+      [/gettickcount|getsystemtime|queryperformancecounter|time\(null\)|rand\(\)/i,
+       '动态调试 静态先行 断点 窗口期'],
     ];
     // 特征反查词放最前（最高优先），其次算法/工具字面量命中，最后文件类型词
     const feats = [];

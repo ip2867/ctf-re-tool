@@ -1,6 +1,6 @@
 ---
 name: ctf-reverse-binary
-description: PE/ELF 二进制逆向方法论：查壳脱壳、IDA 定位关键函数、VM 字节码题专项、算法识别入口、静态分析套路。拿到 EXE/DLL/ELF/SO 题目时使用。
+description: PE/ELF 二进制逆向方法论：查壳脱壳、IDA 定位关键函数、VM 字节码题专项、算法识别入口、静态分析套路、**动态调试入场纪律与定向取证**（断点选址/窗口期/SMC/反调试/GUI）。拿到 EXE/DLL/ELF/SO 题目、或需要下断点取运行时值时使用。
 license: MIT
 metadata:
   user-invocable: "true"

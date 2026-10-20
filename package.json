@@ -29,6 +29,8 @@
     "electron-builder": "^26.15.3"
   },
   "dependencies": {
+    "crypto-js": "^4.2.0",
+    "sm-crypto": "^0.3.13",
     "ssh2": "^1.16.0"
   },
   "build": {

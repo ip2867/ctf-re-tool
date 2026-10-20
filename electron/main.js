@@ -3268,6 +3268,7 @@ function toolLabel(name, input) {
     case 'traffic_extract': return '解析流量 ' + short(i.path ? path.basename(i.path) : '', 36);
     case 'recipe': return '变换链 ' + (i.auto ? '自动解码' : ((i.recipe || []).map(x => (x && x.op) || '?').join(' → ') || '空'));
     case 'gui_input': return 'GUI 喂输入' + (i.list_only ? '（列控件）' : (i.text ? ' ' + short(i.text, 24) : ''));
+    case 'crypto': return '加密工具 ' + [i.op, i.algo, i.action].filter(Boolean).join('/');
     case 'jeb_get_manifest': return 'JEB 读取 Manifest';
     case 'jeb_get_class_decompiled': return 'JEB 反编译 ' + short(i.class_name, 36);
     case 'jeb_get_method_decompiled': return 'JEB 反编译方法 ' + short(i.class_name + '::' + (i.method_name || ''), 36);
@@ -6092,7 +6093,7 @@ function parseTextToolCalls(rawText) {
     'jeb_get_exported_activities', 'jeb_get_all_classes', 'jeb_get_class_methods',
     'ida_decompile', 'ida_list_functions', 'ida_find_strings', 'ida_get_xrefs', 'ida_get_bytes',
     'ida_list_globals', 'ida_disasm', 'ida_dbg', 'ida_dbg_mem',
-    'remote_exec', 'traffic_extract', 'recipe', 'gui_input',
+    'remote_exec', 'traffic_extract', 'recipe', 'gui_input', 'crypto',
     'browser_search', 'browser_open', 'run_command', 'run_python', 'adb_command', 'frida_hook',
     'read_skill', 'wiki_search', 'wiki_read', 'burp_get_history', 'burp_get_message', 'burp_call',
     'switch_to_next_stage'
@@ -6411,6 +6412,20 @@ function precheckToolCall(name, input) {
     }
     if (!i.list_only && (i.text == null || String(i.text) === '')) {
       return '需要 text（要喂给输入框的内容）。';
+    }
+  }
+  if (name === 'crypto') {
+    const op = String(i.op || '').toLowerCase();
+    if (!['symmetric', 'sm4', 'digest', 'hmac'].includes(op)) {
+      return 'op 必须是 symmetric / sm4 / digest / hmac 之一。';
+    }
+    if (op === 'digest' && !i.algo) return 'digest 需要 algo（md5/sha256/sm3/crc32…）。';
+    if ((op === 'symmetric' || op === 'sm4') && !i.key) return `${op} 需要 key。`;
+    if (op === 'symmetric' && !i.algo) return 'symmetric 需要 algo（aes/des/tripledes/rc4/rabbit）。';
+    if (op === 'hmac' && !i.key) return 'hmac 需要 key。';
+    const mode = String(i.mode || '').toLowerCase();
+    if (op === 'symmetric' && mode && mode !== 'ecb' && !i.iv) {
+      return `${mode.toUpperCase()} 模式需要 iv。`;
     }
   }
   if (name === 'ida_list_globals') {
@@ -7530,6 +7545,37 @@ function getToolDefinitions() {
         required: []
       }
     },
+    // ========== 对称加密 / 摘要（离线，等价 toolhelper 加解密页） ==========
+    {
+      name: "crypto",
+      description:
+        "离线加解密与摘要（等价于在线工具的 AES/SM4/哈希页面，但**在本机算**，密文不出网）。\n" +
+        "op=symmetric：algo=aes|des|tripledes|rc4|rabbit，action=encrypt|decrypt，可指定 mode=cbc|ecb|cfb|ofb|ctr、padding=pkcs7|none|zeros|iso10126|ansix923。\n" +
+        "op=sm4：国密 SM4，mode=ecb|cbc（sm-crypto 只支持这两种）。\n" +
+        "op=digest：md5|sha1|sha224|sha256|sha384|sha512|sha3|ripemd160|sm3|crc32（单向）。\n" +
+        "op=hmac：md5|sha1|sha256|sha512|sha3。\n" +
+        "格式：key_format/iv_format/data_format 取 utf8|hex|base64|latin1；缺省 key/iv 按 utf8、data 按 utf8、输出按 hex。\n" +
+        "⚠️ **哈希不可逆**：本工具只能正向计算。要反查弱口令用 recipe 的 crack（有界字典）。\n" +
+        "⚠️ 解密输出是二进制时自动给 hex；data_format 要与密文实际编码一致，否则得到乱码而不是报错。",
+      input_schema: {
+        type: "object",
+        properties: {
+          op: { type: "string", enum: ["symmetric", "sm4", "digest", "hmac"], description: "操作类型" },
+          algo: { type: "string", description: "算法名（见描述）" },
+          action: { type: "string", enum: ["encrypt", "decrypt"], description: "symmetric/sm4 的动作" },
+          data: { type: "string", description: "输入数据" },
+          data_format: { type: "string", enum: ["utf8", "hex", "base64", "latin1"], description: "输入编码（默认 utf8）" },
+          key: { type: "string", description: "密钥" },
+          key_format: { type: "string", enum: ["utf8", "hex", "base64", "latin1"], description: "密钥编码（默认 utf8）" },
+          iv: { type: "string", description: "初始向量（CBC/CFB/OFB/CTR 必填）" },
+          iv_format: { type: "string", enum: ["utf8", "hex", "base64", "latin1"], description: "IV 编码（默认 utf8）" },
+          mode: { type: "string", description: "分组模式（默认 cbc；ecb 不需要 iv）" },
+          padding: { type: "string", description: "填充（默认 pkcs7）" },
+          output_format: { type: "string", enum: ["hex", "base64", "utf8", "latin1"], description: "输出编码（默认 hex）" }
+        },
+        required: ["op"]
+      }
+    },
     // ========== 浏览器 MCP 工具 ==========
     {
       name: "browser_search",
@@ -7959,6 +8005,14 @@ async function executeToolCall(toolName, input) {
           lines.push('\n=== 最终输出（可打印文本）===\n' + r.output.text.slice(0, 8000));
         }
         return lines.join('\n');
+      }
+
+      case 'crypto': {
+        // 离线加解密/摘要。等价 toolhelper 的对称加密与哈希页，但数据不出本机。
+        const { runCryptoTool } = require('./crypto-tool');
+        const r = runCryptoTool(input);
+        if (!r.ok) throw new ToolCallError(`crypto 失败: ${r.error}`);
+        return r;
       }
 
       case 'gui_input': {

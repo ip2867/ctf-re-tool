@@ -165,6 +165,99 @@
 
 全量：`node tests/run_all.js` → 单元测试 **73/73**、回归题集通过、exit 0。
 
+## 一之五、2026-10-20 四续：离线加解密工具 + 两道题的题解核对
+
+### 1. `crypto`：离线加解密/摘要（替代在线工具）
+
+**为什么不接 toolhelper**（实测结论，不是推测）：
+
+- 它的加解密是**服务端计算**：页面 JS 只做 `ys.ajax({url:"/SymmetricEncryption/AesEncrypt"})`。
+- 带完整会话（先 GET 页面取 cookie、带 Referer/Origin/X-Requested-With）仍返回
+  `{"Tag":-1,"Message":"非法访问，如有误判，请刷新页面重试"}` —— 有反自动化校验。
+- 内嵌在线站还意味着题目数据外发；CTF 样本/密文不应离开本机。
+- CyberChef 官方 npm 包依赖过重（tesseract/argon2/libyara 等），为一个 decrypt 不值得。
+
+**改为本机实现** `electron/crypto-tool.js`，新增依赖 `crypto-js` 与 `sm-crypto`：
+
+| op | 支持 |
+|---|---|
+| `symmetric` | aes / des / tripledes / rc4 / rabbit；mode=cbc/ecb/cfb/ofb/ctr；padding=pkcs7/none/zeros/iso10126/ansix923 |
+| `sm4` | 国密 SM4，mode=ecb/cbc |
+| `digest` | md5/sha1/sha224/sha256/sha384/sha512/sha3/ripemd160/sm3/crc32 |
+| `hmac` | md5/sha1/sha256/sha512/sha3 |
+
+**实现中踩到并修复的三个字节级坑**（都有单测锁定）：
+
+1. `crypto-js` 的 WordArray 是 **big-endian word** 语义，`WordArray.create([...bytes])`
+   会让 `MD5('abc')` 变成 `2fd36776…` 而非 `90015098…`。改为文本走 `Utf8.parse`、
+   二进制先转 Latin1 字符串再 parse。
+2. `sm-crypto` 的 sm4 **传字符串会走 `utf8ToArray`**，>=0x80 的字节被扩成 2 字节；
+   必须传字节数组。
+3. `sm-crypto` 解密**默认输出是字符串**，0x80~0xFF 会变成多字节序列
+   （实测 16 字节明文解密后变 20 字节）；必须显式 `output:'array'`。
+
+**验证**：全部用标准测试向量逐字节比对 ——
+NIST SP 800-38A AES-128-CBC/ECB、GB/T 32907 SM4 国标向量、RFC 4231 HMAC-SHA256、
+MD5/SHA1/SHA256/SHA512/SM3/CRC32 标准值。`tests/test_crypto_tool.js` **35/35**。
+
+**关于"解密 MD5"**：MD5 是单向哈希，不存在通用逆运算。在线站的"MD5 解密"本质是
+预计算表/暴力枚举，只能命中弱口令。本工具的 `digest` 只做正向计算，
+反查走 `recipe` 的 `crack`（有界字典，未命中**原样返回**）。
+
+### 2. CrackMe2 题解核对：找到原始题解并复现
+
+通过检索定位到原始题目是**看雪CTF 2016 第四题**，题解：
+`https://blog.csdn.net/agraye9058/article/details/102378437`（原帖 cnblogs/Sendige）。
+
+题解描述与我们此前静态分析**完全吻合**：
+
+- `0x40148C`: `cmp eax, 0x1E` → 输入必须 30 字节
+- `0x4014F0` 的 `md5_update` 只哈希**前 7 字符**
+- 后 23 字节先 XOR 固定 key `44ad5ccc1290738d4781e389849cdff9476ab69e113027`，
+  再 XOR MD5 流（16 字节重复到 23）
+- 结果 23 字节是"移动字节"，每字节拆 4 个 2-bit 方向（MSB 优先）：
+  0=上(-0x10) 1=右(+1) 2=下(+0x10) 3=左(-1)
+- 两张 256 字节表 @0x413798 / 0x413898，`ror(t1[i],2) ^ t2[i]` 构成 16×16 网格，
+  起点 `'C'`(0x43)、终点 `'X'`(0x58)
+
+**我们用工具复现并验证成功**：
+
+```
+PE imageBase=0x400000
+表1 文件偏移=0x11998  表2=0x11a98
+网格: 起点(C)=索引 0   终点(X)=索引 253
+最短路径步数=92（= 23 字节 × 4）✓
+移动字节: a95abeaaa555a50000fabc00001555affe9555aaaafea5
+正向重放验证: {ok:true, why:"reached-exit", finalPos:253}
+```
+
+**关键结论（解释了此前为何"解不出 flag"）**：
+程序的正确输入是 **30 字节二进制串**，后 23 字节不可打印，**不是 `flag{...}` 形态**。
+按题解算法反推，程序会接受的串是：
+
+```
+hex: 31323334353637111d7069c3d763573c9b90cb3c40bd0f4515713bcfdc37
+     ("1234567" + 23 字节不可打印数据)
+```
+
+平台上的 `flag` 提交约定与该二进制输入的关系**仍未确认**——题解本身也没给出 flag 值。
+这不是"AI 算不出来"，而是题目要求的输出形态与平台 flag 格式不一致。
+
+### 3. cnbragon 题解核对：未找到匹配题解
+
+- 找到一篇 BUUCTF "cnbragon" 的题解，但它描述的是 **RC4-KSA + MD5 + 常量 43924** 的结构，
+  与本题（4 张 256 dword 表 + 自定义分组密码 + Base32 + keystream）**完全不同**，
+  该题解给出的 `flag{d2be2981b84f2a905669995873d6a36c}` **不能用于本题**。
+- 未找到任何提及 `KanxueCTF2016Keygenme`、`cnbragon@pediyctf2016`、
+  四个表偏移（0x1fb98/0x1ff98/0x20398/0x20798）或已知 keystream 的公开题解。
+- 看雪论坛原帖与微信公众号「点评和解析」均被反爬拦截，无法读取正文。
+
+**结论**：cnbragon 仍需靠自身分析。此前的静态复核已确认关键事实
+（不是 SMC、四张表已 dump 全、key 派生应为 dword 相加），
+剩余工作是正确翻译轮函数——这是模型能力问题，不是工具缺陷。
+
+全量：`node tests/run_all.js` → 单元测试 **74/74**、回归题集通过、exit 0。
+
 **上一轮遗留的两项也已验证**：
 - P1 契约自动枚举 → 演进为 rank 5 的"契约驱动 verified + 重试循环"，本轮 xxor 实测转成功
 - P2 中间值自动推进 → 已落地（`electron/intermediate-advance.js`，17 项单测 + 3 项 E2E）

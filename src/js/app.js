@@ -698,9 +698,10 @@ async function analyzeFile(filePath, opts = {}) {
     }
 
     // 同步工作目录给主进程（AI 的 glob/grep 搜索根）
+    // 一并传文件与类型：ida_dbg 用它判断 PE(local Windows debugger) 还是 ELF(remote gdb)
     try {
       const dir = filePath.replace(/[\\/][^\\/]+$/, '');
-      await window.electronAPI.setWorkdir(dir);
+      await window.electronAPI.setWorkdir(dir, filePath, state.fileType);
     } catch (e) { /* 可选 */ }
 
     // 创建 CASE 证据目录（本题为一个小案件：evidence/scripts/timeline）

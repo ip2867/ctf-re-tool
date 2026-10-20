@@ -90,26 +90,99 @@ const DBG_ACTIONS = [
   'start', 'exit', 'continue', 'run_to', 'step_into', 'step_over',
   'bp_list', 'bp_add', 'bp_del', 'bp_toggle', 'regs', 'regs_named', 'stack',
   'mem_read', 'mem_write',
+  'mode', 'clear_remote',
 ];
 
+// start 的调试模式判定。
+//
+// 实测（2026-10-20）：IDA 的进程选项是**全局持久**的——某次 set_remote_debugger 之后，
+// ida_dbg.get_process_options() 会一直带着 (host, password, port)，
+// 此后哪怕 load_debugger("win32") 成功，start_process 也返回 -1。
+// 这就是"本地 Windows 调试明明可用，却一直 Failed to start debugger"的真因。
+//
+// 因此 start 必须先决定模式，并且**本地模式要显式清掉远程参数**。
+function decideDebugMode(input, ctx) {
+  const i = input || {};
+  const c = ctx || {};
+  const explicit = String(i.mode || c.mode || '').toLowerCase();
+  if (explicit === 'local' || explicit === 'remote') return explicit;
+  // 未显式指定时按目标类型推断：
+  //   PE（MZ）→ local（Local Windows debugger）
+  //   ELF 且配了 Kali → remote gdb（gdbserver 在 Kali 上跑目标）
+  //   其余 → local（默认行为，失败时上层会给出 remote 提示）
+  const kind = String(c.targetKind || c.fileType || '').toUpperCase();
+  if (kind === 'ELF') return c.remoteAvailable ? 'remote' : 'local';
+  return 'local';
+}
+
+// 生成 start 前需要的 py_eval 代码：设置模式 + 清残留 + 起进程。
+// 返回 {tool, args}，与 buildDbgCall 的其它分支同形态。
+function buildStartPrelude(mode, input, ctx) {
+  const i = input || {};
+  const c = ctx || {};
+  const lines = ['import ida_dbg', 'import idaapi'];
+
+  if (mode === 'remote') {
+    const host = String(i.remote_host || c.remoteHost || '').trim();
+    const port = Number(i.remote_port || c.remotePort) || 23946;
+    const pass = String(i.remote_pass != null ? i.remote_pass : (c.remotePass || ''));
+    if (!host) {
+      return { error: 'remote 模式需要 remote_host（Kali 的 IP，gdbserver 所在主机）' };
+    }
+    // load_debugger 第二参数 use_remote=True 才是远程调试上下文
+    lines.push(`ida_dbg.load_debugger("gdb", True)`);
+    lines.push(`ida_dbg.set_remote_debugger(${JSON.stringify(host)}, ${JSON.stringify(pass)}, ${port})`);
+  } else {
+    // 本地：先清远程参数（空 host/port=-1 表示不使用远程），再加载 win32
+    lines.push(`try: ida_dbg.set_remote_debugger("", "", -1)`);
+    lines.push(`except Exception: pass`);
+    lines.push(`ida_dbg.load_debugger("win32", False)`);
+  }
+
+  const p = i.path !== undefined ? i.path : (i.file !== undefined ? i.file : '');
+  const args = i.args == null ? '' : String(i.args);
+  const cwd = i.cwd == null ? '' : String(i.cwd);
+  lines.push(`_rc = idaapi.start_process(${JSON.stringify(String(p))}, ${JSON.stringify(args)}, ${JSON.stringify(cwd)})`);
+  lines.push(`print("START_RC", _rc)`);
+  // -1 时把关键状态一起打出来，省掉下一轮排查
+  lines.push(`if _rc == -1:`);
+  lines.push(`    try: print("DBG_ON", ida_dbg.is_debugger_on())`);
+  lines.push(`    except Exception: pass`);
+  lines.push(`    try:`);
+  lines.push(`        _o = ida_dbg.get_process_options()`);
+  lines.push(`        _s = _o[3] if isinstance(_o, tuple) else getattr(_o, "host", "")`);
+  lines.push(`        print("STALE_REMOTE", repr(_s))`);
+  lines.push(`    except Exception as _e: print("OPTS_ERR", _e)`);
+
+  return { tool: 'py_eval', args: { code: lines.join('\n') } };
+}
+
 // 返回 {tool, args}；tool 是上游真实工具名（或 py_eval）。无法识别时返回 {error}。
-function buildDbgCall(action, input) {
+function buildDbgCall(action, input, ctx) {
   const i = input || {};
   const a = String(action || '').toLowerCase();
 
   switch (a) {
+    case 'mode':
+    case 'clear_remote': {
+      // 只清远程调试残留（不启动进程）。用于"本地调试莫名失败"时先复位。
+      const py = [
+        'import ida_dbg',
+        'try:',
+        '    ida_dbg.set_remote_debugger("", "", -1)',
+        '    print("REMOTE_CLEARED")',
+        'except Exception as e:',
+        '    print("CLEAR_ERR", e)',
+        'try: ida_dbg.load_debugger("win32", False); print("LOCAL_LOADED")',
+        'except Exception as e: print("LOAD_ERR", e)',
+      ].join('\n');
+      return { tool: 'py_eval', args: { code: py } };
+    }
     case 'start': {
-      const hasArgs = i.args !== undefined || i.cwd !== undefined;
-      if (hasArgs) {
-        // dbg_start 自己不收参数（固定 start_process("","","")），要带参数只能走 py_eval。
-        // path 缺省为空串 = 调试 IDA 当前已加载的数据库（主进程只有 currentWorkDir，没有 currentFile）。
-        const p = i.path !== undefined ? i.path : (i.file !== undefined ? i.file : '');
-        const args = i.args == null ? '' : String(i.args);
-        const cwd = i.cwd == null ? '' : String(i.cwd);
-        const py = `import idaapi\nidaapi.start_process(${JSON.stringify(String(p))}, ${JSON.stringify(args)}, ${JSON.stringify(cwd)})\nprint("started")`;
-        return { tool: 'py_eval', args: { code: py } };
-      }
-      return { tool: 'dbg_start', args: {} };
+      const mode = decideDebugMode(i, ctx);
+      const prelude = buildStartPrelude(mode, i, ctx);
+      if (prelude.error) return { error: prelude.error };
+      return prelude;
     }
     case 'exit': return { tool: 'dbg_exit', args: {} };
     case 'continue': return { tool: 'dbg_continue', args: {} };
@@ -166,11 +239,16 @@ function translateDbgError(msg) {
   if (/requires extension/i.test(s)) {
     return 'IDA MCP 未启用 dbg 扩展组（URL 需带 ?ext=dbg）——请检查主进程的 mcp.idaExtensions 配置';
   }
+  if (/Failed to start debugger/i.test(s)) {
+    return s + '。常见原因：①残留的远程调试配置（先 ida_dbg(action="clear_remote")）；' +
+      '②目标是 ELF 却走了本地模式（改用 mode="remote" 并给 remote_host）；' +
+      '③进程选项里的路径为空（start 时传 path）';
+  }
   return s;
 }
 
 module.exports = {
-  buildDbgCall, translateDbgError,
+  buildDbgCall, translateDbgError, decideDebugMode, buildStartPrelude,
   normalizeAddrList, normalizeHex, normalizeRegions, normalizeBpItems,
   DBG_ACTIONS,
 };

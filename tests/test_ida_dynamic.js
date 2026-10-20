@@ -70,10 +70,14 @@ console.log('\n[3] dbg_* 参数形态与 api_debug.py 的真实 schema 一致');
   ok(write.tool === 'dbg_write' && write.args.regions[0].data === '90 90', 'data 归一为空格分隔 hex', JSON.stringify(write));
   const tog = buildDbgCall('bp_toggle', { addrs: ['0x401000'] });
   ok(tog.tool === 'dbg_toggle_bp' && tog.args.items[0].enabled === true, 'toggle items 带 enabled');
-  for (const a of ['start', 'exit', 'continue', 'step_into', 'step_over', 'bp_list', 'regs', 'stack']) {
+  for (const a of ['exit', 'continue', 'step_into', 'step_over', 'bp_list', 'regs', 'stack']) {
     const c = buildDbgCall(a, {});
     ok(!c.error && /^dbg_/.test(c.tool), `${a} → ${c.tool}`);
   }
+  // start 现在走 py_eval（必须显式设置 local/remote 并清残留），单独断言
+  const start = buildDbgCall('start', {}, { targetKind: 'PE' });
+  ok(!start.error && start.tool === 'py_eval', `start → ${start.tool}（py_eval）`);
+  ok(/start_process/.test(start.args.code), 'start 代码含 start_process');
   ok(buildDbgCall('bogus', {}).error, '未知动作给出可用列表');
   ok(translateDbgError('Debugger not running').includes('start'), '未启动调试器时提示先 start');
   ok(translateDbgError("Tool 'dbg_start' requires extension 'dbg'").includes('ext=dbg'), '扩展未启用时提示 ?ext=dbg');

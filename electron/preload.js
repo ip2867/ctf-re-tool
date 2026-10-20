@@ -109,7 +109,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   sessionLoad: (id) => ipcRenderer.invoke('session-load', id),
 
   // 工作目录 / 应用路径 / 设备就绪
-  setWorkdir: (dir) => ipcRenderer.invoke('set-workdir', dir),
+  setWorkdir: (dir, file, fileType) => ipcRenderer.invoke('set-workdir', dir, file, fileType),
   // CASE 目录同步（主进程没有 state.caseDir；run_python 的 cwd/产物登记靠它）
   setCaseDir: (dir) => ipcRenderer.invoke('set-case-dir', dir),
   // run_python 产物登记（渲染层在 finalize 时逐条转成 evidence）

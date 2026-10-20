@@ -3266,6 +3266,7 @@ function toolLabel(name, input) {
     case 'ida_dbg_mem': return 'IDA 调试内存' + (i.action ? ' ' + short(i.action, 12) : '');
     case 'remote_exec': return '远程执行 ' + short(i.host || 'local', 10) + ' ' + short(i.command, 40);
     case 'traffic_extract': return '解析流量 ' + short(i.path ? path.basename(i.path) : '', 36);
+    case 'recipe': return '变换链 ' + (i.auto ? '自动解码' : ((i.recipe || []).map(x => (x && x.op) || '?').join(' → ') || '空'));
     case 'jeb_get_manifest': return 'JEB 读取 Manifest';
     case 'jeb_get_class_decompiled': return 'JEB 反编译 ' + short(i.class_name, 36);
     case 'jeb_get_method_decompiled': return 'JEB 反编译方法 ' + short(i.class_name + '::' + (i.method_name || ''), 36);
@@ -6090,7 +6091,7 @@ function parseTextToolCalls(rawText) {
     'jeb_get_exported_activities', 'jeb_get_all_classes', 'jeb_get_class_methods',
     'ida_decompile', 'ida_list_functions', 'ida_find_strings', 'ida_get_xrefs', 'ida_get_bytes',
     'ida_list_globals', 'ida_disasm', 'ida_dbg', 'ida_dbg_mem',
-    'remote_exec', 'traffic_extract',
+    'remote_exec', 'traffic_extract', 'recipe',
     'browser_search', 'browser_open', 'run_command', 'run_python', 'adb_command', 'frida_hook',
     'read_skill', 'wiki_search', 'wiki_read', 'burp_get_history', 'burp_get_message', 'burp_call',
     'switch_to_next_stage'
@@ -6394,6 +6395,14 @@ function precheckToolCall(name, input) {
   }
   if (name === 'traffic_extract' && (!i.path || !String(i.path).trim())) {
     return '缺少必填参数 path。请传入 pcap/pcapng 文件的绝对路径。';
+  }
+  if (name === 'recipe') {
+    if (!i.auto && (!Array.isArray(i.recipe) || i.recipe.length === 0)) {
+      return '需要 recipe（操作数组，如 [{op:"from_base64"}]）或 auto:true。';
+    }
+    if (Array.isArray(i.recipe) && i.recipe.some(x => !x || !x.op)) {
+      return 'recipe 的每一项都必须有 op 字段（如 {op:"xor", key:"0a"}）。';
+    }
   }
   if (name === 'ida_list_globals') {
     // 参数都可选，但类型错了会让插件静默退回默认（count=100）→ 表又被截断
@@ -7378,19 +7387,29 @@ function getToolDefinitions() {
           action: {
             type: "string",
             enum: ["start", "exit", "continue", "run_to", "step_into", "step_over",
-                   "bp_list", "bp_add", "bp_del", "bp_toggle", "regs", "regs_named", "stack"],
-            description: "调试动作"
+                   "bp_list", "bp_add", "bp_del", "bp_toggle", "regs", "regs_named", "stack",
+                   "clear_remote"],
+            description: "调试动作。clear_remote 用于清除残留的远程调试配置（本地启动失败时先试它）"
           },
           addr: { type: "string", description: "run_to 的目标地址 / bp_add 的单地址" },
           addrs: { description: "断点地址：字符串或字符串数组（如 '0x401000,0x401010'）" },
           items: { description: "bp_toggle 的条目：[{addr, enabled}]（也接受地址数组）" },
           regs: { type: "string", description: "regs_named 的寄存器名，逗号分隔（如 'RAX,RBX'）" },
+          mode: {
+            type: "string",
+            enum: ["local", "remote"],
+            description: "start 的调试模式。local=Local Windows debugger（PE）；remote=Remote GDB（ELF，需要 Kali 上跑 gdbserver）。不填则按目标类型自动选"
+          },
+          remote_host: { type: "string", description: "remote 模式的 gdbserver 主机（通常是 Kali 的 IP）" },
+          remote_port: { type: "number", description: "remote 模式的 gdbserver 端口（默认 23946）" },
+          remote_pass: { type: "string", description: "remote 模式的密码（gdbserver 未设密码则留空）" },
+          target_kind: { type: "string", enum: ["PE", "ELF"], description: "显式声明目标类型，覆盖自动推断" },
           path: {
             type: "string",
             description: "start 时要调试的可执行文件路径；**留空表示调试 IDA 当前已加载的数据库**（主进程不持有当前文件路径）"
           },
           file: { type: "string", description: "path 的别名" },
-          args: { type: "string", description: "start 时传给进程的命令行参数（提供即走 py_eval 的 start_process）" },
+          args: { type: "string", description: "start 时传给进程的命令行参数" },
           cwd: { type: "string", description: "start 时进程的工作目录" }
         },
         required: ["action"]
@@ -7442,6 +7461,36 @@ function getToolDefinitions() {
           max_flows: { type: "number", description: "最多返回的流数（默认 20）" }
         },
         required: ["path"]
+      }
+    },
+    // ========== 变换链 / 解码（CyberChef 式有界操作组合） ==========
+    {
+      name: "recipe",
+      description:
+        "按顺序执行一条**变换链**（CyberChef 式），一次拿到每一层的 printable/entropy/hex/preview。" +
+        "用途：别再手写 base64→xor→反转→解压 这类重复脚本。\n" +
+        "输入：input（字符串或 hex/base64，用 input_encoding 指定）；recipe=[{op, ...参数}]。\n" +
+        "常用 op：from_hex/to_hex、from_base64/to_base64、from_base32、custom_base64(alphabet)、" +
+        "url_decode、gunzip、zlib_inflate、zlib_deflate_raw、reverse、reverse_each_4、" +
+        "xor(key,key_encoding)、add(key)、sub(key)、rot(n)、bit_shift(n,direction)、" +
+        "slice(start,end)、utf16le_decode、to_upper/to_lower/trim、hash(algo)、" +
+        "crack(algo,dictionary)（有界字典反查，未命中原样返回）。\n" +
+        "auto=true 时忽略 recipe，自动试常见解码链并返回所有可打印结果（有界，不猜 xor key）。\n" +
+        "整链上限 20 步；任一步失败会指到具体步号，不会静默跳过。",
+      input_schema: {
+        type: "object",
+        properties: {
+          input: { type: "string", description: "输入数据（文本；二进制用 input_encoding=hex/base64）" },
+          input_encoding: { type: "string", enum: ["utf8", "hex", "base64", "latin1"], description: "输入编码（默认 utf8）" },
+          recipe: {
+            type: "array",
+            description: "操作链，如 [{op:'from_base64'},{op:'xor',key:'0a'},{op:'to_hex'}]",
+            items: { type: "object" }
+          },
+          auto: { type: "boolean", description: "true = 自动尝试常见解码链（忽略 recipe）" },
+          max_steps: { type: "number", description: "链长上限（默认 20，最大 50）" }
+        },
+        required: []
       }
     },
     // ========== 浏览器 MCP 工具 ==========
@@ -7780,12 +7829,42 @@ async function executeToolCall(toolName, input) {
       }
 
       case 'ida_dbg': {
-        const call = buildDbgCall(input.action, input);
+        // ctx 让 start 能决定 local/remote：
+        //   PE → Local Windows debugger；ELF 且配了 Kali → remote gdb（gdbserver）
+        const cfgKali = config.kali || {};
+        const dbgCtx = {
+          targetKind: input.target_kind || idaDbgTargetKind(),
+          remoteAvailable: !!(cfgKali.sshHost && cfgKali.sshPort),
+          remoteHost: cfgKali.sshHost || '',
+          remotePort: Number(cfgKali.gdbserverPort) || 23946,
+          remotePass: cfgKali.sshPass || '',
+        };
+        const call = buildDbgCall(input.action, input, dbgCtx);
         if (call.error) return `参数错误：${call.error}`;
         try {
           const r = await callIdaMcp(call.tool, call.args);
+          // py_eval 的 start 结果里 START_RC 才说明是否真的起来了：
+          // 旧实现只看工具是否报错，会把 START_RC -1（静默失败）当成功。
+          if (call.tool === 'py_eval' && /START_RC/.test(String(call.args && call.args.code || ''))) {
+            const stdout = String((r && r.stdout) || '');
+            const m = /START_RC\s+(-?\d+)/.exec(stdout);
+            if (m && Number(m[1]) === -1) {
+              const stale = /STALE_REMOTE\s+'([^']*)'/.exec(stdout);
+              const hint = stale && stale[1].trim()
+                ? `；检测到残留远程调试配置（host=${stale[1].trim()}），先执行 ida_dbg(action="clear_remote")`
+                : '；若目标是 ELF，请用 mode="remote" 并给 remote_host（Kali 必先启动 gdbserver）';
+              throw new ToolCallError(`IDA 调试启动失败（START_RC=-1）${hint}`);
+            }
+            if (m && Number(m[1]) === 1) {
+              // 启动成功但调试事件可能尚未落地：等 IP 可读再返回，
+              // 否则 AI 紧接着调 dbg_regs 会拿到 "Debugger not running"（实测）。
+              const ip = await readDbgIp(4, 400);
+              return { started: true, ip, raw: r };
+            }
+          }
           return r;
         } catch (err) {
+          if (err && err.__toolError) throw err;
           // IDA 9 的异步调试器：idaapi.step_over()/step_into() 在"命令已投递"时返回 False，
           // 但单步**确实执行了**（实测 IP 0x77d284cc → 0x4012d1）。插件按返回值判定 →
           // 报 "Failed to step over"，把成功当失败。
@@ -7819,6 +7898,31 @@ async function executeToolCall(toolName, input) {
 
       case 'remote_exec':
         return await remoteExecTool(input);
+
+      case 'recipe': {
+        // CyberChef 式变换链：一次调用跑完整条链，每一层都给可判读的指标。
+        const { runRecipe, autoDecode } = require('./recipe');
+        const raw = input.input == null ? '' : input.input;
+        if (input.auto) {
+          const hits = autoDecode(raw, { inputEncoding: input.input_encoding });
+          if (!hits.length) return '自动解码：所有常见链都未产出可打印结果。可用 recipe 手动指定 op 链（例如 [{op:"from_hex"}]）。';
+          return hits.map((h, i) =>
+            `#${i + 1} ${h.chain}\n  len=${h.len} printable=${h.printable} entropy=${h.entropy}\n  hex=${h.hex}\n  preview=${h.preview}`
+          ).join('\n\n');
+        }
+        const r = runRecipe(raw, input.recipe, {
+          inputEncoding: input.input_encoding,
+          maxSteps: input.max_steps,
+        });
+        const lines = r.steps.map(s =>
+          `[${s.index}] ${s.op}${s.note ? ' — ' + s.note : ''}\n  len=${s.len} printable=${s.printable} entropy=${s.entropy}\n  hex=${s.hex}\n  preview=${s.preview}`
+        );
+        if (!r.ok) lines.push('ERROR: ' + r.error);
+        if (r.output && r.output.text != null) {
+          lines.push('\n=== 最终输出（可打印文本）===\n' + r.output.text.slice(0, 8000));
+        }
+        return lines.join('\n');
+      }
 
       case 'traffic_extract': {
         const p = String(input.path || '').trim();
@@ -8056,13 +8160,18 @@ async function rescueStepFailure(call, err) {
 }
 
 // 从 dbg_regs 里取当前 IP（x86 EIP / x64 RIP）。读不到返回 null。
-async function readDbgIp() {
-  try {
-    const regs = await callIdaMcp('dbg_regs', {});
-    const arr = Array.isArray(regs) ? regs : (regs && regs.registers) || [];
-    const hit = arr.find(r => r && /^(eip|rip)$/i.test(String(r.name || '')));
-    return hit ? String(hit.value).toLowerCase() : null;
-  } catch (e) { return null; }
+// 刚 start 时调试事件可能还没落地（插件会报 Debugger not running），重试几次。
+async function readDbgIp(retries = 3, delayMs = 400) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const regs = await callIdaMcp('dbg_regs', {});
+      const arr = Array.isArray(regs) ? regs : (regs && regs.registers) || [];
+      const hit = arr.find(r => r && /^(eip|rip)$/i.test(String(r.name || '')));
+      if (hit) return String(hit.value).toLowerCase();
+    } catch (e) { /* 重试 */ }
+    if (i < retries) await new Promise(r => setTimeout(r, delayMs));
+  }
+  return null;
 }
 
 // remote_exec：local 走本地 shell，kali 走 sshExec。失败必须如实抛 ToolCallError。
@@ -8246,6 +8355,16 @@ async function browserMcpOpenTool(url) {
 
 // 当前工作目录（渲染层加载题目文件时同步，AI 的 glob/grep 由此定位）
 let currentWorkDir = null;
+// 当前题目文件与类型（供 ida_dbg 决定 local/remote 调试模式）
+let currentTargetFile = null;
+let currentTargetKind = null;
+function idaDbgTargetKind() {
+  if (currentTargetKind) return currentTargetKind;
+  const p = String(currentTargetFile || '');
+  if (/\.(exe|dll)$/i.test(p)) return 'PE';
+  if (/\.(so|elf)$/i.test(p) || /(^|[\\/])(chall|pppp|parallelism|obfuscat3)$/i.test(p)) return 'ELF';
+  return '';
+}
 // 当前案件目录（渲染层 caseInit 成功后通过 set-case-dir 同步）。
 // 主进程没有 state.caseDir：run_python 的 cwd 与产物登记都依赖这份主进程侧副本。
 let currentCaseDir = null;
@@ -9072,8 +9191,11 @@ ipcMain.handle('kali-test-connection', async (event) => {
 // ========== 工作目录与就绪轮询 ==========
 
 // 渲染层同步当前题目文件所在目录（AI glob/grep 的搜索根）
-ipcMain.handle('set-workdir', async (event, dir) => {
+// file/fileType 可选：用于 ida_dbg 判断 PE(local) 还是 ELF(remote)
+ipcMain.handle('set-workdir', async (event, dir, file, fileType) => {
   currentWorkDir = dir || null;
+  if (file) currentTargetFile = String(file);
+  if (fileType) currentTargetKind = String(fileType).toUpperCase();
   return { success: true };
 });
 

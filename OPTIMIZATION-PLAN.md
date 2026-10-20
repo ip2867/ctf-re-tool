@@ -46,6 +46,73 @@
 
 **凭据修正**：`config.json` 的 `kali.sshUser/sshPass` 由占位值 `kali/kali` 改为本机实际账号（连接验证通过后写入，密码不回显）。
 
+## 一之三、2026-10-20 续：变换链工具 + 调试模式分离（已完成）
+
+### 1. `recipe`：CyberChef 式的有界变换链
+
+**动机**：实测里 AI 反复手写同一类脚本（base64 → xor → 反转 → 解压），每次都要生成代码、
+处理异常、自己判断哪层解出了明文，几十轮预算烧在重复劳动上。这些变换是**有界且确定**的。
+
+新增 `electron/recipe.js`（28 个操作）与 AI 工具 `recipe`：
+
+| 类别 | 操作 |
+|---|---|
+| 编码 | `from_hex`/`to_hex`、`from_base64`/`to_base64`、`from_base32`/`to_base32`、`custom_base64(alphabet)`、`url_decode`/`url_encode` |
+| 压缩 | `gunzip`、`zlib_inflate`、`zlib_deflate_raw`（`bzip2` 明确报"未内置"，不假装成功） |
+| 字节 | `reverse`、`reverse_each_4`、`xor(key,key_encoding)`、`add`/`sub`、`rot`、`bit_shift`、`slice` |
+| 文本 | `utf16le_decode`/`utf16le_encode`、`to_upper`/`to_lower`/`trim` |
+| 哈希 | `hash(algo)` 单向计算；`crack(algo,dictionary)` 有界字典反查（未命中**原样返回**，不静默变成别的值） |
+
+设计边界：
+- 每一步都返回 `len / printable / entropy / hex / preview`，让 AI 自己判断哪层是有效明文。
+- 链长上限 20 步；任一步失败**指到具体步号**，绝不静默跳过。
+- `auto:true` 自动试常见解码链并只返回可打印结果（有界，不猜 XOR key）。
+
+**注意**：MD5 仍然不可逆。`crack` 只做弱口令/数字 0..9999 的有界尝试；
+真正的突破口应来自题目里的明文线索，而不是穷举。
+
+### 2. IDA 调试模式：local / remote 显式分离（修 `dbg_start` 恒失败）
+
+**根因（实测确证）**：IDA 的进程选项是**全局持久**的。一次 `set_remote_debugger(host, pass, port)`
+之后，`get_process_options()` 会一直带着这组值：
+
+```
+('...\\CrackMe.exe', '', '...', '192.168.230.129 ', '200512', 23946)
+```
+
+此后即使 `load_debugger("win32")` 成功，`start_process` 也返回 **-1** ——
+这就是"本地 Windows 调试明明可用，却一直 Failed to start debugger"的真因。
+
+**修法**：
+
+- `start` 不再走无参 `dbg_start`，统一走 `py_eval`，先决定模式再起进程：
+  - `local`（PE）：`set_remote_debugger("", "", -1)` 清残留 → `load_debugger("win32", False)` → `start_process`
+  - `remote`（ELF）：`load_debugger("gdb", True)` → `set_remote_debugger(host, pass, port)` → `start_process`
+- 模式自动推断：PE → local；ELF 且配置了 Kali → remote。可用 `mode` / `target_kind` 显式覆盖。
+- 新增 `action="clear_remote"`：只复位远程配置，不启动进程（本地启动莫名失败时先跑它）。
+- `py_eval` 输出 `START_RC`，主进程解析：`-1` 判为**失败**并提示原因（含检测到的残留 host）。
+- 启动成功后等 IP 可读再返回（`readDbgIp` 重试 4 次），避免 AI 紧接着调 `dbg_regs`
+  拿到 `Debugger not running`。
+- 目标类型经 `set-workdir` 从渲染层同步到主进程（`currentTargetFile` / `currentTargetKind`）。
+
+**实测结果**：
+
+| 步骤 | 结果 |
+|---|---|
+| 启动前读进程选项 | 确认残留 `192.168.230.129 / 200512 / 23946` |
+| `clear_remote` | `REMOTE_CLEARED` + `LOCAL_LOADED` |
+| `start`（local，PE） | **`START_RC 1`**，返回 `ip=0x77b8123c` |
+| `regs` | `ip=0x77b8123c`，thread=24812，寄存器可读 |
+| `bp_add` / `bp_list` | 断点被正确登记 |
+| `exit` | `{"exited":true}` |
+
+**未达成的部分（如实记录）**：GUI 程序（CrackMe 系列）启动后停在消息循环，
+`continue` 不会自动进入校验代码——需要人工在界面上触发按钮，或改用
+`dbg_run_to(校验地址)` 强制跑到目标。这一步是**题目的交互约束**，不是工具缺陷；
+对无交互的 ELF/控制台程序（配 gdbserver）不受此限。
+
+全量：`node tests/run_all.js` → 单元测试 **72/72**、回归题集通过、exit 0。
+
 **上一轮遗留的两项也已验证**：
 - P1 契约自动枚举 → 演进为 rank 5 的"契约驱动 verified + 重试循环"，本轮 xxor 实测转成功
 - P2 中间值自动推进 → 已落地（`electron/intermediate-advance.js`，17 项单测 + 3 项 E2E）

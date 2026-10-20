@@ -50,7 +50,18 @@ public class CtfGui
     [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr h);
     [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, string l);
-    [DllImport("user32.dll")] public static extern bool PostMessageNum(IntPtr h, uint m, IntPtr w, IntPtr l);
+    // DllImport resolves an export by METHOD NAME by default; this method is named
+    // PostMessageNum, so EntryPoint must be given explicitly or the call throws
+    // EntryPointNotFoundException at runtime (reproduced).
+    [DllImport("user32.dll", EntryPoint = "PostMessageW")] public static extern bool PostMessageNum(IntPtr h, uint m, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+    public const uint WM_CHAR = 0x0102;
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr SendMessageTimeout(IntPtr h, uint m, IntPtr w, string l, uint flags, uint timeout, out IntPtr res);
 
@@ -86,13 +97,51 @@ public class CtfGui
 
     public static string SetText(IntPtr h, string text, bool useSend, int timeoutMs)
     {
-        if (useSend)
-        {
-            IntPtr res;
-            IntPtr r = SendMessageTimeout(h, WM_SETTEXT, IntPtr.Zero, text, 0x0002, (uint)timeoutMs, out res);
-            return r != IntPtr.Zero ? "sent" : "send-timeout-or-hung";
-        }
-        return PostMessage(h, WM_SETTEXT, IntPtr.Zero, text) ? "posted" : "post-failed";
+        // Bring the dialog to the foreground so keyboard-based fallbacks can land.
+        IntPtr top = h;
+        IntPtr parent = GetParent(h);
+        if (parent != IntPtr.Zero) top = parent;
+
+        ShowWindow(top, 9 /*SW_RESTORE*/);
+        SetForegroundWindow(top);
+        System.Threading.Thread.Sleep(150);
+
+        IntPtr res;
+        // Strategy A: WM_SETTEXT. Note the OS marshals the string for system
+        // messages, but when the target is 32-bit and this host is 64-bit the call
+        // can return 1 (success) while the control stays empty, and GetWindowText
+        // cannot read it back either (reproduced on CrackMe3). We therefore report
+        // a verification state instead of claiming success unconditionally.
+        IntPtr r = SendMessageTimeout(h, WM_SETTEXT, IntPtr.Zero, text, 0x0002, (uint)timeoutMs, out res);
+        System.Threading.Thread.Sleep(120);
+        string after = Txt(h);
+        if (after == text) return "sent-verified";
+
+        // Strategy B: per-character WM_CHAR (wParam only, no string marshalling).
+        PostMessageNum(h, WM_SETTEXT, IntPtr.Zero, IntPtr.Zero);
+        System.Threading.Thread.Sleep(50);
+        foreach (char ch in text) PostMessageNum(h, WM_CHAR, (IntPtr)ch, IntPtr.Zero);
+        System.Threading.Thread.Sleep(150);
+
+        string after2 = Txt(h);
+        if (after2 == text) return "charposted-verified";
+        if (!string.IsNullOrEmpty(after2))
+            return "partial (readback=" + after2.Length + " chars, expected " + text.Length + ")";
+
+        // Neither strategy could be verified. This is expected when the target is
+        // 32-bit and the host is 64-bit: the write may have succeeded but the
+        // caller cannot read it back. Report it honestly.
+        return "unverified (WM_SETTEXT ret=" + r + "; readback unavailable cross-bitness)";
+    }
+
+    // Read the control's current text. GetWindowText works for same-bitness targets;
+    // for a 32-bit target from a 64-bit host it returns empty, which is why SetText
+    // reports "unverified" rather than assuming success.
+    public static string GetText(IntPtr h)
+    {
+        var sb = new StringBuilder(2048);
+        GetWindowText(h, sb, 2048);
+        return sb.ToString();
     }
 
     public static string Click(IntPtr btn)

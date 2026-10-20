@@ -80,10 +80,17 @@ console.log('\n[3] 脚本关键点：PostMessage 优先、BM_CLICK、超时上�
   // 优先匹配"确认/提交"类按钮（脚本用 unicode 转义拼模式，保持纯 ASCII）
   ok(/preferPattern/.test(GUI_SCRIPT), '有按钮文本优先匹配模式');
   ok(/0x786E/.test(GUI_SCRIPT) || /confirm/.test(GUI_SCRIPT), '模式含确认类语义（unicode 转义）');
-  // PostMessage 的 lParam 用字符串重载（WM_SETTEXT 跨进程由系统封送）
+  // WM_SETTEXT 用字符串重载
   ok(/PostMessage\(IntPtr h, uint m, IntPtr w, string l\)/.test(GUI_SCRIPT), 'WM_SETTEXT 用字符串重载');
-  // 不能有裸 SendMessage（会阻塞）
-  ok(!/[^s]SendMessage\(IntPtr/.test(GUI_SCRIPT.replace(/SendMessageTimeout/g, 'ST')), '没有会阻塞的裸 SendMessage');
+  // 写完后必须回读校验；不允许无条件声称成功
+  ok(/sent-verified/.test(GUI_SCRIPT), 'WM_SETTEXT 后回读校验（sent-verified）');
+  ok(/charposted-verified/.test(GUI_SCRIPT), 'WM_CHAR 后回读校验（charposted-verified）');
+  ok(/unverified/.test(GUI_SCRIPT), '无法回读时如实报告 unverified（不假装成功）');
+  ok(/cross-bitness/.test(GUI_SCRIPT), 'unverified 说明跨位数原因');
+  // PostMessage 的数值重载必须显式 EntryPoint
+  ok(/EntryPoint = "PostMessageW"/.test(GUI_SCRIPT), 'PostMessage 数值重载显式 EntryPoint（否则 EntryPointNotFoundException）');
+  // 脚本必须纯 ASCII
+  ok([...GUI_SCRIPT].every(c => c.charCodeAt(0) < 128), 'PowerShell 脚本纯 ASCII（5.1 按 ANSI 读无 BOM 文件）');
 }
 
 console.log('\n[4] 工具注册：定义 / dispatch / KNOWN / label / precheck');

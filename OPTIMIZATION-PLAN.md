@@ -258,6 +258,47 @@ hex: 31323334353637111d7069c3d763573c9b90cb3c40bd0f4515713bcfdc37
 
 全量：`node tests/run_all.js` → 单元测试 **74/74**、回归题集通过、exit 0。
 
+## 一之六、2026-10-20 五续：gui_input 真实环境验证结论（含明确的能力边界）
+此前记录的"未验证：真正的文本注入与按钮点击动作"本次已在真实桌面上跑过。**结论分三档**：
+
+### ✅ 已验证可用
+
+| 能力 | 证据 |
+|---|---|
+| **窗口/控件枚举**（`list_only`） | 对 CrackMe3 真实识别到对话框：`#32770 "CrackMe"`，`Static id=65535 "Serial:"`、`Edit id=1001`、`Button id=1002` |
+| **按钮点击**（`BM_CLICK`） | 返回 `clicked parent=4265022 id=1002`，程序无崩溃、进程存活 |
+| **前台获取** | 用 TOPMOST + ALT 破前台锁后 `SetForegroundWindow=True foregroundIsDlg=True` |
+| **桌面会话探测** | 枚举到 32 个真实窗口（开始菜单/任务栏/桌面/雷电模拟器） |
+
+顺带修了三个真实缺陷：
+- `PostMessageNum` 的 `DllImport` 缺 `EntryPoint="PostMessageW"` → 运行时 `EntryPointNotFoundException`
+- PowerShell 脚本里的中文注释按 ANSI 解码会让 C# 编译失败（脚本已强制纯 ASCII）
+- `out _`（C# 7 语法）不被 PowerShell 的 CodeDom 编译器支持
+
+### ⚠️ 无法验证（真实限制，不是代码缺陷）
+
+**CrackMe3 是 32 位程序，本工具宿主是 64 位**，跨位数注入有两个硬限制：
+
+1. `SendMessageTimeout(WM_SETTEXT)` 返回 `1`（成功），但 `GetWindowText` 回读为空
+   —— 写入可能生效，但**无法从 64 位侧读回验证**。
+2. `SetFocus` 返回 0，即使已 `AttachThreadInput` 且窗口在前台
+   —— 键盘类降级路径（`SendInput`/`WM_CHAR`）因此无法定向到目标控件。
+3. UI Automation 也找不到该 Edit（`NO_EDIT`）：它是经典 `CreateWindowEx` 控件，
+   未实现 UIA provider。
+
+**因此工具现在如实返回 `unverified (WM_SETTEXT ret=1; readback unavailable cross-bitness)`，
+而不是像之前那样声称 `sent`。** 这是刻意的：宁可报告"无法验证"，也不给 AI 一个假成功。
+
+### 实用结论
+
+- **32 位 GUI 题**：`gui_input` 的枚举与点击可用，文本注入**无法自证**；
+  建议改用 IDA 动态调试直接在内存里改输入（`ida_dbg_mem` write），或走离线 Unicorn。
+- **64 位 GUI 题**：`WM_SETTEXT` + 回读校验可完整工作（`sent-verified`）。
+- **自绘 UI / WinUI 应用**（如新版记事本 `NotepadTextBox`/`RichEditD2DPT`）：
+  不适用，工具会明确返回 `NO_EDIT_CONTROL`。
+
+全量：`node tests/run_all.js` → 单元测试 **74/74**、回归题集通过、exit 0。
+
 **上一轮遗留的两项也已验证**：
 - P1 契约自动枚举 → 演进为 rank 5 的"契约驱动 verified + 重试循环"，本轮 xxor 实测转成功
 - P2 中间值自动推进 → 已落地（`electron/intermediate-advance.js`，17 项单测 + 3 项 E2E）

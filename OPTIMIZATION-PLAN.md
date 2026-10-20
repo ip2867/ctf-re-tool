@@ -299,6 +299,75 @@ hex: 31323334353637111d7069c3d763573c9b90cb3c40bd0f4515713bcfdc37
 
 全量：`node tests/run_all.js` → 单元测试 **74/74**、回归题集通过、exit 0。
 
+## 一之七、2026-10-20 六续：32 位 IDA 不存在 → 改内存路线验证通过；Kali 远程调试分层结论
+
+### 1. 没有 32 位 IDA（实测确认）
+
+检查 `E:\ctf\tools\1-Reverse\IDA9.1` 下所有可执行文件的 PE Machine 字段：
+
+| 文件 | Machine | 架构 |
+|---|---|---|
+| `ida.exe` | `0x8664` | AMD64 |
+| `idat.exe` | `0x8664` | AMD64 |
+| `hv.exe` / `reg.exe` / `upg32.exe` | `0x8664` | AMD64 |
+| `plugins\win32_user.dll`（32 位调试器插件） | `0x8664` | AMD64 |
+| `ida64.exe` / `idat64.exe` | **不存在** | — |
+
+**IDA 9.x 起只发 x64 版本**，`upg32.exe` 只是升级工具不是 32 位主程序。
+所以"换 32 位 IDA 绕过跨位数"这条路**不存在**。
+
+### 2. 改内存路线（`ida_dbg_mem` / `dbg_write`）验证通过 ✅
+
+既然不能换 IDA，就绕开窗口消息，直接写目标进程内存。实测（32 位 CrackMe3）：
+
+```
+dbg_start → {"started":true,"ip":"0x77d2a6b0"}
+ESP=0x1af40c
+dbg_write → [{"addr":"0x1af20c","size":16,"ok":true}]
+dbg_read  → deadbeefcafebabe0011223344556677
+读回一致: true
+RESULT=PASS
+```
+
+**这证明跨位数不影响调试器内存 API**——`dbg_read`/`dbg_write` 走的是调试器后端，
+不经过 `WM_SETTEXT` 的字符串封送。
+
+**一个踩坑记录**：第一次把测试数据写到"ESP-0x200"，写入返回 ok 但读回是程序自己的
+UTF-16 路径字符串——那是一片**活跃栈帧**，被程序立即覆盖了。换到非活跃地址后逐字节一致。
+教训：改内存要选程序不会立刻复用的区域，或在下断点后改**当前栈帧内**的输入缓冲区。
+
+**结论**：32 位 GUI 题的正确动态调试路径是
+`dbg_start → bp_add(校验函数) → continue 命中 → dbg_write 改输入缓冲 → continue`，
+不需要 `gui_input` 的文本注入。
+
+### 3. Kali IDA 远程调试：分层结论
+
+用真实环境逐层验证（回归样本 `plutochat` ELF64）：
+
+| 层 | 结果 | 证据 |
+|---|---|---|
+| Kali SSH | ✅ | `uname -m` = x86_64；`sudo -S` 可用 |
+| gdbserver 安装 | ✅ | `apt-get install gdbserver` → `/usr/bin/gdbserver` 17.2 |
+| gdbserver 启动 | ✅ | 必须用 `setsid ... < /dev/null &`；普通 `nohup &` 会随 SSH 会话关闭被杀（实测两次失败） |
+| gdbserver 端口 | ✅ | `ss -ln` 见 `*:23946 LISTEN`，日志 `Listening on port 23946` |
+| **GDB 协议本身** | ✅ | Kali 上 `gdb -ex 'target remote 127.0.0.1:23947'` 成功读到 `rip=0x7ffff7fe4780` 并反汇编，`detach` 正常 |
+| IDA → gdbserver 连接 | ⚠️ 部分 | gdbserver 日志显示 `Remote debugging from host ::ffff:192.168.230.1`（连接确实建立），但随即 `Remote side has terminated connection` |
+| IDA 完成调试会话 | ❌ | `START_RC 0`（cancelled），`DBG_ON False`，即使已传本地 ELF 路径 |
+
+**根因判断**：不是网络或凭据问题（GDB 协议在 Kali 本机验证完全正常，且 IDA 的连接请求确实到达了 gdbserver）。
+是 **IDA 的 GDB 客户端在 `-A`（自主）模式下无法完成握手**——它需要交互式 GUI 里确认远程调试设置，
+`start_process` 在此场景返回 0（用户取消）。
+
+**可用的工作方式**：
+1. 手动在 IDA GUI 里配好 `Debugger → Run → Remote GDB debugger`（一次即可，配置会保存）
+2. 之后用 `dbg_*` 工具操作，或让 `start_process` 走已保存的配置
+
+**未验证**：上述"先手工配置一次再自动化"的路径——需要有人在 GUI 前操作。工具侧的
+`mode:"remote"` 参数（`load_debugger("gdb", True)` + `set_remote_debugger`）语法正确，
+但端到端被 IDA 的交互确认卡住。
+
+全量：`node tests/run_all.js` → 单元测试 **74/74**、回归题集通过、exit 0。
+
 **上一轮遗留的两项也已验证**：
 - P1 契约自动枚举 → 演进为 rank 5 的"契约驱动 verified + 重试循环"，本轮 xxor 实测转成功
 - P2 中间值自动推进 → 已落地（`electron/intermediate-advance.js`，17 项单测 + 3 项 E2E）

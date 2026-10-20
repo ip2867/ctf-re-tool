@@ -57,7 +57,11 @@ console.log('\n[2] 调试能力判定：白名单完整词，不再用单字子�
 console.log('\n[3] dbg_* 参数形态与 api_debug.py 的真实 schema 一致');
 {
   const add = buildDbgCall('bp_add', { addrs: '0x401000,0x402000' });
-  ok(add.tool === 'dbg_add_bp' && Array.isArray(add.args.addrs) && add.args.addrs.length === 2, 'addrs 统一为数组', JSON.stringify(add));
+  // bp_add 改走 py_eval + idaapi.add_bpt：远程 linux 后端下 dbg_add_bp/ida_dbg.add_bpt
+  // 恒返回 False（实测），而 idaapi.add_bpt 本地与远程都可用。
+  const addCode = (add.args && add.args.code) || '';
+  ok(add.tool === 'py_eval' && /idaapi\.add_bpt/.test(addCode) && /"0x401000","0x402000"/.test(addCode),
+    'bp_add 用 idaapi.add_bpt 且地址归一为数组', JSON.stringify(add));
   const del = buildDbgCall('bp_del', { addr: '0x401000' });
   ok(del.tool === 'dbg_delete_bp' && del.args.addrs[0] === '0x401000', '单个 addr 也归一为数组');
   const rt = buildDbgCall('run_to', { addr: '0x4012d0' });

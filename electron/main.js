@@ -25,7 +25,7 @@ const { callPaged } = require('./ida-paging');
 // IDA MCP 扩展组 URL（?ext=dbg）与会话重置判定
 const { idaMcpEffectiveUrl, needsSessionReset } = require('./ida-mcp-url');
 // dbg_* 真实工具名 -> 两个合并 AI 工具（ida_dbg / ida_dbg_mem）的映射
-const { buildDbgCall, normalizeHex, normalizeAddrList, normalizeRegions, normalizeBpItems } = require('./ida-dbg');
+const { buildDbgCall, normalizeHex, normalizeAddrList, normalizeRegions, normalizeBpItems, dbgStateName } = require('./ida-dbg');
 // tools/list 结果 -> 调试能力判定（白名单完整词，替代 'ea'/'ip' 子串匹配）
 const { classifyIdaDebugTools } = require('./ida-debug-capability');
 // 自修改特征（W+X 节/可写代码段/反调试导入）
@@ -7402,18 +7402,23 @@ function getToolDefinitions() {
     {
       name: "ida_dbg",
       description:
-        "IDA 动态调试控制。action 可选：start（提供 args/cwd 时用 py_eval 调 idaapi.start_process）、exit、continue、run_to（需 addr）、" +
-        "step_into、step_over、bp_list、bp_add（addrs）、bp_del（addrs）、bp_toggle（items: [{addr,enabled}]）、" +
-        "regs、regs_named（regs: 'RAX,RBX'）、stack。未 start 时上游会报 Debugger not running。",
+        "IDA 动态调试控制。action：start（幂等；远程模式会自动 suspend 并返回重定位符号）、" +
+        "status（查 ON/STATE/IP）、suspend（把运行中的进程拉回暂停态）、exit、continue、run_to（需 addr）、" +
+        "step_into、step_over、bp_list、bp_add（addrs，走 idaapi.add_bpt，本地/远程都可用）、" +
+        "bp_del（addrs）、bp_toggle（items: [{addr,enabled}]）、regs、regs_named（regs: 'RAX,RBX'）、stack。\n" +
+        "STATE：-1=已暂停（可单步/run_to/写内存）、0=无进程、1=运行中（单步与写内存会失败）、2=已退出。\n" +
+        "continue/run_to 已自动轮询到真正停下：返回 stopped:true 才能继续单步；state:1 表示仍在跑，需 suspend。\n" +
+        "本地 PE：start 后停在入口。远程 ELF：start 后不停，工具自动 suspend；断点要用重定位地址（见 start 返回的 symbols）。",
       input_schema: {
         type: "object",
         properties: {
           action: {
             type: "string",
             enum: ["start", "exit", "continue", "run_to", "step_into", "step_over",
+                   "status", "suspend",
                    "bp_list", "bp_add", "bp_del", "bp_toggle", "regs", "regs_named", "stack",
                    "clear_remote"],
-            description: "调试动作。clear_remote 用于清除残留的远程调试配置（本地启动失败时先试它）"
+            description: "调试动作。status=查状态；suspend=把运行中的进程停下（GUI 程序必须）；clear_remote=清残留远程配置"
           },
           addr: { type: "string", description: "run_to 的目标地址 / bp_add 的单地址" },
           addrs: { description: "断点地址：字符串或字符串数组（如 '0x401000,0x401010'）" },
@@ -7924,6 +7929,22 @@ async function executeToolCall(toolName, input) {
         };
         const call = buildDbgCall(input.action, input, dbgCtx);
         if (call.error) return `参数错误：${call.error}`;
+        const act = String(input.action || '').toLowerCase();
+        // 运行态（STATE=1）下 step/run_to 必然失败（实测：Failed to step over / run to）。
+        // 与其让 AI 拿到一句含糊的上游报错，不如提前拦下并给出确切下一步。
+        if (/^(step_over|step_into|run_to)$/.test(act)) {
+          const st = await readDbgState();
+          if (st.on && st.state === 1) {
+            throw new ToolCallError(
+              `无法执行 ${act}：进程正在运行（STATE=1）。` +
+              '先 ida_dbg(action="suspend") 把它停下（STATE 变 -1），再单步；' +
+              '或先 bp_add 下断点再 continue，等命中后自动暂停。'
+            );
+          }
+          if (st.on && st.state === 2) {
+            throw new ToolCallError(`无法执行 ${act}：进程已退出（STATE=2），需要重新 ida_dbg(action="start")。`);
+          }
+        }
         try {
           const r = await callIdaMcp(call.tool, call.args);
           // py_eval 的 start 结果里 START_RC 才说明是否真的起来了：
@@ -7931,20 +7952,158 @@ async function executeToolCall(toolName, input) {
           if (call.tool === 'py_eval' && /START_RC/.test(String(call.args && call.args.code || ''))) {
             const stdout = String((r && r.stdout) || '');
             const m = /START_RC\s+(-?\d+)/.exec(stdout);
-            if (m && Number(m[1]) === -1) {
-              const stale = /STALE_REMOTE\s+'([^']*)'/.exec(stdout);
-              const hint = stale && stale[1].trim()
-                ? `；检测到残留远程调试配置（host=${stale[1].trim()}），先执行 ida_dbg(action="clear_remote")`
-                : '；若目标是 ELF，请用 mode="remote" 并给 remote_host（Kali 必先启动 gdbserver）';
-              throw new ToolCallError(`IDA 调试启动失败（START_RC=-1）${hint}`);
+            const already = /ALREADY_RUNNING True/.test(stdout);
+            if (m && Number(m[1]) !== 1) {
+              const rc = Number(m[1]);
+              const stale = /STALE_OPTS (.*)/.exec(stdout);
+              const hint = rc === 0
+                ? '（启动被取消：进程选项里多半残留了上一次远程调试的 target 路径。' +
+                  '本地模式已自动 set_process_options 复位；若仍失败，先 ida_dbg(action="clear_remote")）'
+                : (stale && /192\.168|remote|linux/i.test(stale[1])
+                  ? `；检测到残留远程配置 ${stale[1].slice(0, 120)}，先执行 ida_dbg(action="clear_remote")`
+                  : '；若目标是 ELF，请用 mode="remote" 并给 remote_host（Kali 必先启动 linux_server）');
+              throw new ToolCallError(`IDA 调试启动失败（START_RC=${rc}）${hint}`);
             }
             if (m && Number(m[1]) === 1) {
-              // 启动成功但调试事件可能尚未落地：等 IP 可读再返回，
-              // 否则 AI 紧接着调 dbg_regs 会拿到 "Debugger not running"（实测）。
-              const ip = await readDbgIp(4, 400);
-              return { started: true, ip, raw: r };
+              // 本地 vs 远程的启动语义不同（均为实测）：
+              //   本地 win32：start 后自动停在入口（STATE=-1），可直接单步
+              //   远程 linux：start 后**不会**停在入口，进程直接跑（STATE=1），
+              //              必须 suspend 才能单步/下断点。
+              // 所以远程要立刻 suspend，抢在目标跑过关键代码之前固定它。
+              const isRemote = /load_debugger\("linux"/.test(String(call.args && call.args.code || ''));
+              if (isRemote && !already) {
+                try {
+                  await callIdaMcp('py_eval', { code: 'import ida_dbg\nprint("SUSP", ida_dbg.suspend_process())' });
+                } catch (e) { /* suspend 失败下面靠轮询判断 */ }
+              }
+              const w = await waitDbgStop({ timeoutMs: already ? 3000 : 20000, intervalMs: 250, startupGraceMs: 1500 });
+              const ip = await readDbgIp(2, 300);
+              // 远程 PIE 目标需要重定位后的符号地址：start 前取到的静态地址下断点会失败（实测）。
+              let symbols = null;
+              if (isRemote && w.reason === 'suspended') {
+                try {
+                  const sym = await callIdaMcp('py_eval', {
+                    code: 'import idaapi\n' +
+                      'print("IMAGEBASE", hex(idaapi.get_imagebase()))\n' +
+                      'for n in ("main", "start", "_start"):\n' +
+                      '    ea = idaapi.get_name_ea(idaapi.BADADDR, n)\n' +
+                      '    if ea != idaapi.BADADDR: print("SYM", n, hex(ea))',
+                  });
+                  const txt = String((sym && sym.stdout) || '');
+                  const base = (/IMAGEBASE (0x[0-9a-fA-F]+)/.exec(txt) || [])[1];
+                  const syms = {};
+                  for (const line of txt.split('\n')) {
+                    const mm = /SYM (\S+) (0x[0-9a-fA-F]+)/.exec(line);
+                    if (mm) syms[mm[1]] = mm[2];
+                  }
+                  symbols = { imagebase: base, entries: syms };
+                } catch (e) { /* 符号可选 */ }
+              }
+              return {
+                started: true,
+                already_running: already,
+                mode: isRemote ? 'remote' : 'local',
+                ip,
+                state: w.state,
+                state_name: dbgStateName(w.state),
+                at_entry: w.reason === 'suspended',
+                waited_ms: w.waitedMs,
+                symbols,
+                note: already
+                  ? '调试器原本就在运行，未重复启动（start 幂等）'
+                  : isRemote
+                    ? (w.reason === 'suspended'
+                      ? '远程已连接并已暂停（自动 suspend）。注意：PIE 目标的断点要用上面 symbols 里的重定位地址，' +
+                        '用 idaapi.add_bpt（ida_dbg.add_bpt 对远程段返回 False）'
+                      : '远程已连接但进程仍在运行。若目标是长时间 sleep/等待输入，可稍后 ida_dbg(action="suspend") 固定进程；' +
+                        '若它很快就调用了目标函数，需要重新 start 并更早 suspend')
+                    : (w.reason === 'suspended'
+                      ? '已停在入口，可以 bp_add / step / run_to'
+                      : '调试器已接管但进程仍在加载（未到入口）。稍后用 ida_dbg(action="status") 复查，' +
+                        '或直接 ida_dbg(action="suspend") 停下'),
+                raw: r,
+              };
             }
           }
+
+          // continue / run_to 是异步投递：插件返回的 ip 是投递前的旧值。
+          // 必须轮询到真正停下，否则 AI 拿着旧 IP 去单步，必然失败（实测）。
+          if (call.tool === 'dbg_continue' || call.tool === 'dbg_run_to') {
+            const w = await waitDbgStop({ timeoutMs: Number(input.wait_ms) || 8000 });
+            const ip = await readDbgIp(1, 200);
+            const wantBpHit = act === 'run_to';
+            if (w.reason === 'suspended') {
+              const atTarget = wantBpHit && ip && String(input.addr || '').toLowerCase() === ip;
+              return {
+                ip,
+                state: -1,
+                stopped: true,
+                hit_target: wantBpHit ? !!atTarget : undefined,
+                waited_ms: w.waitedMs,
+                note: atTarget || !wantBpHit
+                  ? '已暂停，可以 step / regs / mem_read'
+                  : `暂停在 ${ip}，不是请求的 ${input.addr}`,
+              };
+            }
+            if (w.reason === 'exited') {
+              return { ip, state: 2, stopped: true, exited: true, note: '进程已退出' };
+            }
+            if (w.reason === 'no-process') {
+              return { ip, state: 0, stopped: true, note: '调试器已不在运行' };
+            }
+            // 还在运行：GUI 程序进消息循环等输入时是常态，不是错误。
+            return {
+              ip,
+              state: 1,
+              stopped: false,
+              waited_ms: w.waitedMs,
+              note: '进程仍在运行（未命中断点）。GUI 程序通常在等用户输入：' +
+                '可以用 ida_dbg(action="suspend") 停下再单步，或用 gui_input 喂输入后等断点。',
+            };
+          }
+
+          // status / suspend 的 py_eval 输出是逐行 key-value，转成结构化结果，
+          // 免得 AI 每次自己解析 stdout。
+          if (call.tool === 'py_eval' && (act === 'status' || act === 'suspend')) {
+            const text = typeof r === 'string' ? r : String((r && r.stdout) || '');
+            const st = /STATE\s+(-?\d+)/.exec(text);
+            const ipm = /IP\s+(0x[0-9a-fA-F]+|None)/.exec(text);
+            const on = /ON\s+True/.test(text);
+            const stateNum = st ? Number(st[1]) : null;
+            return {
+              on,
+              state: stateNum,
+              state_name: dbgStateName(stateNum),
+              ip: ipm ? ipm[1] : null,
+              can_step: stateNum === -1,
+              action: act,
+              raw: text.trim(),
+            };
+          }
+
+          // bp_add 现在走 py_eval + idaapi.add_bpt（远程后端下 dbg_add_bp 恒 False），
+          // 把逐行输出转成 {addrs:[{addr,ok}], qty} 便于 AI 判断。
+          if (act === 'bp_add' && call.tool === 'py_eval') {
+            const text = typeof r === 'string' ? r : String((r && r.stdout) || '');
+            const addrs = [];
+            for (const line of text.split('\n')) {
+              const m = /^BP (0x[0-9a-fA-F]+) (True|False)$/.exec(line.trim());
+              if (m) addrs.push({ addr: m[1], ok: m[2] === 'True' });
+              const err = /^BP_ERR (\S+) (.*)$/.exec(line.trim());
+              if (err) addrs.push({ addr: err[1], ok: false, error: err[2] });
+            }
+            const qty = (/BP_QTY (\d+)/.exec(text) || [])[1];
+            const failed = addrs.filter(a => !a.ok);
+            if (failed.length) {
+              throw new ToolCallError(
+                `断点设置失败：${failed.map(a => a.addr).join(', ')}。` +
+                '常见原因：地址不在 .text 段、PIE 目标用了未重定位的静态地址（先用 ida_dbg(action="start") 返回的 symbols）、' +
+                '或目标已退出（用 ida_dbg(action="status") 确认 STATE=-1）'
+              );
+            }
+            return { addrs, qty: qty ? Number(qty) : addrs.length, note: '断点已生效，可以 continue' };
+          }
+
           return r;
         } catch (err) {
           if (err && err.__toolError) throw err;
@@ -7966,6 +8125,17 @@ async function executeToolCall(toolName, input) {
         const act = String(input.action || '').toLowerCase() === 'write' ? 'mem_write' : 'mem_read';
         const call = buildDbgCall(act, input);
         if (call.error) return `参数错误：${call.error}`;
+        // 写内存只在暂停态可靠：运行中写入会被目标覆盖或直接失败（实测）。
+        if (act === 'mem_write') {
+          const st = await readDbgState();
+          if (!st.on) throw new ToolCallError('写内存失败：调试器未运行，先 ida_dbg(action="start")。');
+          if (st.state === 1) {
+            throw new ToolCallError(
+              '写内存失败：进程正在运行（STATE=1），写入会被覆盖。' +
+              '先 ida_dbg(action="suspend") 或下断点让进程停下，再写。'
+            );
+          }
+        }
         try {
           const r = await callIdaMcp(call.tool, call.args);
           const text = typeof r === 'string' ? r : JSON.stringify(r);
@@ -8279,6 +8449,57 @@ async function readDbgIp(retries = 3, delayMs = 400) {
     if (i < retries) await new Promise(r => setTimeout(r, delayMs));
   }
   return null;
+}
+
+// 读进程状态。语义见 ida-dbg.js 的 dbgStateName：
+//   -1 暂停 / 0 无进程 / 1 运行中 / 2 已退出
+async function readDbgState() {
+  try {
+    const r = await callIdaMcp('py_eval', {
+      code: 'import idaapi, ida_dbg\n' +
+        'print("ON", ida_dbg.is_debugger_on())\n' +
+        'print("STATE", idaapi.get_process_state())',
+    });
+    const text = typeof r === 'string' ? r : String((r && r.stdout) || '');
+    const m = /STATE\s+(-?\d+)/.exec(text);
+    const on = /ON\s+True/.test(text);
+    return { on, state: m ? Number(m[1]) : null };
+  } catch (e) {
+    return { on: false, state: null };
+  }
+}
+
+// continue / run_to 是**异步投递**：命令返回时进程还在跑（实测返回的 ip 是投递前的旧值）。
+// 必须轮询到进程真正停下（STATE=-1）或退出（STATE=2），否则紧接着的单步/写内存必然失败。
+//
+// 注意：GUI 程序 continue 后会停在消息循环等用户输入，期间 STATE 一直是 1，
+// 直到某个断点命中。所以这里要能区分"还在跑"和"等输入"——超时不算错误，
+// 而是把控制权交回 AI，由它决定 suspend 还是继续等。
+async function waitDbgStop({ timeoutMs = 8000, intervalMs = 150, startupGraceMs = 0 } = {}) {
+  const t0 = Date.now();
+  let last = null;
+  while (Date.now() - t0 < timeoutMs) {
+    const cur = await readDbgState();
+    last = cur;
+    // 刚 start_process 时 is_debugger_on() 会短暂为 False（进程还没被接管），
+    // 不能据此判"无进程"——否则 start 后立刻检查会得到假阴性（实测 8ms 就误判）。
+    if (!cur.on) {
+      if (Date.now() - t0 < startupGraceMs) {
+        await new Promise(r => setTimeout(r, intervalMs));
+        continue;
+      }
+      return { stopped: true, state: 0, reason: 'no-process', waitedMs: Date.now() - t0 };
+    }
+    if (cur.state === -1) return { stopped: true, state: -1, reason: 'suspended', waitedMs: Date.now() - t0 };
+    if (cur.state === 2) return { stopped: true, state: 2, reason: 'exited', waitedMs: Date.now() - t0 };
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+  return {
+    stopped: false,
+    state: last ? last.state : null,
+    reason: 'still-running',
+    waitedMs: Date.now() - t0,
+  };
 }
 
 // remote_exec：local 走本地 shell，kali 走 sshExec。失败必须如实抛 ToolCallError。

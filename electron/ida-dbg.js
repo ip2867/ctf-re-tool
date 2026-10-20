@@ -88,10 +88,26 @@ function normalizeBpItems(v) {
 
 const DBG_ACTIONS = [
   'start', 'exit', 'continue', 'run_to', 'step_into', 'step_over',
+  'status', 'suspend',
   'bp_list', 'bp_add', 'bp_del', 'bp_toggle', 'regs', 'regs_named', 'stack',
   'mem_read', 'mem_write',
   'mode', 'clear_remote',
 ];
+
+// idaapi.get_process_state() 的实测取值（2026-10-20，IDA 9.1 + WOW64 目标）：
+//   -1 已暂停（start 命中入口、断点命中、单步结束后）
+//    0 无进程（dbg_exit 之后）
+//    1 运行中（continue 之后；DLL 陆续加载）
+//    2 已退出（PROCESS_EXITED）
+// 注意这不是 idaapi.PROCESS_* 那组常量（STARTED=1 / EXITED=2 / SUSPENDED=13），
+// 用 get_process_state() 的返回值直接比对，不要拿常量名去猜。
+function dbgStateName(st) {
+  if (st === -1) return 'suspended';
+  if (st === 0) return 'no-process';
+  if (st === 1) return 'running';
+  if (st === 2) return 'exited';
+  return 'unknown';
+}
 
 // start 的调试模式判定。
 //
@@ -108,7 +124,7 @@ function decideDebugMode(input, ctx) {
   if (explicit === 'local' || explicit === 'remote') return explicit;
   // 未显式指定时按目标类型推断：
   //   PE（MZ）→ local（Local Windows debugger）
-  //   ELF 且配了 Kali → remote gdb（gdbserver 在 Kali 上跑目标）
+  //   ELF 且配了 Kali → remote（Kali 上跑 dbgsrv/linux_server）
   //   其余 → local（默认行为，失败时上层会给出 remote 提示）
   const kind = String(c.targetKind || c.fileType || '').toUpperCase();
   if (kind === 'ELF') return c.remoteAvailable ? 'remote' : 'local';
@@ -122,6 +138,17 @@ function buildStartPrelude(mode, input, ctx) {
   const c = ctx || {};
   const lines = ['import ida_dbg', 'import idaapi'];
 
+  // 启动必须幂等：调试器已在跑时再 start_process 会返回 -1（实测），
+  // 但这对 AI 是"已经就绪"而非失败。先探测再决定是否真的启动。
+  lines.push(`if ida_dbg.is_debugger_on():`);
+  lines.push(`    try: _ip = ida_dbg.get_ip_val()`);
+  lines.push(`    except Exception: _ip = None`);
+  lines.push(`    print("START_RC 1")`);
+  lines.push(`    print("ALREADY_RUNNING True")`);
+  lines.push(`    print("STATE", idaapi.get_process_state())`);
+  lines.push(`    print("IP", hex(_ip) if _ip is not None else "None")`);
+  lines.push(`else:`);
+
   if (mode === 'remote') {
     const host = String(i.remote_host || c.remoteHost || '').trim();
     const port = Number(i.remote_port || c.remotePort) || 23946;
@@ -133,29 +160,51 @@ function buildStartPrelude(mode, input, ctx) {
     // 调试器名必须是 "linux"；用 "gdb" 会走另一套（GDB 协议）客户端，
     // 与 linux_server 的私有协议不兼容（实测：能连上但调试器不接管）。
     // 参考：看雪《IDA动态调试环境搭建教程》——Android 用 android_server，Linux 对应 linux_server。
-    lines.push(`ida_dbg.load_debugger("linux", True)`);
-    lines.push(`ida_dbg.set_remote_debugger(${JSON.stringify(host)}, ${JSON.stringify(pass)}, ${port})`);
+    lines.push(`    ida_dbg.load_debugger("linux", True)`);
+    lines.push(`    ida_dbg.set_remote_debugger(${JSON.stringify(host)}, ${JSON.stringify(pass)}, ${port})`);
   } else {
-    // 本地：先清远程参数（空 host/port=-1 表示不使用远程），再加载 win32
-    lines.push(`try: ida_dbg.set_remote_debugger("", "", -1)`);
-    lines.push(`except Exception: pass`);
-    lines.push(`ida_dbg.load_debugger("win32", False)`);
+    // 本地：清掉远程 host/pass/port，再加载 win32。
+    //
+    // 实测（2026-10-20）：
+    //   · start_process("", ...) 在进程选项 path 为空时返回 **0（启动被取消）**。
+    //     以前能跑起来，是因为 get_process_options() 里还残留着上一次的目标路径，
+    //     相当于"碰巧"传了 path——做过一次远程调试后就变成 Linux 路径，本地必然失败。
+    //   · 所以本地 start 必须拿到真实目标路径（path 参数，或调用方传入的当前文件）。
+    //   · set_process_options 只用来清 host/pass/port，path 由 start_process 显式给。
+    lines.push(`    try: ida_dbg.set_process_options("", "", "", "", "", -1)`);
+    lines.push(`    except Exception: pass`);
+    lines.push(`    try: ida_dbg.set_remote_debugger("", "", -1)`);
+    lines.push(`    except Exception: pass`);
+    lines.push(`    ida_dbg.load_debugger("win32", False)`);
   }
 
   const p = i.path !== undefined ? i.path : (i.file !== undefined ? i.file : '');
   const args = i.args == null ? '' : String(i.args);
   const cwd = i.cwd == null ? '' : String(i.cwd);
-  lines.push(`_rc = idaapi.start_process(${JSON.stringify(String(p))}, ${JSON.stringify(args)}, ${JSON.stringify(cwd)})`);
-  lines.push(`print("START_RC", _rc)`);
-  // -1 时把关键状态一起打出来，省掉下一轮排查
-  lines.push(`if _rc == -1:`);
-  lines.push(`    try: print("DBG_ON", ida_dbg.is_debugger_on())`);
-  lines.push(`    except Exception: pass`);
-  lines.push(`    try:`);
-  lines.push(`        _o = ida_dbg.get_process_options()`);
-  lines.push(`        _s = _o[3] if isinstance(_o, tuple) else getattr(_o, "host", "")`);
-  lines.push(`        print("STALE_REMOTE", repr(_s))`);
-  lines.push(`    except Exception as _e: print("OPTS_ERR", _e)`);
+
+  if (!String(p).trim()) {
+    // 本地 start 必须有真实目标路径：start_process("", ...) 在 path 为空时返回 0（取消）。
+    // 以前能跑起来是因为进程选项里残留着上一次的路径，做过一次远程调试后变成
+    // Linux 路径，本地就必然失败——典型的"时好时坏"。
+    // 这里让 py 侧自己回落到 IDA 当前加载的文件，AI 不必知道这个细节。
+    lines.push(`    _p = idaapi.get_input_file_path()`);
+    lines.push(`    if not _p: print("NO_TARGET_PATH")`);
+  } else {
+    lines.push(`    _p = ${JSON.stringify(String(p))}`);
+  }
+  lines.push(`    _rc = idaapi.start_process(_p, ${JSON.stringify(args)}, ${JSON.stringify(cwd)})`);
+  lines.push(`    print("START_RC", _rc)`);
+  // 非 1（-1 失败 / 0 被取消）时把关键状态一起打出来，省掉下一轮排查。
+  // RC=0 的典型原因：path 为空，或进程选项里残留了上一次远程调试的 Linux target 路径。
+  lines.push(`    if _rc != 1:`);
+  lines.push(`        try: print("DBG_ON", ida_dbg.is_debugger_on())`);
+  lines.push(`        except Exception: pass`);
+  lines.push(`        try: print("USED_PATH", _p)`);
+  lines.push(`        except Exception: pass`);
+  lines.push(`        try:`);
+  lines.push(`            _o = ida_dbg.get_process_options()`);
+  lines.push(`            print("STALE_OPTS", repr(_o))`);
+  lines.push(`        except Exception as _e: print("OPTS_ERR", _e)`);
 
   return { tool: 'py_eval', args: { code: lines.join('\n') } };
 }
@@ -188,6 +237,47 @@ function buildDbgCall(action, input, ctx) {
       return prelude;
     }
     case 'exit': return { tool: 'dbg_exit', args: {} };
+    case 'status': {
+      // 统一的"现在能不能单步"探针。AI 在 continue 之后、单步之前都该先看它：
+      // 运行中（1）时 step/run_to/写内存都可能失败。
+      const py = [
+        'import ida_dbg, idaapi',
+        'try:',
+        '    print("ON", ida_dbg.is_debugger_on())',
+        'except Exception as e: print("ON_ERR", e)',
+        'try: print("STATE", idaapi.get_process_state())',
+        'except Exception as e: print("STATE_ERR", e)',
+        'try:',
+        '    _ip = ida_dbg.get_ip_val()',
+        '    print("IP", hex(_ip) if _ip is not None else "None")',
+        'except Exception as e: print("IP_ERR", e)',
+        'try: print("BPS", len(list(idautils.BreakPoints())))',
+        'except Exception: pass',
+      ].join('\n');
+      return { tool: 'py_eval', args: { code: py } };
+    }
+    case 'suspend': {
+      // GUI 程序 continue 后进消息循环，永远不会自己停下来。
+      // suspend_process 是唯一能把它拉回暂停态的手段（之后 step/run_to 才可用）。
+      const py = [
+        'import ida_dbg, idaapi',
+        'if not ida_dbg.is_debugger_on():',
+        '    print("SUSPEND_RC not-running")',
+        'else:',
+        '    _st = idaapi.get_process_state()',
+        '    if _st == -1:',
+        '        print("SUSPEND_RC already-suspended")',
+        '    else:',
+        '        try: print("SUSPEND_RC", ida_dbg.suspend_process())',
+        '        except Exception as e: print("SUSPEND_RC error", e)',
+        '    try:',
+        '        _ip = ida_dbg.get_ip_val()',
+        '        print("IP", hex(_ip) if _ip is not None else "None")',
+        '    except Exception as e: print("IP_ERR", e)',
+        '    print("STATE", idaapi.get_process_state())',
+      ].join('\n');
+      return { tool: 'py_eval', args: { code: py } };
+    }
     case 'continue': return { tool: 'dbg_continue', args: {} };
     case 'run_to': {
       const addr = String(i.addr != null ? i.addr : (i.address != null ? i.address : '')).trim();
@@ -200,7 +290,21 @@ function buildDbgCall(action, input, ctx) {
     case 'bp_add': {
       const addrs = normalizeAddrList(i.addrs != null ? i.addrs : (i.addr != null ? i.addr : i.address));
       if (!addrs.length) return { error: 'ida_dbg(action="bp_add") 需要 addrs 参数（地址或地址数组）' };
-      return { tool: 'dbg_add_bp', args: { addrs } };
+      // 实测：远程 linux 后端下 ida_dbg.add_bpt 恒返回 False（它转发到 ida_idd，
+      // 对远程段不适用），而 idaapi.add_bpt 能正常下发并在服务端看到 add_bpt => BPT_OK。
+      // 这里直接用 idaapi.add_bpt，本地/远程都通，并回显每个地址的真实结果。
+      const lines = ['import idaapi', 'print("BP_RESULTS")'];
+      lines.push(`for _a in ${JSON.stringify(addrs)}:`);
+      lines.push('    try:');
+      lines.push('        _ea = int(_a, 16) if isinstance(_a, str) else int(_a)');
+      lines.push('        try: idaapi.del_bpt(_ea)');
+      lines.push('        except Exception: pass');
+      lines.push('        _ok = idaapi.add_bpt(_ea, 0, idaapi.BPT_SOFT)');
+      lines.push('        print("BP", hex(_ea), _ok)');
+      lines.push('    except Exception as _e:');
+      lines.push('        print("BP_ERR", _a, _e)');
+      lines.push('print("BP_QTY", idaapi.get_bpt_qty())');
+      return { tool: 'py_eval', args: { code: lines.join('\n') } };
     }
     case 'bp_del': {
       const addrs = normalizeAddrList(i.addrs != null ? i.addrs : (i.addr != null ? i.addr : i.address));
@@ -253,5 +357,6 @@ function translateDbgError(msg) {
 module.exports = {
   buildDbgCall, translateDbgError, decideDebugMode, buildStartPrelude,
   normalizeAddrList, normalizeHex, normalizeRegions, normalizeBpItems,
+  dbgStateName,
   DBG_ACTIONS,
 };

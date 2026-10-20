@@ -116,7 +116,12 @@ console.log('\n[7] IDA 调试模式：PE→local，ELF+Kali→remote');
   ok(local.tool === 'py_eval', 'local 走 py_eval（需要设置模式）');
   ok(/set_remote_debugger\("", "", -1\)/.test(local.args.code), 'local 显式清远程参数（残留会让你一直 start 失败）');
   ok(/load_debugger\("win32", False\)/.test(local.args.code), 'local 加载 win32 调试器');
-  ok(/start_process\("a\.exe"/.test(local.args.code), '路径被带入 start_process');
+  // start_process 的第一个实参现在是变量 _p（无 path 时回落到 get_input_file_path），
+  // 因为 start_process("", ...) 会返回 0（启动被取消）。
+  ok(/_p = "a\.exe"/.test(local.args.code) && /start_process\(_p,/.test(local.args.code),
+    '路径被带入 start_process（经 _p 变量）');
+  const localNoPath = buildStartPrelude('local', {}, {});
+  ok(/get_input_file_path\(\)/.test(localNoPath.args.code), '无 path 时回落到当前加载文件');
 
   const remote = buildStartPrelude('remote', { path: 'a.elf' }, { remoteHost: '1.2.3.4', remotePort: 23946 });
   // Linux 远程调试必须用 IDA 自带的 dbgsrv/linux_server，调试器名为 "linux"。
@@ -140,8 +145,9 @@ console.log('\n[8] START_RC=-1 不能再被当成功；错误信息给出可行�
   ok(/START_RC/.test(mainSrc), '主进程读取 START_RC');
   // dispatch 里的 case 在文件靠后位置；toolLabel 里也有同名 case，取最后一段
   const seg = mainSrc.slice(mainSrc.lastIndexOf("case 'ida_dbg':"));
-  ok(/Number\(m\[1\]\) === -1/.test(seg), 'START_RC=-1 判为失败');
-  ok(/STALE_REMOTE/.test(seg), '识别残留远程配置并提示');
+  // START_RC 只要不是 1 都算失败（-1=无法创建，0=启动被取消）
+  ok(/Number\(m\[1\]\) !== 1/.test(seg), 'START_RC != 1 判为失败（含 -1 与 0）');
+  ok(/STALE_OPTS/.test(seg), '识别残留进程选项并提示');
   ok(/clear_remote/.test(seg), '提示可执行 clear_remote');
 
   const hint = translateDbgError('Failed to start debugger');

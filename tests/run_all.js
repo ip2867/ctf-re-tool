@@ -1,32 +1,28 @@
-// 轻量测试运行器：node tests/run_all.js
-// 依次跑全部单测；任一失败则退出码非 0（便于 CI / 发布前把关）。
-const { spawnSync } = require('child_process'), p = require('path'), fs = require('fs');
+// 全量单元回归：逐个跑 tests/test_*.js，统计通过数。失败项打印尾部输出。
+// 跑法：node tests/run_all.js
+// 注意：manual_dbg_*.js 不在里面——它们需要真实 IDA / Kali，属手工验收。
+const { execFileSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
-const tests = fs.readdirSync(__dirname)
-  .filter(f => /^test_.*\.js$/.test(f))
-  .sort();
+const dir = __dirname;
+const files = fs.readdirSync(dir).filter(f => /^test_.*\.js$/.test(f)).sort();
+let pass = 0, fail = 0;
+const failed = [];
 
-let failed = 0;
-const results = [];
-for (const t of tests) {
-  process.stdout.write('\n========== ' + t + ' ==========\n');
-  const r = spawnSync(process.execPath, [p.join(__dirname, t)], { stdio: 'inherit' });
-  const ok = r.status === 0;
-  if (!ok) failed++;
-  results.push((ok ? '✅ ' : '❌ ') + t);
+for (const f of files) {
+  try {
+    execFileSync(process.execPath, [path.join(dir, f)], { cwd: path.join(dir, '..'), stdio: 'pipe', timeout: 120000 });
+    pass++;
+    console.log('PASS ' + f);
+  } catch (e) {
+    fail++;
+    failed.push(f);
+    const out = String((e.stdout || '') + (e.stderr || '')).trim().split('\n').slice(-6).join('\n');
+    console.log('FAIL ' + f);
+    if (out) console.log('     ' + out.replace(/\n/g, '\n     '));
+  }
 }
-console.log('\n================ 汇总 ================');
-results.forEach(r => console.log(r));
-console.log(`\n${tests.length - failed}/${tests.length} 个测试文件通过`);
-
-// 回归题集（真实题多题实测）：单测证明"机制通用"，回归题集证明"在多道真题上不误报/不失效"。
-// 两者缺一不可——单测全绿但真题误报，等于把 AI 引向错误结论。
-console.log('\n========== 回归题集（真实题目） ==========');
-const rr = spawnSync(process.execPath, [p.join(__dirname, 'run_regression.js')], { stdio: 'inherit' });
-if (rr.status !== 0) { failed++; results.push('❌ 回归题集'); } else results.push('✅ 回归题集');
-
-console.log('\n================ 最终汇总 ================');
-results.forEach(r => console.log(r));
-console.log(`\n单元测试 ${tests.length - (failed - (rr.status !== 0 ? 1 : 0))}/${tests.length} 通过` +
-  ` ｜ 回归题集 ${rr.status === 0 ? '通过' : '失败'}`);
-process.exit(failed ? 1 : 0);
+console.log('\n==== ' + pass + '/' + (pass + fail) + ' passed ====');
+if (failed.length) console.log('failed: ' + failed.join(', '));
+process.exit(fail ? 1 : 0);

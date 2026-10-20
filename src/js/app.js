@@ -9040,15 +9040,57 @@ ${smc.summary}
       smcBlock += `\n## 动态调试决策顺序（GUI/ELF 通用）
 **先问：不动态能不能拿到答案？**
 1. **离线模拟优先**：校验若是纯计算（不依赖 GetTickCount/文件/网络），用静态映射 + Unicorn（py_eval）直接跑，最省预算。
-2. **GUI 对话框题必须先喂输入**：CrackMe 这类校验只在按钮点击（WM_COMMAND）时执行，
-   程序启动后阻塞在消息循环，\`dbg_run_to(校验地址)\` 会**永远等不到**——
-   实测 8 轮 continue，IP 全程停在系统 DLL。正确顺序：
-   \`ida_dbg(start)\` → \`gui_input(list_only:true)\` 看控件 → \`gui_input(text, submit:true)\` → \`dbg_continue\` → 断点命中。
-   注意：\`gui_input\` 只对**标准控件**（Edit/Button）有效；自绘 UI / Qt 自绘 / 游戏引擎不适用。
-3. **无交互程序（ELF/控制台）**：可直接 \`run_to\`；ELF 需要 Kali 上跑 gdbserver，
-   用 \`ida_dbg(start, mode:"remote", remote_host:"<kali ip>")\`。
-4. **本地启动报 Failed to start debugger**：先 \`ida_dbg(action:"clear_remote")\` —— IDA 的远程调试配置是
-   全局持久的，残留的 host/pass/port 会让本地 start_process 恒返回 -1。
+2. **GUI 对话框题**：校验只在按钮点击（WM_COMMAND）时执行，程序启动后阻塞在消息循环，
+   \`run_to(校验地址)\` **永远等不到**——实测 8 轮 continue，IP 全程停在系统 DLL。
+   - 32 位目标（WOW64）：**优先用内存改写法，不要依赖窗口消息**。跨位数下
+     \`WM_SETTEXT\` 会返回 1 但 \`GetWindowText\` 读不回、\`SetFocus\` 失败、UIA 也找不到
+     CreateWindowEx 创建的经典控件。可靠做法是：
+     \`status\` 确认 STATE=-1 → 在**读取输入的那条指令**下断点 → \`continue\` 命中 →
+     \`ida_dbg_mem(write, 地址=输入缓冲区, data=你的候选)\` → \`continue\` 看校验分支。
+     \`dbg_read/dbg_write\` 走调试器后端，**不受位数影响**（实测 32 位目标读写字节精确一致）。
+   - 64 位目标：可先用 \`gui_input(list_only:true)\` 看控件，再
+     \`gui_input(text, submit:true)\`；自绘 UI / Qt / 游戏引擎不适用。
+3. **无交互程序（ELF/控制台）**：可直接 \`run_to\`；ELF 用
+   \`ida_dbg(start, mode:"remote", remote_host:"<kali ip>")\`。
+4. **本地启动报 Failed to start debugger / START_RC=0**：两种原因分开处理。
+   - `START_RC=-1`：先 \`ida_dbg(action:"clear_remote")\` —— IDA 的远程调试配置全局持久，
+     残留的 host/pass/port 会让本地 start_process 失败。
+   - `START_RC=0`（启动被取消）：进程选项里 target 路径为空或残留了上一次远程调试的
+     Linux 路径。工具已自动回落到 IDA 当前加载的文件；若仍失败，先 \`clear_remote\` 再 start。
+
+### 调试状态机（必须先看 STATE 再动手）
+\`ida_dbg(action:"status")\` 返回 \`state\`：**-1=已暂停（可单步/run_to/写内存）**、
+0=无进程、1=运行中（step/写内存必然失败）、2=已退出。
+\`continue\`/\`run_to\` 是异步投递，工具已自动轮询到真正停下再返回：
+- 返回 \`stopped:true\` → 可以紧接着 step / regs / mem_read；
+- 返回 \`state:1\` + \`stopped:false\` → 进程在跑（GUI 程序通常在等输入）。
+  用 \`ida_dbg(action:"suspend")\` 停下，或 \`gui_input\` 喂输入后等断点。
+- 返回 \`state:2\` → 进程已退出，需要重新 \`start\`。
+
+### 本地（PE / win32）与远程（ELF / linux_server）的关键差异
+| | 本地 win32 | 远程 linux |
+|---|---|---|
+| start 后 | 自动停在入口（STATE=-1），可直接单步 | **不停**，进程直接跑（STATE=1），工具已自动 suspend |
+| 调试器名 | \`load_debugger("win32", False)\` | \`load_debugger("linux", True)\`（**不是 gdb**） |
+| 服务端 | 无 | Kali 上跑 IDA 自带 \`dbgsrv/linux_server\`，**不是 gdbserver** |
+| 启动命令 | — | \`setsid linux_server -P<密码> & \`（\`-P\` 必须紧贴密码；\`setsid\` 防 SSH 断开被杀） |
+| 断点 | 静态地址即可 | **PIE 必须用重定位后的地址**：\`start\` 返回的 \`symbols\` 里取 main 等地址 |
+| 断点 API | 均可 | 用 \`idaapi.add_bpt\`（\`dbg_add_bp\` 转发 ida_idd，对远程段恒 False） |
+
+远程调试用例实测（11/11 通过）：编译带符号的 PIE → 下载 → linux_server 监听 23946 →
+\`start(mode:"remote")\` → suspend → 读重定位符号（IMAGEBASE 0x555555554000）→
+\`idaapi.add_bpt(main)\` → continue 命中 → step_over → continue 命中 check → 读写内存。
+**关键时序**：目标若启动后立刻跑关键逻辑，调试器来不及下断点。要么让目标先 sleep 留窗口，
+要么先按入口地址下断再 continue。
+
+### 常见假故障（不要误判成"工具不可用"）
+- \`dbg_step_over\` 报 Failed 但 IP 确实变了 → IDA 9 异步返回值问题，工具已用 IP 变化兜底。
+- \`load_debugger("linux") 返回 False\` → 很可能连到了**仍加载 PE 的旧 IDA 实例**。
+  确认只跑一个 IDA，且打开的数据库是 ELF。
+- 连上后立刻 \`Closing connection\` + \`read_regs => -1\` → 目标已退出（如聊天客户端连不上服务端），
+  换一个会驻留的样本验证链路。
+- Kali 的 shell 是 zsh：未匹配的 glob 会报 \`no matches found\` 并中止整条命令，
+  通配符命令放到 \`sh -c '...'\` 里。
 \n`;
       const h = smcHash.hash || {};
       if (!h.hasTarget) {

@@ -448,15 +448,102 @@ IDA 连上了 `linux_server`，并且**在 Kali 上真正启动了被调试程�
    而不是在 MCP 线程直接调 `wait_for_next_event`。
 
 **结论**：`linux_server` 路线是对的（比 gdbserver 正确），链路已验证到"程序在远程被启动"。
-差的只是事件循环线程归属，属可实现问题，不是能力缺失。
 
-全量：`node tests/run_all.js` → 单元测试 **74/74**、回归题集通过、exit 0。
+## 一之九、2026-10-20 八续：动态调试真正打通（本地 + 远程均 100% 实测通过）
 
-全量：`node tests/run_all.js` → 单元测试 **74/74**、回归题集通过、exit 0。
+上一节记录的"事件循环线程归属"问题**不存在**。真正的阻塞点是四个可复现的实现缺陷，
+修掉之后本地与远程都能下断点、单步、读写内存。
 
-**上一轮遗留的两项也已验证**：
-- P1 契约自动枚举 → 演进为 rank 5 的"契约驱动 verified + 重试循环"，本轮 xxor 实测转成功
-- P2 中间值自动推进 → 已落地（`electron/intermediate-advance.js`，17 项单测 + 3 项 E2E）
+### 缺陷 1：进程状态语义判错（最要命）
+
+`idaapi.get_process_state()` 的实测取值（IDA 9.1，WOW64 目标）：
+
+| 值 | 含义 | 能否单步/run_to/写内存 |
+|---|---|---|
+| `-1` | 已暂停 | ✅ |
+| `0` | 无进程（dbg_exit 之后） | ❌ |
+| `1` | 运行中（DLL 正在加载 / 进消息循环） | ❌ |
+| `2` | 已退出 | ❌ |
+
+之前把 `1` 当成"运行中"去等暂停、把 `-1` 当成"无状态"，导致所有判断反了。
+`STATE 1` 下 `step_over` 必然 `Failed to step over`、`run_to` 必然失败——这不是能力缺失。
+
+### 缺陷 2：`continue` / `run_to` 是异步投递
+
+插件返回的 `ip` 是**投递命令前**的旧值（实测 `dbg_continue` 返回 `0x4012d1`，
+而进程实际在几秒后才命中或进入消息循环）。拿旧 IP 去单步必然失败。
+
+修法：`waitDbgStop()` 轮询 `get_process_state()`，直到 `-1`（暂停）/`2`（退出）。
+超时不报错——GUI 程序停在消息循环等输入时 `STATE` 恒为 `1`，这是正常状态，交给 AI 决定。
+
+### 缺陷 3：start 幂等 + 加载窗口 + 空 path
+
+`start_process` 返回 `1` 只表示"已接管"，**不代表已停在入口**：进程还要加载几十个 DLL，
+数秒后才到入口。在线上重复 `start` 会返回 `-1`（实测）。现在：
+
+- `start` 先查 `is_debugger_on()`，已在线则返回 `ALREADY_RUNNING`（幂等）；
+- 轮询到真暂停再返回，并带 `state_name` / `at_entry` / `waited_ms`；
+- 前 1.5s 内 `is_debugger_on()` 可能仍为 False，用 `startupGraceMs` 跳过误判。
+
+**另一个隐藏地雷**：`start_process("", ...)` 在进程选项 path 为空时返回 **0（启动被取消）**。
+以前本地调试"能用"，是因为 `get_process_options()` 里残留着上一次的目标路径，
+相当于碰巧传了 path。只要做过一次 Linux 远程调试，残留路径变成 `/tmp/xxx`，
+本地 start 就会**稳定失败并返回 0**——这解释了此前"本地调试时好时坏"的全部现象，
+与 ScyllaHide 无关。
+
+现在 `buildStartPrelude` 在 path 为空时于 py 侧回落到 `idaapi.get_input_file_path()`，
+AI 不需要知道这个细节；失败回显里也会打印 `USED_PATH` 和 `STALE_OPTS`。
+
+### 缺陷 4：远程调试的三个真实差异（本地经验会误导）
+
+| | 本地 win32 | 远程 linux |
+|---|---|---|
+| start 后 | 自动停在入口 | **不停**，直接跑（工具已自动 suspend） |
+| 调试器名 | `win32` | `linux`（**不是 gdb**） |
+| 服务端 | 无 | Kali 上 `dbgsrv/linux_server`（**不是 gdbserver**） |
+| 断点 | 静态地址即可 | **PIE 必须用重定位地址** |
+| 断点 API | 均可 | 必须 `idaapi.add_bpt`（`dbg_add_bp` 转发 ida_idd，对远程段恒 False） |
+
+### 新增能力
+
+- `ida_dbg(action:"status")` → `{on,state,state_name,ip,can_step}`
+- `ida_dbg(action:"suspend")` → 把运行中的进程拉回暂停态（GUI 消息循环必备）
+- `start(mode:"remote")` 自动 suspend + 返回 `symbols {imagebase, entries:{main,start,_start}}`
+- `bp_add` 改走 `idaapi.add_bpt`，失败的地址会被结构化报错（不再静默 False）
+
+### 实测结果
+
+**本地 PE（CrackMe3，32 位 WOW64）：10/10 通过**
+- start 后 `state=-1`，EIP=0x4012d0（入口）
+- step_over `0x4012d0 → 0x4012d1`
+- run_to 0x4012d3 命中
+- continue 后正确识别 `still-running`（GUI 等输入）
+- suspend 拉回 `state=-1`
+- 写内存精确读回 `4142434445464748494a4b4c4d4e4f50`
+- exit 后 `on=false, state=0`
+
+**远程 ELF（Kali linux_server，PIE + 调试符号）：11/11 通过**
+- `load_debugger("linux", True)` → `RC 1`
+- 自动 suspend → `state=-1`
+- 重定位符号 `IMAGEBASE 0x555555554000`，`main 0x555555555174`
+- `idaapi.add_bpt` → `BP_MAIN True, QTY 2`
+- continue 命中 main（RIP=0x555555555174）
+- step_over `…5174 → …5175`
+- continue 命中 check（RIP=0x555555555159）
+- 读内存 `cc4889e5897dec8b55ec89d001c001d0`
+- 写内存读回 `4142...4f50`
+- linux_server 日志：`add_bpt => BPT_OK`、`stopped_at_debug_event => RPC_OK`
+
+### 排查过程中被证伪的三个"假故障"
+
+- **`load_debugger("linux")` 返回 False** → 连到了**仍加载 PE 的旧 IDA 实例**。
+  测试必须用 `Stop-Process -Force` 清干净（本环境 `taskkill` 对挂满插件的 IDA 无效）。
+- **`Accepting connection` 后立刻 `Closing connection` + `read_regs => -1`** → 目标自己退出了
+  （plutochat 是聊天客户端，连不上服务端就退出），不是调试器问题。
+- **断点设了却不命中** → 目标在调试器下断点之前就跑过了目标函数（`usleep(1.5s)`），
+  或 PIE 用了未重定位的静态地址。给目标留 sleep 窗口 + 用重定位地址即可。
+
+全量：`node tests/_run_all.js` → 单元测试 **75/75** 通过。
 
 ## 二、本轮新发现的两个通用缺陷（优先级最高）
 

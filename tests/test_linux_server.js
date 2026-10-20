@@ -57,7 +57,8 @@ console.log('\n[4] 远程调试器名必须是 linux（不是 gdb）');
   const prelude = require('../electron/ida-dbg.js').buildStartPrelude('remote', { path: '/tmp/target' }, { remoteHost: '1.2.3.4', remotePass: 'pw' });
   ok(/load_debugger\("linux", True\)/.test(prelude.args.code), '生成代码含 linux 调试器');
   ok(/set_remote_debugger\("1\.2\.3\.4", "pw", 23946\)/.test(prelude.args.code), 'host/pass/port 正确');
-  ok(/start_process\("\/tmp\/target"/.test(prelude.args.code), '目标用远端路径（不是空串）');
+  ok(/_p = "\/tmp\/target"/.test(prelude.args.code) && /start_process\(_p,/.test(prelude.args.code),
+    '目标用远端路径（经 _p 变量，不是空串）');
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

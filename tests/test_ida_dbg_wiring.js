@@ -20,7 +20,7 @@ console.log('[1] schema 恰好新增 ida_dbg / ida_dbg_mem，action 枚举完整
   ok(dbg.length > 0 && mem.length > 0, '两个工具定义都存在');
   const e1 = (dbg.match(/enum: \[([^\]]+)\]/) || [])[1] || '';
   const acts = [...e1.matchAll(/"([a-z_]+)"/g)].map(m => m[1]);
-  for (const a of ['start', 'exit', 'continue', 'run_to', 'step_into', 'step_over', 'bp_list', 'bp_add', 'bp_del', 'bp_toggle', 'regs', 'regs_named', 'stack']) {
+  for (const a of ['start', 'exit', 'continue', 'run_to', 'step_into', 'step_over', 'status', 'suspend', 'bp_list', 'bp_add', 'bp_del', 'bp_toggle', 'regs', 'regs_named', 'stack']) {
     ok(acts.includes(a), `ida_dbg action 含 ${a}`);
   }
   ok(/enum: \["read", "write"\]/.test(mem), 'ida_dbg_mem action 为 read/write');
@@ -35,6 +35,17 @@ console.log('\n[2] buildDbgCall 对每个 action 逐一断言上游工具名与�
   ok(startLocal.tool === 'py_eval', 'start → py_eval（需要设置模式）', startLocal.tool);
   ok(/set_remote_debugger\("", "", -1\)/.test(startLocal.args.code), 'local 模式清远程残留');
   ok(/load_debugger\("win32", False\)/.test(startLocal.args.code), 'local 模式加载 win32');
+  ok(/_p = "a\.exe"/.test(startLocal.args.code) && /start_process\(_p,/.test(startLocal.args.code),
+    '显式 path 经 _p 变量用于 start_process');
+
+  // 不传 path 时必须回落到 IDA 当前加载的文件：
+  // start_process("", ...) 在 path 为空时返回 0（启动被取消），
+  // 以前能跑只是因为进程选项里残留着上一次的路径。
+  const startNoPath = buildDbgCall('start', {}, { targetKind: 'PE' });
+  const npc = startNoPath.args.code || '';
+  ok(/get_input_file_path\(\)/.test(npc), '无 path 时回落到 get_input_file_path()');
+  ok(/start_process\(_p,/.test(npc), 'start_process 使用回落后的路径变量 _p');
+  ok(!/start_process\("",/.test(npc), '不再出现 start_process("")（会返回 RC=0）');
 
   const cases = [
     ['exit', {}, 'dbg_exit', {}],
@@ -43,7 +54,10 @@ console.log('\n[2] buildDbgCall 对每个 action 逐一断言上游工具名与�
     ['step_into', {}, 'dbg_step_into', {}],
     ['step_over', {}, 'dbg_step_over', {}],
     ['bp_list', {}, 'dbg_bps', {}],
-    ['bp_add', { addrs: '0x1,0x2' }, 'dbg_add_bp', { addrs: ['0x1', '0x2'] }],
+    // bp_add 从 dbg_add_bp 改为 py_eval + idaapi.add_bpt：
+    // 实测远程 linux 后端下 ida_dbg.add_bpt / dbg_add_bp 恒返回 False，
+    // 而 idaapi.add_bpt 同时适用于本地与远程。
+    ['bp_add', { addrs: '0x1,0x2' }, 'py_eval', null],
     ['bp_del', { addrs: ['0x1', '0x2'] }, 'dbg_delete_bp', { addrs: ['0x1', '0x2'] }],
     ['bp_toggle', { items: { addr: '0x1', enabled: false } }, 'dbg_toggle_bp', { items: [{ addr: '0x1', enabled: false }] }],
     ['regs', {}, 'dbg_regs', {}],
@@ -52,13 +66,21 @@ console.log('\n[2] buildDbgCall 对每个 action 逐一断言上游工具名与�
     ['mem_read', { regions: { addr: '0x401000', size: 16 } }, 'dbg_read', { regions: [{ addr: '0x401000', size: 16 }] }],
     ['mem_write', { regions: { addr: '0x401000', data: 'abcd' } }, 'dbg_write', { regions: [{ addr: '0x401000', data: 'ab cd' }] }],
     ['clear_remote', {}, 'py_eval', null],
+    ['status', {}, 'py_eval', null],
+    ['suspend', {}, 'py_eval', null],
   ];
   for (const [action, input, tool, args] of cases) {
     const r = buildDbgCall(action, input);
     ok(r.tool === tool, `${action} → ${tool}（实际 ${r.tool || r.error}）`);
     if (args) ok(JSON.stringify(r.args) === JSON.stringify(args), `${action} 参数 ${JSON.stringify(args)}（实际 ${JSON.stringify(r.args)}）`);
   }
-  ok(DBG_ACTIONS.length === 17, `DBG_ACTIONS 共 17 项（start/clear_remote 增强后）实际 ${DBG_ACTIONS.length}`);
+  ok(DBG_ACTIONS.length === 19, `DBG_ACTIONS 共 19 项（新增 status/suspend 后）实际 ${DBG_ACTIONS.length}`);
+
+  // bp_add 的生成代码必须用 idaapi.add_bpt 并覆盖每个地址
+  const bpa = buildDbgCall('bp_add', { addrs: '0x401000,0x401010' });
+  const bcode = (bpa.args && bpa.args.code) || '';
+  ok(/idaapi\.add_bpt/.test(bcode), 'bp_add 使用 idaapi.add_bpt（远程后端可用）');
+  ok(/"0x401000","0x401010"/.test(bcode), 'bp_add 把全部地址写进循环');
 }
 
 console.log('\n[3] 形态归一化');
@@ -68,16 +90,18 @@ console.log('\n[3] 形态归一化');
   ok(JSON.stringify(normalizeBpItems({ addr: '0x1', enabled: true })) === '[{"addr":"0x1","enabled":true}]', 'items 单对象 → [{addr,enabled}]');
 }
 
-console.log('\n[4] start 带 args/cwd → 参数进入 start_process；path 缺省空串');
+console.log('\n[4] start 带 args/cwd → 参数进入 start_process；path 缺省回落到当前文件');
 {
   const r = buildDbgCall('start', { args: '-d', cwd: 'C:\\tmp' });
   ok(r.tool === 'py_eval', `上游 py_eval（实际 ${r.tool}）`);
   const code = r.args.code || '';
   ok(/idaapi\.start_process/.test(code), '代码含 idaapi.start_process');
-  ok(/start_process\("", "-d"/.test(code), 'path 缺省为空字符串');
+  // start_process("", ...) 会返回 0（启动被取消），缺省 path 必须回落到当前加载文件
+  ok(/get_input_file_path\(\)/.test(code) && /start_process\(_p, "-d"/.test(code),
+    'path 缺省回落到 get_input_file_path()');
   ok(/"-d"/.test(code) && /C:\\\\tmp/.test(code), 'args/cwd 被带入');
   const withPath = buildDbgCall('start', { path: 'a.exe' });
-  ok(withPath.tool === 'py_eval' && /start_process\("a\.exe"/.test(withPath.args.code), '只给 path 也走 py_eval 并带入路径');
+  ok(withPath.tool === 'py_eval' && /_p = "a\.exe"/.test(withPath.args.code), '只给 path 也走 py_eval 并带入路径');
 }
 
 console.log('\n[5] hex 形态：read 输出带空格 / write 接受无空格');

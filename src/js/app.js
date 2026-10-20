@@ -324,12 +324,14 @@ function setupWindowStateListener() {
 async function loadConfig() {
   try {
     state.config = await window.electronAPI.getConfig();
-    // 平台批量解题跳过清单（config.platform.skipChallenges: ["time-travel", ...]）——
-    // 人工已解出/不想自动跑的题写在这里，连续模式会跳过它们。
+    // 平台批量解题的「已处理」清单（config.platform.skipChallenges）——
+    // 记录**已解出**或人工明确指定跳过的题，连续模式会跳过它们。
+    // 未解出的题不会自动写入（见批量循环里的持久化逻辑），以便下次重试。
+    // 字段名沿用 skipChallenges 以兼容旧配置。
     const skip = state.config && state.config.platform && state.config.platform.skipChallenges;
     if (Array.isArray(skip) && skip.length) {
       state.platformSkipSet = new Set(skip.map(s => String(s)));
-      addLog('info', '[平台] 跳过清单: ' + skip.join(', '));
+      addLog('info', '[平台] 已处理清单（' + skip.length + ' 题，批量时跳过）: ' + skip.join(', '));
     }
     addLog('info', '配置加载成功');
   } catch (err) {
@@ -1344,13 +1346,16 @@ async function __ctfAutoTest(opts = {}) {
     // 结构性失败（无题可拉）→ 提前结束
     if (['no-candidates', 'no-grounds', 'connect-failed', 'grounds-failed', 'list-failed'].includes(r.note)) break;
 
-    // 跨进程去重：把"本轮已尝试过"写进 config.platform.skipChallenges，
+    // 跨进程去重：把"本轮已处理过"写进 config.platform.skipChallenges，
     // 否则每题重启工具后 exclude 丢失 → 同一题被反复拉取（实测 not-baby-parallelism 连跑两轮）。
-    // 定向验证（noPersistSkip）不写：定向复验本来就要反复跑同几道题，
-    // 写进跳过清单会污染后续批量选题目录。
+    //
+    // ⚠️ 只记录**已解出**的题，失败的不写。历史上这里无条件写入，
+    // 导致批量跑失败的题（CrackMe 系列 8 道等）永久进入跳过清单、后续再也不会重试，
+    // 混入人工已解题的语义里，无法区分"解过"与"没解成"。
+    // 失败题的去重靠本轮的 exclude 集合（内存态），下次启动可以重试。
     if (opts.noPersistSkip) {
       addLog('info', `[自动测试] 定向模式：不把「${name}」写入跳过清单`);
-    } else if (name && name !== '(unknown)') {
+    } else if (r.ok && name && name !== '(unknown)') {
       try {
         const cur = ((state.config && state.config.platform && state.config.platform.skipChallenges) || []).slice();
         if (!cur.includes(name)) {
@@ -1362,9 +1367,11 @@ async function __ctfAutoTest(opts = {}) {
           if (window.electronAPI && window.electronAPI.saveConfig) {
             await window.electronAPI.saveConfig({ platform: { skipChallenges: cur } });
           }
-          addLog('info', `[自动测试] 已记录「${name}」到跳过清单（${cur.length} 条），下次启动不再重复拉取`);
+          addLog('info', `[自动测试] 「${name}」已解出，记入已处理清单（${cur.length} 条），后续批量不再重复拉取`);
         }
       } catch (e) { /* 记录失败不阻塞 */ }
+    } else if (!r.ok && name && name !== '(unknown)') {
+      addLog('info', `[自动测试] 「${name}」未解出（${r.note || '未知原因'}），不写入清单，下次可重试`);
     }
 
     // 存档本轮报告（供外部脚本读取）

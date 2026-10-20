@@ -19,6 +19,15 @@
 
 ## 一、按技术标签检索
 
+### 动态调试（进入条件与定向取证）
+
+- **知识**: [reverse/method_static_first_dynamic.md](reverse/method_static_first_dynamic.md)
+  （先用 MCP 把静态数据取全、锁定 2~5 个候选函数并写出"断点处读什么"的假设，再启动调试器；
+  含窗口期处理、PIE 重定位、SMC 解密后 dump、反调试、GUI 改内存、预算对照）
+- **技能**: `read_skill ctf-reverse-binary` §动态调试 / `ctf-frida-dynamic`（Android 同理，断点→hook 点）
+- **关键词**: `动态调试` `静态先行` `入场条件` `断点选址` `窗口期` `函数锁定` `get_process_state`
+  `suspend` `PIE 重定位` `add_bpt` `linux_server` `一次多取` `离线复算` `SMC dump` `反调试`
+
 ### 算法识别 / 常量反演
 - **知识**: [native-key-inversion.md](frida/native-key-inversion.md)（从 native 常量反演 key，正逆互校）
 - **速查**: PAYLOAD-CHEATSHEET §算法特征
@@ -79,6 +88,7 @@
 | `.luac/.wasm/.go/.rust` | ctf-reverse-langs |
 | 固件/bin | ctf-iot-firmware |
 | 逻辑读懂但手算不完 | ctf-reverse-tooling（Z3/angr/Unicorn）|
+| 静态读不动 / 需要运行时值 | **先读** [reverse/method_static_first_dynamic.md](reverse/method_static_first_dynamic.md)，再按入场条件决定是否启动 IDA 调试 |
 
 ---
 

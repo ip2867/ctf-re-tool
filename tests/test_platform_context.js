@@ -71,7 +71,12 @@ console.log('\n[2] applyWrap：包装语义');
   ok(R.applyWrap('771535', 'flag{%s}') === 'flag{771535}', '裸值 → flag{771535}');
   ok(R.applyWrap('771535', 'CTF{%s}') === 'CTF{771535}', '自定义模板');
   ok(R.applyWrap('flag{abc}', 'flag{%s}') === 'flag{abc}', '已带外壳不重复套');
-  ok(R.applyWrap('x{y}', 'flag{%s}') === 'x{y}', '任意 xxx{...} 已算外壳');
+  // 历史缺陷 A（[WUSTCTF2020]level1）：内层前缀与目标前缀不同时，
+  // 必须**先脱内层再套目标壳**。旧行为是"任意 xxx{...} 都算外壳直接返回"，
+  // 会产出 x{y} 这种不符合目标形态的答案 → 平台判错。
+  ok(R.applyWrap('x{y}', 'flag{%s}') === 'flag{y}', '异前缀 xxx{...} 先脱壳再套目标模板');
+  ok(R.applyWrap('hack1ng_fo1_fun{abc}', 'flag{%s}') === 'flag{abc}', '题目自定义壳被正确剥离');
+  ok(R.applyWrap('x{y}', 'x{%s}') === 'x{y}', '同前缀仍不重复套');
   ok(R.applyWrap('', 'flag{%s}') === '', '空值不包装');
   ok(R.applyWrap('  v  ', 'flag{%s}') === 'flag{v}', '两端空白被裁掉');
 }

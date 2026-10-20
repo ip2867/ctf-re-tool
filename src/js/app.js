@@ -1978,8 +1978,22 @@ function applyWrap(value, tpl) {
   const v = String(value == null ? '' : value).trim();
   const t = String(tpl || 'flag{%s}');
   if (!v) return v;
-  // 已经是外壳形态就不再套
-  if (/^[A-Za-z][A-Za-z0-9_]*\{[^}]*\}$/.test(v)) return v;
+
+  // 从模板取出目标前缀（如 'flag{%s}' → 'flag'；无 %s 时按裸值处理）
+  const tplPrefix = (/^([A-Za-z][A-Za-z0-9_]*)\{/.exec(t) || [])[1] || '';
+
+  // 值本身已是 prefix{...} 形态时，分两种情况：
+  //   ① 内层前缀 == 目标前缀 → 原样返回（避免 flag{flag{x}}）
+  //   ② 内层前缀 != 目标前缀 → **先脱内层再套外层**
+  // ② 就是历史缺陷 A：题面要求 "flag{裸值}"，而求解得到的裸值本身带着
+  // 题目自定义壳（如 hack1ng_fo1_fun{...}）。旧实现看到"已有外壳"直接返回，
+  // 产出 hack1ng_fo1_fun{...} 这种不合目标形态的答案，平台判错。
+  const inner = /^([A-Za-z][A-Za-z0-9_]*)\{([^}]*)\}$/.exec(v);
+  if (inner) {
+    if (!tplPrefix || inner[1] === tplPrefix) return v;   // 同前缀（或模板无前缀）→ 不重复套
+    return t.replace('%s', inner[2]);                     // 异前缀 → 脱内层，套目标壳
+  }
+
   return t.replace('%s', v);
 }
 

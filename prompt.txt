@@ -1,0 +1,350 @@
+# 交接文档 — CTF-RE-TOOL v1.8.0
+
+> 写给**没有本对话历史**的下一个 agent。
+> 目标不是总结过去，而是让你**立刻能动手**：先读哪个文件、先跑哪条命令、改哪个函数、怎么算成功。
+>
+> 采集时间：2026-10-20 18:00 (+08:00)
+> 来源标注：`[已验证]` = 来自 git / 文件 / 命令输出；`[用户提供]` = 用户说明未独立验证；`[推断]` = 合理判断；`[未知]` = 尚未确认。
+
+---
+
+## 0. 30 秒交接
+
+- **项目**：Electron 桌面应用，用 AI（Tool-Use 循环）调度 IDA/JEB/Burp/Frida 解 CTF 逆向题。`[已验证]`
+- **当前版本**：v1.8.0，回归 79/79 通过，**无 P0 blocker**。`[已验证]`
+- **两个仓库**：本地 `ctf-tool-v2`（开发）、`ctf-re-tool-publish`（发布，推到 GitHub）。`[已验证]`
+- **下一件事**：先跑回归确认基线（§1），再按 §8 挑任务。
+
+---
+
+## 1. 立刻要做的事（照抄即可）
+
+```bat
+REM 1. 确认项目能跑
+cd /d "C:\Users\Administrator\Desktop\工具\ctf-tool-v2"
+node tests/run_all.js
+REM 期望输出：==== 79/79 passed ====
+
+REM 2. 确认版本与工作区
+git log --oneline -1
+REM 期望：d085670 CTF-RE-TOOL v1.8.0
+git status --short
+REM 期望：空（无未提交改动）
+
+REM 3. 启动应用（需先在设置页配好工具路径）
+启动.bat
+REM 或 npm start
+```
+
+**成功判据**：第 1 步输出 `79/79 passed`；第 2 步工作区为空；第 3 步能打开窗口。
+
+**若本文与现场不符，以现场为准**。本文写于 2026-10-20 18:00，之后可能已变化。快速自检：
+
+```bat
+git rev-parse --short HEAD          REM HEAD 是否还是本文所写
+dir electron\*.js | find /c /v ""   REM 模块数
+dir tests\test_*.js | find /c /v "" REM 测试数
+node -p "require('./package.json').version"
+```
+
+---
+
+## 2. 项目是什么 `[已验证]`
+
+一个 **CTF 逆向 AI 解题工作台**。核心设计原则：
+
+> **AI 是解题主体，工具提供能力。**
+> 不是把功能堆在一起，而是让 AI 在解题过程中真正调用工具、识别算法、验证结论。
+
+关键机制：
+
+| 机制 | 作用 | 实现位置 |
+|---|---|---|
+| Tool-Use 循环 | AI 自主调用工具反复推进，最多 25 轮 | `src/js/app.js` |
+| 四阶段提示词 | ①收集 → ②定位算法 → ③脚本本地验证 → ④结论 | `src/js/app.js` |
+| 本地验证闭环 | `[VERIFY]` 契约 → 生成 Python 复现 → 标 ✅/⚠️ | `src/js/app.js` |
+| 知识库检索 | `wiki_search` / `wiki_read` 按关键词加权检索 | `electron/main.js` |
+| 技能加载 | `read_skill` 按需加载方法论，不占固定上下文 | `electron/main.js` |
+| 动态调试 | `ida_dbg` 系列工具，本地 PE + Kali 远程 ELF | `electron/ida-dbg.js` |
+| 长任务可靠性 | 上下文压缩、死循环拦截、失败环 | `electron/agent-runtime.js` |
+
+**技术栈**：Electron 35 + 原生 JS（无框架）+ Anthropic `/v1/messages` 协议 + MCP 客户端。`[已验证]`
+
+---
+
+## 3. 仓库与版本 `[已验证]`
+
+### 3.1 两个仓库
+
+```
+C:\Users\Administrator\Desktop\工具\ctf-tool-v2          ← 开发仓，无 remote
+C:\Users\Administrator\Desktop\工具\ctf-re-tool-publish  ← 发布仓，origin = github.com/ip2867/ctf-re-tool
+```
+
+**重要**：两仓**内容需手动同步**，没有自动化。发布仓 = 开发仓子集 + README + docs/ + exe。
+
+### 3.2 当前状态
+
+| 项 | 值 |
+|---|---|
+| 开发仓 HEAD | `d085670` |
+| 发布仓 HEAD | `4c26832`（本地与远程一致） |
+| 分支 | 开发仓 `master`，发布仓 `main` |
+| 工作区 | 两仓均干净 |
+| 版本号 | `package.json` = 1.8.0 |
+| 备份分支 | 两仓都有 `backup-before-rewrite`（历史重写前） |
+
+### 3.3 提交消息全部相同 `[已验证]`
+
+两仓所有提交消息都是 `CTF-RE-TOOL v1.8.0`（用户要求，2026-10-20 用 `git filter-repo` 重写）。
+
+**后果**：`git log` 看不出每次改了什么。别试图从提交历史理解变更——看 `docs/OPTIMIZATION-PLAN.md`。
+
+---
+
+## 4. 代码地图 `[已验证]`
+
+### 4.1 核心文件（按修改风险排序）
+
+| 文件 | 规模 | 职责 | 改它的风险 |
+|---|---|---|---|
+| `electron/main.js` | ~10,000 行 | Electron 主进程：IPC、MCP 客户端、AI 传输、知识库、所有工具实现 | **高**——牵一发动全身 |
+| `src/js/app.js` | ~13,800 行 | 渲染层：AI 编排、Tool-Use 循环、提示词构建、验证闭环、WP 生成 | **高** |
+| `electron/ida-dbg.js` | ~360 行 | `ida_dbg` 动作映射、启动前奏（local/remote）、状态语义 | 中 |
+| `electron/agent-runtime.js` | — | 上下文压缩、连续调用拦截、失败环、会话续跑 | 中 |
+
+### 4.2 electron 下的模块 `[已验证]`
+
+```
+agent-runtime.js      binary-map.js         crypto-detect.js      crypto-tables.js
+crypto-tool.js        file-capability.js    gui-input.js          hash-hint.js
+ida-dbg.js            ida-debug-capability.js  ida-mcp-url.js     ida-paging.js
+intermediate-advance.js  kali-preflight.js  main.js               pcap.js
+preload.js            py-artifacts.js       recipe.js             remote-exec.js
+script-dedup.js       smc-detect.js         tool-result.js        verify-discipline.js
+xref-gate.js
+```
+
+共 25 个 .js 文件（用 `ls electron/*.js | wc -l` 或 `dir electron\*.js` 核对）。
+
+### 4.3 知识库与技能 `[已验证]`
+
+- `skills/`：11 个方法论 —— ctf-dispatch / ctf-reverse-binary / ctf-reverse-android / ctf-reverse-tooling / ctf-reverse-langs / ctf-frida-dynamic / ctf-antidebug / ctf-jsreverse / ctf-iot-firmware / ctf-crypto-identify / ctf-writeup
+- `wiki/reverse/`：43 篇历年题 + **7 篇方法论**（`method_*.md`）
+
+其中 `wiki/reverse/method_static_first_dynamic.md` 是动态调试纪律，最重要的单篇。
+
+---
+
+## 5. 关键设计决策（不要轻易推翻）
+
+### 5.1 动态调试是"取证"不是"探索" `[已验证]`
+
+`src/js/app.js` 里的四条入场条件：
+1. 有函数清单
+2. 候选函数说得清职责（读输入 / 做变换 / 比对 / 解壳）
+3. **写得出调试假设**：断点地址 + 读哪个表达式 + 期望值 + 判定方式
+4. 有办法把流程逼到那里
+
+写不出第 3 条 = 静态没读够，回反编译。
+
+**为什么**：无假设直接 `start` 会在系统 DLL 和消息循环里漫游几十轮，零信息。
+
+### 5.2 进程状态语义（三个实现坑，别再踩） `[已验证]`
+
+```
+get_process_state() 返回值：
+  -1 = 已暂停（可单步 / run_to / 写内存）
+   0 = 无进程
+   1 = 运行中（单步必然失败）
+   2 = 已退出
+```
+
+三个历史根因（都已修，别改回去）：
+
+1. **语义判反**：曾把 `1` 当暂停等、把 `-1` 当无状态 → 所有单步"失败"。
+2. **`continue` / `run_to` 是异步投递**：插件返回的 IP 是投递前旧值，必须轮询 `waitDbgStop()` 到真正停下。GUI 程序进消息循环后 STATE 恒为 1，这是正常状态而非错误。
+3. **`start_process("")` 在路径为空时返回 0（启动被取消）**：以前"能用"是因为进程选项残留了上次的目标路径。做过一次远程调试后残留变成 Linux 路径，本地启动就稳定失败——**这才是"本地调试时好时坏"的真因，与 ScyllaHide 无关**。现在 `buildStartPrelude` 会回落到 `idaapi.get_input_file_path()`。
+
+### 5.3 远程 ELF 与本地 PE 的三处差异 `[已验证]`
+
+| | 本地 win32 | 远程 linux |
+|---|---|---|
+| start 后 | 自动停在入口 | **不停**，需主动 `suspend` |
+| 断点地址 | 静态地址即可 | PIE 必须用**重定位后**地址 |
+| 断点 API | 均可 | `dbg_add_bp` 恒 False，必须 `idaapi.add_bpt` |
+
+远程用 Kali 上 IDA 自带 `dbgsrv/linux_server`（**不是 gdbserver**），调试器名 `"linux"`。
+
+### 5.4 知识库"写了但搜不到"是最大陷阱 `[已验证]`
+
+失败模式：页面存在、检索函数正常，但自动预取选词选不到 → AI 永远看不到。
+
+已修：`src/js/app.js` 的 `FEATURES` 有动态调试结构特征（VirtualProtect / IsDebuggerPresent / DialogBoxParam / GetTickCount），`POOL` 有中英文检索词，提示词的 `METHOD_PAGES` 显式点名 7 篇方法论。
+
+**回归保护**：`tests/test_knowledge_reachability.js` 模拟 `prefetchKnowledge` 选词 + 打分，验证 5 类特征都排第 1、普通题不误命中。
+
+---
+
+## 6. 测试 `[已验证]`
+
+```bat
+node tests/run_all.js
+REM 期望：==== 79/79 passed ====
+```
+
+- 79 个单元测试 + 2 个手工验收脚本
+- **手工验收需真实环境**，不在 `run_all` 里：
+  - `tests/manual_dbg_local.js` → 需本机 IDA 9.x，期望 `PASS (10/10)`
+  - `tests/manual_dbg_remote.js` → 需 Kali 可达，期望 `PASS (11/11)`
+
+新增测试时：文件名必须 `test_*.js` 才会被 `run_all.js` 收集。
+
+---
+
+## 7. 失败过的路（不要重复）
+
+### 7.1 动态调试 `[已验证]`
+
+| 尝试 | 结果 | 真实原因 |
+|---|---|---|
+| 用 `gdbserver` 做远程 | 连上但调试器不接管 | 必须用 IDA 的 `linux_server` |
+| 禁用 ScyllaHide 后单步成功 | 误判为根因 | 真正原因是状态语义判反 |
+| `load_debugger("linux")` 返回 False | 以为不支持 | **连到了仍加载 PE 的旧 IDA 实例** |
+| 连上后立刻 `Closing connection` | 以为调试器有问题 | 目标自己退出了（plutochat 连不上服务端） |
+| 断点设了不命中 | 以为断点 API 有问题 | 目标在调试器下完断点前就跑过了 / PIE 用了静态地址 |
+
+### 7.2 环境坑 `[已验证]`
+
+- **`taskkill` 杀不掉挂满插件的 IDA** → 用 `powershell -Command "Stop-Process -Name ida -Force"`
+- **`tasklist` 在本机报"无效类"** → 改用 PowerShell `Get-Process`
+- **Kali shell 是 zsh**：未匹配 glob 会报 `no matches found` 并中止整条命令 → 通配符放 `sh -c '...'` 里
+
+### 7.3 两个未解题目 `[已验证]`
+
+- **CrackMe2**：已通过公开题解 + 独立 BFS 交叉验证得到 30 字节 serial（见 `solved-challenges.json`），**不是 flag{} 形态**，平台 flag 值未知。
+- **cnbragon**：轮函数 oracle 稳定可用，但 `0x4101f0` 是 base64-style 解码器，**寄存器+栈混合的参数约定没推定**，35 字符输入无法映射到 16 字节 key 材料。已按用户指示跳过（见 `skipped-challenges.json`）。
+
+---
+
+## 8. 下一步可做的事（按优先级，任选）
+
+### 选项 A：确认基线（推荐先做，5 分钟）
+
+```bat
+cd /d "C:\Users\Administrator\Desktop\工具\ctf-tool-v2"
+node tests/run_all.js
+```
+成功：`79/79 passed`。失败：看具体哪个 `test_*.js` 挂了，读该文件的断言。
+
+### 选项 B：修 cnbragon 的阻塞点（技术任务）
+
+**目标**：定位 `0x4101f0` 的参数传递方式。
+
+**具体动作**：
+1. 用 IDA 打开 cnbragon，跳到 `0x403130`（主校验函数）
+2. 在 `0x4101f0` 设断点，看命中时 `EAX` / `ECX` / `EDX` 和 `[ESP+4]`、`[ESP+8]` 的值
+3. 对照 `skipped-challenges.json` 里 `working_oracle` 的格式（`eax = data ptr, ecx = round-key ptr`）
+4. 成功后更新 `skipped-challenges.json` → 移入 `solved-challenges.json`
+
+**成功判据**：能复现出 35 字符输入 → 16 字节 key 的映射，且用 `sub_401DB0` oracle 验证通过。
+
+### 选项 C：找新题验证整套链路（比改代码更能暴露问题）
+
+用 CTF² 平台或本地题库跑一道**没做过的**题。观察三点：
+- AI 是否真的调用了工具（不是凭上下文空想）
+- 知识库是否命中（日志里看 `[知识库] 已按本题特征自动检索`）
+- 验证闭环是否生效（flag 是否被标 ✅已验证）
+
+### 选项 D：补 README 缺失的模型后端说明
+
+`README.md` 的「Claude API 配置」只提 Anthropic 兼容接口。若要支持其他 provider，需改 `src/js/app.js` 的请求构造。
+**但先问用户**是否真要支持——当前设计是单一 Anthropic 协议。
+
+---
+
+## 9. 环境与配置 `[已验证]`
+
+| 依赖 | 要求 | 检查命令 |
+|---|---|---|
+| Node.js | 18+ | `node -v` |
+| Python | 3.10+（跑解密脚本） | `python --version` |
+| IDA Pro | 9.x，MCP 插件监听 13337 | `curl http://127.0.0.1:13337/mcp` |
+| JEB | MCP 监听 16161 | 设置页配路径 |
+| 夜神模拟器 | ADB 62025 / Frida 27042 | 设置页配 `nox_adb` |
+
+配置文件：`%APPDATA%\ctf-reverse-tool\config.json`。
+工具路径默认全空，**首次运行必须在设置页填**（本工具是调度框架，不含这些工具）。
+
+---
+
+## 10. 发布流程（两个站，别漏）
+
+### 10.1 工具发布
+
+```bat
+cd /d "C:\Users\Administrator\Desktop\工具\ctf-tool-v2"
+npm run build:exe
+REM 产物：dist\CTF-RE-TOOL.exe（约 74 MB）
+```
+
+**已知问题**：`dist\win-unpacked\resources\app.asar` 会被 Windows Defender 实时防护锁住，导致 `EBUSY` 删除失败。
+**绕法**：输出到新目录
+```bat
+npx electron-builder --win portable --config.directories.output=dist-180
+```
+
+然后：
+1. 算 SHA256 → 更新 `README.md` 的校验值
+2. 拷 exe 到发布仓（被 `.gitignore` 排除，只随 Release 分发）
+3. `git push` 发布仓
+4. 用 GitHub API 创建 Release 并上传 exe（`gh` CLI 未安装；token 在 git credential 里，可用 `git credential fill` 取）
+
+### 10.2 Blog 发布（两个目标，很容易漏）
+
+```bat
+cd /d E:\blog\hugo_extended_0.153.2_windows-amd64\MyBlog
+hugo.exe --minify
+
+REM 目标 1：Firebase
+firebase deploy --only hosting --non-interactive --debug
+
+REM 目标 2：GitHub Pages（public/ 是独立 git 仓库！）
+cd public
+git add -A
+git commit -m "post: xxx"
+git push origin main
+```
+
+**坑（全部实测）**：
+- `public/` 目录**自带 `.git`**，是独立仓库（remote = `ip2867.github.io`），不是普通子目录
+- 文章 `date` 必须早于当前时间，否则 Hugo 当"未来文章"跳过不构建
+- Firebase 需 `--debug` 参数绕过 `ProxyAgent` 循环引用 bug（`firebase-tools` 15.1.0 + Node 24）
+- 代理：`github.com` 直连不通，git 需 `-c http.proxy=http://127.0.0.1:7890`
+- Firebase Spark 计划禁止托管 exe/apk/py，靠 `firebase.json` 的 `ignore` 排除
+- 启动脚本 `启动.bat` 必须纯 ASCII——UTF-8 中文在 cmd 默认 GBK 代码页下会导致命令执行失败
+
+---
+
+## 11. 文档索引
+
+| 想知道 | 读哪个 |
+|---|---|
+| 每轮改了什么、为什么 | `docs/OPTIMIZATION-PLAN.md`（最全） |
+| 项目框架总览 | `docs/PROJECT-FRAMEWORK.md` |
+| 批量实测失败归因 | `docs/AUTOTEST-REPORT.md` |
+| 动态调试方法论 | `wiki/reverse/method_static_first_dynamic.md` |
+| 二进制逆向方法论 | `skills/ctf-reverse-binary/SKILL.md` |
+| 分流与卡题决策 | `skills/ctf-dispatch/SKILL.md` |
+| 历史版本日志 | `docs/CHANGELOG-ARCHIVE.md` |
+
+---
+
+## 12. 给下一个 agent 的提醒
+
+1. **先跑 `node tests/run_all.js`**。79/79 是基线，挂了说明环境或代码有问题，别在坏基线上改东西。
+2. **改 `main.js` 或 `app.js` 前先 grep**。这两个文件上万行，同名逻辑常有 2-3 处（如 `toolLabel` 和 `executeToolCall` 各有一个 `case 'ida_dbg'`）。
+3. **提交消息不用纠结**——历史已全部改成 `CTF-RE-TOOL v1.8.0`，改了什么靠 `docs/` 记录。
+4. **不确定就问用户**。特别是：改产品方向、动发布流程、删文件。
+5. **写代码前先 `wiki_search`**——很多坑已记在 `failed_attempts` 里。
+6. **PowerShell 在本机会吃掉转义符**（`\$_` 被当字面量）。复杂脚本改用 Node 写文件再执行，别硬扛 PowerShell 单行命令。

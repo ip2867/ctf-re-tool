@@ -1,0 +1,33 @@
+{
+  "challenge": "cnbragon (KanxueCTF2016Keygenme.exe)",
+  "status": "skipped",
+  "date": "2026-10-20",
+  "reason": "轮函数已能在 Unicorn 中真实执行（oracle 可用），但完整校验链的参数约定（寄存器+栈混合）未能确定，35 字符输入的解码路径未打通。按用户指示跳过。",
+  "confirmed_facts": {
+    "not_smc": "PE .text Characteristics=0x60000020（无 MEM_WRITE），无 VirtualProtect/WriteProcessMemory 导入，capstone 扫描绝对寻址写 .text = 0 处，Unicorn + UC_HOOK_MEM_WRITE 监视 .text = 0 次写入",
+    "not_packed": ".text 整体熵 6.511，最大 7.637 在 .rdata 表区",
+    "tables": {
+      "offsets": ["0x1fb98", "0x1ff98", "0x20398", "0x20798"],
+      "layout": "00 70 70 70 style dword arrays; value lane varies per table",
+      "t0_head": "0x70707000",
+      "t1_head": "0x00e0e0e0",
+      "t2_head": "0x38003838",
+      "t3_head": "0x70700070"
+    },
+    "key_string": "cnbragon@pediyctf2016",
+    "charset": "ABCDEFGHJKMNPQRSTVWXYZ1234567890 (35 chars, no I/L/O/U)",
+    "success_message": "Congratulations! ... (0x428eac)",
+    "fail_message": "Success! (0x428ea0, misleading name)",
+    "index_constraints_at_0x428ee0": "08 11 1a 00",
+    "input_length_required": 35,
+    "ciphertext_is_runtime": "target compared at [esp+ecx+0x250], computed at runtime (not a static constant)"
+  },
+  "working_oracle": {
+    "function": "sub_401DB0 (round function)",
+    "calling_convention": "eax = data ptr, ecx = round-key/context ptr",
+    "sample": "in=0102030405060708090a0b0c0d0e0f10 rk=0x11*0x100 -> 5003a2bd54d34579c2267f09cbe4c1bb",
+    "note": "This oracle is stable and reusable; it is the right basis for a future attempt."
+  },
+  "blocking_issue": "0x4101f0 is a base64-style decoder whose argument placement (register+stack mix) could not be pinned down; without it the 35-char input cannot be mapped to the 16-byte key material.",
+  "next_step_if_resumed": "Trace 0x403130 with a full UC_HOOK_CODE + stack snapshot at each call, and read the actual argument values at the moment 0x4101f0 / 0x402760 are entered (rather than guessing the convention)."
+}

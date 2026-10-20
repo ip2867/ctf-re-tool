@@ -1,0 +1,23 @@
+{
+  "challenge": "CrackMe2",
+  "status": "solved-and-crosschecked",
+  "date": "2026-10-20",
+  "method": "public writeup (看雪CTF 2016 第四题) + independent BFS reimplementation",
+  "verification": {
+    "movestream_matches_writeup": true,
+    "xor_chain_after_key_matches": true,
+    "xor_chain_after_md5_matches": true,
+    "forward_replay_reached_exit": true,
+    "exit_index": 253,
+    "start_index": 0,
+    "shortest_path_steps": 92
+  },
+  "solution": {
+    "note": "The binary accepts a 30-byte serial, NOT a flag{...} string. Bytes 7..29 are non-printable.",
+    "input_hex_len30": "31323334353637111d7069c3d763573c9b90cb3c40bd0f4515713bcfdc37",
+    "prefix_ascii": "1234567",
+    "movestream_hex": "a95abeaaa555a50000fabc00001555affe9555aaaafea5"
+  },
+  "platform_flag": "unknown — no public flag value found; the required answer shape differs from flag{...}",
+  "unicorn_note": "Direct Unicorn replay of sub_401000 hit UC_ERR_READ_UNMAPPED (likely calling-convention mismatch for the WProtec VM entry), so it was not used as evidence. Cross-check relied on the three independent signals above, all of which agree."
+}

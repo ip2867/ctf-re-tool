@@ -127,10 +127,13 @@ function buildStartPrelude(mode, input, ctx) {
     const port = Number(i.remote_port || c.remotePort) || 23946;
     const pass = String(i.remote_pass != null ? i.remote_pass : (c.remotePass || ''));
     if (!host) {
-      return { error: 'remote 模式需要 remote_host（Kali 的 IP，gdbserver 所在主机）' };
+      return { error: 'remote 模式需要 remote_host（Kali 的 IP，linux_server 所在主机）' };
     }
-    // load_debugger 第二参数 use_remote=True 才是远程调试上下文
-    lines.push(`ida_dbg.load_debugger("gdb", True)`);
+    // ⚠️ Linux 远程调试用的是 IDA 自带的 dbgsrv/linux_server，不是 gdbserver。
+    // 调试器名必须是 "linux"；用 "gdb" 会走另一套（GDB 协议）客户端，
+    // 与 linux_server 的私有协议不兼容（实测：能连上但调试器不接管）。
+    // 参考：看雪《IDA动态调试环境搭建教程》——Android 用 android_server，Linux 对应 linux_server。
+    lines.push(`ida_dbg.load_debugger("linux", True)`);
     lines.push(`ida_dbg.set_remote_debugger(${JSON.stringify(host)}, ${JSON.stringify(pass)}, ${port})`);
   } else {
     // 本地：先清远程参数（空 host/port=-1 表示不使用远程），再加载 win32

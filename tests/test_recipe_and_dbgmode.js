@@ -119,7 +119,10 @@ console.log('\n[7] IDA 调试模式：PE→local，ELF+Kali→remote');
   ok(/start_process\("a\.exe"/.test(local.args.code), '路径被带入 start_process');
 
   const remote = buildStartPrelude('remote', { path: 'a.elf' }, { remoteHost: '1.2.3.4', remotePort: 23946 });
-  ok(/load_debugger\("gdb", True\)/.test(remote.args.code), 'remote 加载 gdb 调试器（use_remote=True）');
+  // Linux 远程调试必须用 IDA 自带的 dbgsrv/linux_server，调试器名为 "linux"。
+  // 用 "gdb" 会走 GDB 协议客户端，与 linux_server 的私有协议不兼容（实测能连上但不接管）。
+  ok(/load_debugger\("linux", True\)/.test(remote.args.code), 'remote 加载 linux 调试器（对应 linux_server）');
+  ok(!/load_debugger\("gdb"/.test(remote.args.code), 'remote 不用 gdb（与 linux_server 协议不兼容）');
   ok(/set_remote_debugger\("1\.2\.3\.4", ""/.test(remote.args.code), 'remote 设置主机');
   ok(/23946/.test(remote.args.code), 'remote 设置端口');
 

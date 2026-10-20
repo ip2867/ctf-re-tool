@@ -73,4 +73,43 @@ function classifyRemoteError(input) {
   return { code: PREFIXES.OK, message: '', isError: false };
 }
 
-module.exports = { classifyRemoteError, REMOTE_PREFIXES: PREFIXES };
+// remote_exec 的补充能力：IDB 的 Linux 远程调试服务端（dbgsrv/linux_server）。
+//
+// 为什么单独写：Linux 远程调试不是 gdbserver，而是 IDA 自带的 linux_server。
+// 启动它有固定套路，且必须 setsid（否则 SSH 会话一断就被杀，实测两次失败）：
+//   setsid <path>/linux_server -P<password> > <log> 2>&1 < /dev/null &
+//
+// 传入 password 时拼 `-P<pw>`（IDA 的格式是紧贴的，不是 `-P <pw>`）。
+function buildLinuxServerCommand(opts) {
+  const o = opts || {};
+  const bin = String(o.path || '/tmp/linux_server');
+  const pass = String(o.password == null ? '' : o.password);
+  const log = String(o.log || '/tmp/linux_server.log');
+  if (!bin) return { error: 'path 不能为空' };
+  // 只允许常规路径字符，避免命令注入（这是拼给远端 shell 的字符串）
+  if (!/^[A-Za-z0-9_./-]+$/.test(bin)) return { error: 'path 含非法字符' };
+  if (pass && !/^[A-Za-z0-9_@#%+.-]*$/.test(pass)) return { error: 'password 含非法字符' };
+  const passArg = pass ? ` -P${pass}` : '';
+  return {
+    command: `setsid ${bin}${passArg} > ${log} 2>&1 < /dev/null & echo LINUX_SERVER_SPAWNED`,
+    password: pass,
+    // 校验是否起来了：ss/netstat 看端口；两条命令都给，兼容不同发行版
+    verifyCommand: `sleep 1; (ss -ln 2>/dev/null || netstat -ln 2>/dev/null) | grep -E '23946|:23946' || echo NOT_LISTENING`,
+    stopCommand: "pkill -f 'linux_server' 2>/dev/null; echo STOPPED",
+  };
+}
+
+// linux_server 的启动日志里能判断状态的几个标志
+function classifyLinuxServerLog(text) {
+  const s = String(text || '');
+  if (/Listening on .*23946/i.test(s)) return { ready: true, state: 'listening' };
+  if (/Accepting connection/i.test(s)) return { ready: true, state: 'connected' };
+  if (/Address already in use|bind.*failed/i.test(s)) return { ready: false, state: 'port-in-use' };
+  if (/Permission denied|not found|No such file/i.test(s)) return { ready: false, state: 'cannot-start' };
+  return { ready: false, state: 'unknown' };
+}
+
+module.exports = {
+  classifyRemoteError, REMOTE_PREFIXES: PREFIXES,
+  buildLinuxServerCommand, classifyLinuxServerLog,
+};

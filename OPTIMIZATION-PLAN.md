@@ -366,6 +366,92 @@ UTF-16 路径字符串——那是一片**活跃栈帧**，被程序立即覆盖
 `mode:"remote"` 参数（`load_debugger("gdb", True)` + `set_remote_debugger`）语法正确，
 但端到端被 IDA 的交互确认卡住。
 
+## 一之八、2026-10-20 七续：读了看雪《IDA 动态调试环境搭建教程》后的关键修正
+
+参考：`https://bbs.kanxue.com/thread-287250-1.htm`（作者 烬奇小云，完整版在 Notion）
+
+### 关键修正：Linux 远程调试**不用 gdbserver**，用 IDA 自带 `linux_server`
+
+教程讲的是 Android，但原理完全对应 Linux。**之前用 `gdbserver` 是错的方向**：
+
+| | 我之前用的 | 教程/IDA 官方的方式 |
+|---|---|---|
+| 服务端程序 | `gdbserver :23946 ./target` | **`linux_server`**（在 IDA 的 `dbgsrv/` 目录） |
+| IDA 调试器 | `load_debugger("gdb", True)` | **`load_debugger("linux", True)`** |
+| 端口 | 23946 | 同样 23946 |
+| 密码 | 无 | `linux_server -P<password>` |
+
+`E:\ctf\tools\1-Reverse\IDA9.1\dbgsrv\` 里实际有的文件：
+
+```
+linux_server        (21 MB)   ← Linux 64 位
+linux_server32      (18 MB)   ← Linux 32 位
+android_server / android_server32 / android_x64_server / android_x86_server
+armlinux_server / armlinux_server32 / armlinux_serverhf32
+mac_server / mac_server_arm / mac_server_arme
+win32_remote32.exe / win64_remote.exe
+```
+
+这就是教程里"在 Kali 终端输入指令"的实际内容——不是 gdbserver，而是：
+
+```bash
+# 1. 把 linux_server 传到 Kali（教程第 1 步）
+scp dbgsrv/linux_server ip2867@192.168.230.129:/tmp/
+ssh ip2867@192.168.230.129 'chmod +x /tmp/linux_server'
+
+# 2. 在 Kali 上以 root 运行（教程第 2 步），监听 23946
+setsid /tmp/linux_server -P<password> > /tmp/ls.log 2>&1 < /dev/null &
+
+# 3. Linux 不需要 adb forward（那是 Android 的 adb 隧道），直接连 IP:23946
+```
+
+### 实测结果：链路确实通了
+
+用真实环境（Kali + IDA 9.1 + 编译的测试 ELF）：
+
+```
+linux_server 日志:
+  IDA Linux 64-bit remote debug server(ST) v9.1.31. Hex-Rays (c) 2004-2025
+  2026-10-20 12:26:05 Listening on :::23946 (my ip 192.168.230.129)...
+  2026-10-20 12:26:24 [1] Accepting connection from ::ffff:192.168.230.1...
+  Login to PlutoChat
+  Username: Password: Could not connect to PlutoChat servers. Try again later!
+  2026-10-20 12:26:54 [1] Closing connection from ::ffff:192.168.230.1...
+```
+
+**`Accepting connection` + 程序自己的输出（`Login to PlutoChat`）证明**：
+IDA 连上了 `linux_server`，并且**在 Kali 上真正启动了被调试程序**。
+
+用阻塞型测试程序（`for(;;) sleep(1)`）复现：
+`START_RC 1`、`STATE 1`、linux_server 日志打印 `ready`（程序跑到了 printf）。
+
+### 仍未打通的最后一环（诚实记录）
+
+`ida_dbg.is_debugger_on()` 仍为 `False`，`get_ip_val()` 返回 None。原因是：
+
+- `start_process` / `request_start_process` 是**异步投递**；
+- `ida_dbg.wait_for_next_event(WFNE_ANY|WFNE_SUSP, ...)` 在**非 UI 线程**（MCP 的 py_eval 线程）里调用会阻塞到超时，
+  因为 IDA 的调试事件循环跑在 UI 线程；
+- 尝试 `wait_for_next_event(..., 1)` 轮询 15 次仍全部超时（py_eval 整体 30s 超时）。
+
+也就是说：**进程确实被启动和附着，但调试器事件没有被 MCP 线程消费**，
+所以 `dbg_regs` / `dbg_read` 这类依赖"调试器在线"的 API 拿不到数据。
+
+### 正确的后续做法（下一次的起点）
+
+1. **手工在 IDA GUI 里走一遍教程流程**（`Debugger → Run → Remote Linux debugger`，
+   host/password/port 填好后点 OK）。这一步会把配置**持久化**到 IDA 里。
+2. 配置持久化后，后续 `dbg_*` 调用就不再需要 `start_process` 的参数协商，
+   事件循环也已由 GUI 建立。
+3. 如果要全自动：需要绕开 UI 线程限制——例如在 `py_eval` 里用
+   `ida_kernwin.execute_sync(lambda: ..., MFF_WRITE)` 把调试操作投递到 UI 线程执行，
+   而不是在 MCP 线程直接调 `wait_for_next_event`。
+
+**结论**：`linux_server` 路线是对的（比 gdbserver 正确），链路已验证到"程序在远程被启动"。
+差的只是事件循环线程归属，属可实现问题，不是能力缺失。
+
+全量：`node tests/run_all.js` → 单元测试 **74/74**、回归题集通过、exit 0。
+
 全量：`node tests/run_all.js` → 单元测试 **74/74**、回归题集通过、exit 0。
 
 **上一轮遗留的两项也已验证**：

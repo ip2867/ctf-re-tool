@@ -102,3 +102,75 @@ Burp MCP 集成 + JS 逆向能力（工作思路参考 reverse-skill 与 hello_j
 - Python 解密脚本生成（支持多种算法）
 - 反调试绕过脚本生成（支持多种绕过技术）
 - 响应式窗口布局
+
+### v1.4.0 (2026-10-14) — 修复 Frida Hook 证据被噪音淹没 / 降噪失效 / 经验跨阶段丢失
+
+审查两次真实运行日志（一次 APK 自动解题、一次 Frida Hook）发现三个真实缺陷，全部修复。
+
+**一、Frida 输出"真证据被噪音挤出 AI 结论窗口"（高危，可能漏 flag）**
+
+Hook 输出回灌 AI 前，旧逻辑把 `[DATA]`/`[FLAG]` 真证据与 `[HIT]` 噪音**混在一个池子**里再 `slice(-120)`。而噪音（可达上百条）通常出现在真证据**之后** → 尾部 120 条几乎全是噪音，**真证据被整段丢弃**。
+本次实测复现：131 条关键行里 2 条真证据 + 129 条噪音，`slice(-120)` 后**真证据 0 条保留**。
+（这次 flag 没丢，是因为另有一条独立逻辑直接收割 `[FLAG]` 行兜底；但若 flag 只以 `[DATA]`/普通解密输出形式出现，就会彻底漏掉。）
+
+**修复**：改为**分级保留** —— 高价值行（`[DATA]`/`[FLAG]`/flag 形态/加解密实参/SP 读写）**全部保留、不参与截断**；仅对 `[HIT]` 噪音限量（保留末尾 40 条作线索）。实测：真证据 ✅必留。
+
+**二、Frida `String.equals` 降噪形同虚设（129 条 `[HIT]` 全是误报）**
+
+两条根因：
+- 关键词正则 `/flag|ctf|key|secret|token|pass|stage/i` **命中了应用包名本身** —— 本题包名 `com.nctf.hookmysecret` 同时含 `ctf` 与 `secret`，导致每条涉及包名的比较都被判"有意义"而刷屏；
+- 兜底规则"两串 ≥6 字且长度差 ≤2"太松，把 `include==ViewStub`、`pathInterpolator==linearInterpolator`、`res/*.xml` 等框架/资源串全部放行。
+
+**修复**：改为"**高熵优先 + 噪音形态黑名单**"——① 高熵串（flag 形态/长 hex/base64）**先**保留（`flag==flag` 这种最终校验不能被误杀）；② 双方均为噪音形态（包名/资源/绝对路径/算法名/框架词）排除；③ 语义词命中且非噪音形态才打印。修复前后对比：**129 条噪音 → 0 条**（降噪 100%），5 个正例（flag、hex key、password 对）全部保留。
+
+**三、经验"跨阶段丢失"（前序暂存的经验永远进不了库）**
+
+一次 APK 解题里，阶段2（初步分析）AI 产出的经验被"暂存"，阶段2.5（Tool-Use）解出 flag 后**只入库了它自己那条** —— 阶段2 那条滞留在内存 `pendingExperience`，既不入库、也不持久化（关应用即丢）。且该暂存区从不随换题清空，会跨题残留。
+
+**修复**：① 换题（加载新文件）时清空 `pendingExperience`；② 解题成功时把**本题前序暂存的全部经验**一并入库（含防御性去重）。实测：阶段2 暂存 1 条 + 阶段2.5 成功 1 条 → 库内 2 条、暂存清空、重复幂等。
+
+> 回归：修复项 #1 真证据必留 ✅ ｜ #2 降噪 128/128 且正例 5/5 ✅ ｜ #3 经验接管与幂等 ✅ ｜ 原有回归（经验流 6/6、相似度 5/5、finalizeSolve 契约 2/2、求解路径审计 10/10）无回退 ｜ `node --check` 全过。
+
+### v1.3.14 (2026-10-14) — 当日汇总
+
+> 本条目汇总 **2026-10-14 当天**的全部更新（原按里程碑分为 v1.3.6 ~ v1.3.14 多次提交，现合并为一个版本）。
+
+**解题结构根治**
+- **"三件套"收口**：把"验证闭环 + 经验沉淀"从散落 9 处的两步复制粘贴，收口为单一入口 `finalizeSolve(text, {source})` —— 内含「验证闭环 → 失败自动枚举 → 登记 flag → 解题成功则经验自动入库」，从结构上杜绝"修一处漏一处"。
+- **5 类"只指路"入口改为真正解题**：`.dex` / `.jar` / `.class` / Mach-O / `.luac` 此前只启动外部工具或打印指引（AI 不参与），现全部接入 AI 求解闭环 —— DEX/JAR 走 **JEB 优先**（不可用降级 jadx）、Mach-O 走 IDA、`.luac` 走字节/常量抽取。分流表 12/12 均路由到真实求解器。
+- **修复跨文件 MCP 缓存泄漏**：`analyzeJavaLike` 未清缓存、`state._keyClassesByContent` 从不重置 → 连解多题时上一题数据会串进本题提示词/类选择；现随 `clearMcpCache()` 一并清理。
+
+**经验与知识库"真正帮到解题"**
+- **经验自动入库 + 真去重**：解题成功即写入（无需手动「保存」）；去重从"按整行含日期比对（换日必重复）"改为**与日期无关的内容级去重**（精确 + 二元组相似度≥0.78 + 子串判定）。经验注入补全到所有求解路径。
+- **修复题库 meta 解析 bug**：`wiki_search` 解析 YAML 的 `m` 标志令 `$` 匹配行尾，导致**列表写法**的 `attack_chain`/`failed_attempts` 被解析为空 —— 43 篇题库仅 13 篇解法链可用。修复后 **13 → 38 篇**，检索摘要升级为 **要点 + 解法链 + 避坑**。
+- **主路径自动预取**：新增 `prefetchKnowledge()`，调用 AI 前按题面特征词检索题库并把攻略内联进提示词（已覆盖 APK/PE/ELF、PYC、Web/JS、DEX/JAR、Lua）。
+
+**PYC 逆向从"无解"到可用**
+- 多后端自动回退：**pycdc → xdis/pydisasm → 原生 marshal+dis → 纯字节串扫描**（永不空手）；内置零依赖助手 `electron/pyc_decompile.py`。
+- 求解器兼容 `xor` **单字节整数密钥**（`xor_key=199`）、`custom` 返回 `str`/`list[int]` 归一化。
+
+**验证闭环与动态 Hook 通用性**
+- **修复 IDA 采集 0 反编译（最严重）**：`window.electronApi` 拼写错被空 catch 吞掉，实测反编译 **0 → 19 个**。
+- 验证闭环不再"没契约就放弃"：`synthesizeHypotheses()` 自合成候选矩阵（≤24 组）。
+- AES/DES-CBC **缺 IV/错 IV** 不再必然失败（枚举全零/首块/前置 IV + 回退 ECB）；口令 key 自动派生（MD5/SHA-256/零填充）。
+- 多候选密文**交叉校验 + 自动裁决**（IDA `xrefs_to` 判"哪条被校验函数引用"），防"变种题"陷阱。
+- 动态 Hook：修复"抓到输出却报 0 条关键数据"、手动 Hook 自动驱动界面、枚举失败改按 PID attach、`String.equals` 降噪。
+
+**重构引入问题的修复**
+- v1.3.9：验证闭环 7 处复制粘贴收敛为 `verifyAndRecord()`（纯重构）。
+- v1.3.10：修复该重构遗漏 —— `autoSolveFlag`/`autoSolveBinaryFlag` 只解构 `verifiedFlags` 却引用裸 `flags`，导致 `ReferenceError: flags is not defined`。
+
+### v1.3.5 (2026-10-13) — 结构化知识库 + 解题成功率优化
+- **知识库重构为「结构化 + RAG 友好」**：新增全局检索索引 `AI-SEARCH-INDEX.md` 与速查表 `PAYLOAD-CHEATSHEET.md`
+- **历年逆向题条目库**：新增 `wiki/reverse/`，**43 篇**纯逆向题（从 132 候选筛选、剔除 PWN/杂项），每题带 `attack_chain`（解法链）/`reasoning_chain`（思维链）/`failed_attempts`（避坑）等 YAML meta
+- **修复结构化检索失效**：`wiki_search` 此前只解析 `---` front matter，而条目库把 meta 放在 ` ```yaml ` 围栏里，导致 tags/attack_chain 加权**完全失效**；现兼容两种写法，并新增 `vuln_type`/`contest`/`difficulty` 加权；命中片段优先展示 `one_liner`+`attack_chain` 且保留原文大小写（防止把大小写敏感的 flag 小写化）
+- **系统提示瘦身**：不再逐条列出 43 篇逆向条目路径（交给 `wiki_search` 检索），每次请求省约 1.5k tokens
+- **Frida 能力增强**：吸收两大开源 Frida Hook 项目精华——RegisterNatives 拦截、JCE 通杀自吐、SSL pinning 绕过（Java+native）、脱壳、反检测；兜底模板注入题目情报做针对性 Hook（不再是固定模板）
+- **AI 解题流程优化**：APK/PE/ELF 深度求解改为四阶段流水线提示词；AI 脚本语法错自动重新生成 2 轮
+- **环境自愈**：frida client/server 版本一致性自检、双 adb 互杀重连、装 APK 前 package 服务就绪轮询、GUI 窗口可见性修复（IDA/JEB/Nox）
+- **Frida 枚举失败自动降级为按 PID 附加**：某些模拟器（如 Nox Android9）上 `frida-ps`/`-f`/`-n`/`-F` 会抛 `queryIntentActivities NullPointerException`（**即使 client=server 版本完全一致**，是枚举路径本身的 quirk）——旧逻辑据此判"Frida 不可用"并跳过整个动态阶段。现改为 `adb pidof/ps` 取 PID → `frida -p <PID>` 附加（实测该路径正常），动态阶段继续
+- **隐私与安全**：移除源码/文档中硬编码的私有 AI 中转地址（Base URL 默认留空，未配置时明确报错）；`git-filter-repo` 抹除历史中的私有域名与本机路径；清理构建残留与一次性调试脚本
+- **发现并修复**：`wikiSearch` 结构化 meta 解析失效（见上）；`baseUrl` 为空时由 `Invalid URL` 改为明确的中文配置提示
+
+
+> v1.3.4 及更早版本见 [CHANGELOG-ARCHIVE.md](CHANGELOG-ARCHIVE.md)。

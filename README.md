@@ -36,28 +36,17 @@
 - 显示文件详细信息（MD5、SHA256、大小等）
 
 ### 2. 一键调用逆向工具
-**静态分析工具：**
-- IDA Pro - 静态分析
-- DIE - 查壳工具
-- JEB - Android 分析
-- jadx - DEX→Java 反编译
-
-**脱壳工具：**
-- UPX - 脱壳工具
-- apktool - APK 解包
-
-**Python工具：**
-- pycdc - Python 字节码反编译
-- pycdas - Python 字节码反汇编
+IDA Pro、JEB、jadx（静态分析）、DIE（查壳）、UPX、apktool（脱壳）、pycdc / pycdas（Python 字节码）。路径在设置页配置，本工具负责调度。
 
 ### 3. Frida 自动 Hook
-- 自动生成**针对题目情报**的 Hook 脚本（从静态分析提取类名/native 方法/算法特征注入模板，而非固定模板）
-- **Java 层**：Cipher、MessageDigest、String、SharedPreferences、Base64、`Arrays.equals` 等
-- **Native 层**：主动扫描 Java 声明的 native 方法 + **RegisterNatives 拦截**（动态注册、无 `Java_` 导出时的唯一入口）+ 符号级 `findFunc`
-- **JCE 通杀自吐**：Hook `Cipher.init`/`doFinal`，不追业务代码直接吐算法/密钥/明文
-- **进程内解密出 flag**：把已求得的 key/iv/密文注入 Hook，在 App 进程内直接 decrypt 并 `send('[FLAG]...')`，绕过关卡
-- **反检测**：Frida 文件/端口探测绕过、SSL pinning 绕过（Java 层 + native `SSL_read/write`）、反调试绕过
-- 实时显示 Hook 日志；滚动窗口抓取（每来数据续 60s，绝对上限 10min）；spawn 失败自动回退 attach
+自动生成**针对本题情报**的 Hook 脚本（类名 / native 方法 / 算法特征从静态分析提取，不是固定模板）。
+
+- **Java 层**：Cipher、MessageDigest、String、SharedPreferences、Base64、Arrays.equals
+- **Native 层**：扫描 native 方法 + RegisterNatives 拦截（无 `Java_` 导出时的唯一入口）+ 符号级查找
+- **JCE 通杀**：Hook `Cipher.init`/`doFinal` 直接吐出算法/密钥/明文，不追业务代码
+- **进程内解密**：把求得的 key/iv/密文注入 Hook，在目标进程内 decrypt 后直接取 flag
+- **反检测**：文件/端口探测、SSL pinning、反调试三类绕过
+- spawn 失败自动回退 attach
 
 ### 4. 解密脚本生成
 - 自动生成 Python 解密脚本
@@ -65,39 +54,33 @@
 - RSA 攻击脚手架（小指数/factordb/Wiener/共模）、Z3 约束求解、angr 符号执行模板
 
 ### 5. 反调试绕过
-**Android：**
-- ptrace 检测绕过、Debuggable 标志清除
-- Frida 文件/端口检测绕过、TracerPid 检测绕过
-- System.exit / Process.killProcess / Debug.isDebuggerConnected 绕过
 
-**Windows PE（新增）：**
-- IsDebuggerPresent / CheckRemoteDebuggerPresent / PEB BeingDebugged
-- NtGlobalFlag / NtQueryInformationProcess / OutputDebugString 绕过
+| 平台 | 覆盖 |
+|---|---|
+| Android | ptrace / TracerPid / Debuggable 标志 / Frida 文件与端口探测 / System.exit 与 killProcess |
+| Windows PE | IsDebuggerPresent / CheckRemoteDebuggerPresent / PEB / NtGlobalFlag / NtQueryInformationProcess |
+| APK 重打包 | apktool 解包 → smali patch → 回编 → zipalign + jarsigner 签名，一键批处理 |
 
-**APK 重打包（新增）：**
-- apktool 解包 → smali patch → 回编 → zipalign + jarsigner 签名 一键批处理
+### 6. AI 分析引擎
+兼容 CCSwitch / Claude Code 的 Anthropic `/v1/messages` 接口，SSE 流式输出，可随时中断。
 
-### 6. AI 分析引擎（流式输出）
-- 兼容 CCSwitch / Claude Code 的 Anthropic `/v1/messages` 接口（Base URL 留空则由环境变量或设置页提供）
-- SSE 流式逐字渲染，发送按钮可随时停止 AI 任务
-- 429/5xx 自动退避重试；`max_tokens` 可配置；连接 60s / 空闲 120s 超时
-- **Tool-Use 循环**（最多 25 轮，工具结果自动截断防止撑爆上下文）
-- **分阶段解题提示词**：APK/PE/ELF 深度求解按「①收集代码+数据 → ②定位算法 → ③写脚本本地验证 → ④出结论」四阶段推进，强制"先证据后结论"，禁止跳步臆测
-- **模型分级**（cascade）：先用快速模型初解，未出 flag 再升级思考模型，兼顾速度与成功率
-- AI 系统提示注入真实 MCP 连接状态、已收集结论（避免重复劳动/推翻已验证项）、知识库索引与经验速查；flag 用 `[FLAG]...[/FLAG]` 契约标记便于程序提取
-- **兜底模板针对性**：AI 生成的 Frida 脚本失败时，回退模板会注入题目情报（包名、类名、native 方法、算法特征）做**针对性 Hook**，而非固定模板
+- **Tool-Use 循环**：AI 自主调用工具反复推进，而不是一次性问答
+- **四阶段推进**：①收集代码与数据 → ②定位算法 → ③写脚本本地验证 → ④出结论；先证据后结论，禁止跳步臆测
+- **模型分级**：快速模型初解，未出 flag 再升级思考模型
+- **上下文纪律**：大输出落盘、旧结果压缩、确定性压缩、连续调用拦截、跨轮失败环（详见开发文档）
 
-### 7. Agent Skills 知识库（v1.2 新增）
-- `skills/` 目录 + SKILL.md 格式，兼容 Anthropic Agent Skills / ljagiello·ctf-skills（MIT）
-- 内置 11 个中文方法论文档：`ctf-writeup`（提交级题解写作）、`ctf-reverse-android`、`ctf-reverse-binary`、`ctf-reverse-tooling`（Z3/angr/Unicorn 自动化求解 + 迷宫题）、`ctf-reverse-langs`（Python 字节码/Go/Rust/Lua 语言特定逆向）、`ctf-iot-firmware`（固件提取/解包/QEMU 仿真）、`ctf-crypto-identify`、`ctf-antidebug`、`ctf-frida-dynamic`、`ctf-jsreverse`（JS/Web 逆向五阶段）、`ctf-dispatch`（分流与卡题决策）
-- AI 可通过 `read_skill` 工具按需加载（渐进披露，不占固定提示词）；系统提示只注入技能索引
-- 用户可往 `%APPDATA%/ctf-reverse-tool/skills/` 或应用 `skills/` 目录放自己的 SKILL.md，重启即生效
+### 7. Agent Skills 方法论库
+`skills/` 目录 + SKILL.md 格式，兼容 Anthropic Agent Skills。
 
-### 8. CASE 证据体系 + 验证闭环（v1.2 新增）
-- 拖入文件自动建案：`cases/<题名>_<md5前8>/`，含 `evidence/`（MCP 采集物落盘）、`scripts/`、`timeline.jsonl`（全量日志时间线）、`findings.json`（结构化发现）
-- flag/解题记录双写：原 `solveNotes` 兼容保留，新增结构化 findings（含来源与时间戳）
-- **验证闭环**：AI 按契约输出 `[VERIFY]{"algo","key","ciphertext","expected"}[/VERIFY]` → 工具自动生成 Python 本地复现 → flag 标 ✅已验证 / ⚠️未验证
-- **本地枚举**：AI 给出 `[HYPOTHESES][...][/HYPOTHESES]` 候选组合（算法/密钥/字节序），工具并行枚举全部组合，命中即停；验证失败自动触发，也可聊天输入 `枚举假设` 手动触发
+内置 11 个中文方法论：题解写作、Android、二进制、自动化求解（Z3/angr/Unicorn）、语言特定（Python 字节码/Go/Rust/Lua）、IoT 固件、密码识别、反调试、Frida 动态、JS 逆向、总调度。
+
+AI 通过 `read_skill` 按需加载，系统提示只注入索引。也可往 `%APPDATA%/ctf-reverse-tool/skills/` 放自己的技能，重启生效。
+
+### 8. CASE 证据体系 + 验证闭环
+拖入文件自动建案（`cases/<题名>_<md5前8>/`），采集物、脚本、时间线、结构化发现各自落盘。
+
+- **验证闭环**：AI 输出 `[VERIFY]` 契约 → 工具生成 Python 本地复现 → 标注 ✅已验证 / ⚠️未验证
+- **本地枚举**：AI 给出 `[HYPOTHESES]` 候选组合，工具并行枚举，命中即停
 
 ### 9. WP 双轨（v1.2 新增）
 - 模板轨（`wp` 命令 / "生成WP"按钮）：升级为 findings 驱动——证据清单、flag 验证状态自动填充，无数据才留占位
@@ -122,46 +105,39 @@
 - **两处可放页**：应用内置 `wiki/`（随 exe 分发）+ `%APPDATA%/ctf-reverse-tool/wiki/`（用户自加，重启即生效）；系统提示只注入页面索引，不占固定上下文
 - 设计参考 Des-CTF-Knowledge 知识库的「结构化 meta + attack_chain + 分段索引」范式（**仅借鉴设计思路，纯文本条目，零样本落地**）
 
-### 12. 分组密码识别与变体求解（v1.7 新增）
-- **S 盒知识库**（`electron/crypto-tables.js`）：AES / AES 逆 / SM4 完整 S 盒、AES Rcon、SM4 FK/CK/旋转常量全部固化，扫描器不再散落硬编码
-- **S 盒三级关系判定**：`classifySbox()` 逐个比对标准表，报出 `exact`（完全相同）/ 逐项 `XOR·ADD` / **GF(2) 仿射**（高斯消元求 8×8 可逆矩阵 + 回代验证 256 项），并给出能否精确还原
-- **非线性度指标**：Walsh 谱计算（标定值 AES/SM4 = 112，随机置换 90~96）。**只描述设计强度，不据此劝退**——CTF 大量题目用随机置换当 S 盒，照样能解
-- **结构推理** `inferCipherStructure()`：SM4 CK 固定差分 → SM4 骨架；AES S 盒关系 + Rcon → AES 骨架；未知结构明确说"未知"而不是硬猜
-- **多骨架解密器**：
-  - SM4：枚举 密文 × FK × key × 16 种字节序/状态组合 × 3 种块内排列
-  - AES：pycryptodome 主路径，枚举 key 长度 16/24/32（轮数 10/12/14）× 字节序 × 状态排列
-  - DES/Blowfish：**明确不支持**，不假装能解
-- **诚实边界**：轮数被改 / MixColumns 矩阵被替换的变体不支持，未命中时明确提示"不代表算法认错"
+### 12. 分组密码识别与变体求解
 
-### 13. AI Agent 运行时（v1.7.3 新增）
-借鉴开源项目 openclaude 的上下文管理与可靠性设计（`electron/agent-runtime.js`，参数逐项对照其源码标定）：
+S 盒知识库内置 AES / SM4 完整表（含逆 S 盒、Rcon、FK/CK），扫描器不再散落硬编码。
 
-| 能力 | 机制 |
+- **S 盒关系判定**：exact（完全相同）/ 逐项 XOR·ADD / GF(2) 仿射（高斯消元 + 回代验证）
+- **结构推理**：SM4 的 CK 固定差分、AES 的 S 盒关系 + Rcon → 直接给骨架，未知就说未知
+- **多骨架解密**：SM4 枚举密文 × FK × key × 字节序 × 块内排列；AES 走 pycryptodome 覆盖 16/24/32 字节密钥
+- **诚实边界**：DES/Blowfish 明确不支持；轮数或 MixColumns 被改的变体不支持，未命中时说明"不代表算法认错"
+
+### 13. 长任务可靠性
+
+借鉴 openclaude 的上下文管理设计，解决长任务三个核心痛点：上下文爆掉、原地打转、崩溃丢进度。
+
+| 能力 | 说明 |
 |---|---|
-| **大输出落盘** | 超过 24k 字符的工具输出写盘，回传 **60% 头 + 40% 尾**预览（错误堆栈/flag 常在尾部）。旧实现只截头会丢关键信息 |
-| **旧结果微压缩** | 每轮把旧 `tool_result` 替换为占位串，只保留最近 6 条；**绝不清 `is_error`**（错误是模型纠错的依据） |
-| **确定性上下文压缩** | 超 90k token 触发，保留首条任务 + 最近 10 条 + 抽取的硬事实（偏移/常量/骨架/已排除路线）；熔断 3 次 / 冷却 5 分钟；**不额外调模型** |
-| **连续调用拦截** | `sha256(工具 + 完整入参)` 连续 3 次即拦（不做前缀截断，否则"同文件不同尾部的两次写"会被误判） |
-| **跨轮失败环** | 按 (工具,错误类别) / 类别 / 路径 三键累计；第 2 次提醒、第 3 次判死；NoSymbol 时给出候选函数名 |
-| **工具预检** | 执行前做确定性检查，错误必带"怎么改"：路径不存在给相近文件、IDA 缺参给补救工具建议 |
-| **结构化经验检索** | 按当前题特征词给经验条目打分，只注入命中的 top 6（≤600 字符），**零命中不注入** |
-| **会话续跑** | 追加式 JSONL；恢复时剥离未完成的 `tool_use` / 孤立 `tool_result`（不清洗会直接 400），末尾注入续跑指令 |
-| **API 重试** | 5 次指数退避 + 抖动、优先 `retry-after`、429 上限 3、4xx 不重试 |
+| 大输出落盘 | 超阈值写盘，回传头 60% + 尾 40%（错误堆栈与 flag 常在尾部） |
+| 旧结果微压缩 | 只保留最近几条，**绝不清除错误标记**（错误是模型纠错的依据） |
+| 确定性压缩 | 超阈值触发，保留任务首条 + 最近若干条 + 抽取的硬事实；不额外调模型 |
+| 连续调用拦截 | 相同工具 + 相同入参连续多次即拦，防止原地打转 |
+| 跨轮失败环 | 按工具/错误类别/路径三键累计，第 2 次提醒、第 3 次判死 |
+| 工具预检 | 执行前检查，错误必带"怎么改" |
+| 会话续跑 | JSONL 追加；恢复时清洗未完成的 tool_use / 孤立 tool_result |
 
-**界面**：AI 调用工具时显示实时步骤条（`⏳ 正在反编译 main` → `✅ 1.2s · 3400 字符`），长任务不再"看起来卡死"。
+界面在 AI 调用工具时显示实时步骤条，长任务不再"看起来卡死"。
 
-### 14. 对话滚动与离线可用性（v1.7.3 修复）
-- **修复"流式输出时无法向上滚动"**：旧实现每收到一个 token 就 `scrollTop = scrollHeight`，用户上滑一次立刻被拽回底部。改为 stick-to-bottom（距底 ≤48px 才跟随；滚轮上滑/PageUp/Home 立即脱离），并加"回到底部"悬浮按钮；日志面板同样受保护
-- **图标库本地化**：Font Awesome 全量内置到 `src/vendor/`（约 1MB），CSP 收紧为 `font-src 'self'`。原来依赖 cdnjs，实测超时 16 秒会让 `<link>` 阻塞解析、页面停在 loading（内网/离线环境表现为启动卡死）
-
-### 15. 定向动态调试（v1.8.0 新增）
+### 14. 定向动态调试
 
 **核心原则：动态调试是取证手段，不是探索手段。** 它只回答"这个值运行时是多少"，
 不回答"这段代码在干什么"——后者反编译更便宜、更可复现。
 
 四条入场条件全满足才启动调试器：
 
-1. 有函数清单（`list_funcs` 已调用）
+1. 有函数清单
 2. 候选函数说得清职责（读输入 / 做变换 / 比对 / 解壳）
 3. **写得出调试假设**：断点地址 + 命中后读哪个表达式 + 期望值 + 判定方式
 4. 有办法把流程逼到那里（入口断点 / 输入触发 / 定时触发 / 改 IP）
@@ -170,30 +146,19 @@
 
 | 能力 | 说明 |
 |---|---|
-| 本地 PE | `start` 后停在入口，可直接单步；32 位 WOW64 目标优先 `dbg_write` 改内存 |
-| 远程 ELF | Kali 上跑 IDA 自带 `dbgsrv/linux_server`（不是 gdbserver），自动 suspend + 重定位符号 |
-| 断点 | 变换函数入口/出口 ＞ `memcmp`/`strcmp` 调用点 ＞ 解密循环内部 |
-| 状态机 | `status` 查 STATE：-1 暂停（可单步）/ 0 无进程 / 1 运行中 / 2 已退出 |
+| 本地 PE | start 后停在入口，可直接单步；32 位 WOW64 优先改内存 |
+| 远程 ELF | Kali 上跑 IDA 自带 linux_server，自动 suspend + 重定位符号 |
+| 断点 | 变换函数入口/出口 ＞ memcmp/strcmp 调用点 ＞ 解密循环内部 |
+| 状态机 | -1 暂停（可单步）/ 0 无进程 / 1 运行中 / 2 已退出 |
 | 取数 | 一次命中批量读寄存器 + 关键内存 + 调用栈，不在同一点反复单步 |
-| SMC | 在解密循环**结束后**下断，dump 后对**新字节**重新静态分析 |
+| SMC | 在解密循环结束后下断，dump 后对新字节重新静态分析 |
 
-实测：本地 PE 10/10、远程 ELF 11/11（下断点命中 main → 单步 → 命中 check → 读写内存）。
+实测：本地 PE 10/10、远程 ELF 11/11。
 
-### 16. 知识库真正接进解题链路（v1.8.0 修复）
+### 15. 离线加解密与变换链
 
-知识库最常见的失效不是"文件丢了"，而是**写了但自动预取选不到**。
-
-- 题面出现 SMC / 反调试 / GUI / 时间校验等结构特征时，自动预取向对应方法论页
-- 提示词显式点名 7 篇方法论专页（与 43 篇题库区分），不再只列"另有 40+ 篇"
-- 技能分流表新增"需要运行时值"路由，卡住时有明确去处
-
-实测 5 类真实题面特征均把方法论页排到检索第 1 位，普通算法题不误命中。
-
-### 17. 离线加解密与变换链（v1.8.0 新增）
-
-- `crypto`：AES / SM4 / DES / 3DES / RC4 / TEA 系 / 哈希 / HMAC，数据不出本机
-- `recipe`：CyberChef 式变换链，一次调用跑完 base64→xor→反转→解压，每层给 printable/entropy/hex
-- 标准向量自测 35/35（NIST AES、GB/T SM4、RFC 4231 HMAC）
+- **crypto**：AES / SM4 / DES / 3DES / RC4 / TEA 系 / 哈希 / HMAC，数据不出本机（标准向量 35/35）
+- **recipe**：CyberChef 式变换链，一次调用跑完 base64→xor→反转→解压，每层给 printable/entropy/hex
 
 ## 环境要求
 
@@ -269,7 +234,7 @@ ctf-tool-v2/
 │   ├── ctf-reverse-tooling/   #   Z3/angr/Unicorn 自动化求解 + 迷宫题
 │   ├── ctf-frida-dynamic/ ctf-antidebug/ ctf-jsreverse/
 │   ├── ctf-iot-firmware/ ctf-crypto-identify/ ctf-writeup/
-├── wiki/                 # 可检索结构化知识库（54 页，AI 经 wiki_search/wiki_read 检索）
+├── wiki/                 # 可检索结构化知识库（50 条，AI 经 wiki_search/wiki_read 检索）
 │   ├── AI-SEARCH-INDEX.md      # 全局检索索引（优先读）
 │   ├── PAYLOAD-CHEATSHEET.md   # 逆向套路/Payload/脚本速查
 │   ├── reverse/                # 43 篇历年逆向题（YAML meta：attack_chain/reasoning_chain/failed_attempts）+ _INDEX.md
@@ -381,6 +346,24 @@ frida -H 127.0.0.1:27042 -n "包名或进程名" -l hook.js
 “ELF 一键 AI 分析”需要 **IDA 已打开当前 ELF/PE 文件，并且 IDA MCP 插件正在监听 `http://127.0.0.1:13337/mcp`**。应用现在会完成 MCP 会话握手、读取 `tools/list`、兼容 JSON/SSE 响应并按实际工具名调用。若端口未监听，先在 IDA 中启用 MCP 插件，再重试；日志中应看到“IDA MCP 已连接”和工具发现结果。
 
 Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是两套独立服务，所以 APK 正常不代表 IDA 已启动。
+
+## 开发文档
+
+架构设计、实测报告与优化计划放在 [docs/](docs/)：
+
+| 文档 | 内容 |
+|---|---|
+| [PROJECT-FRAMEWORK.md](docs/PROJECT-FRAMEWORK.md) | 项目框架总览（SSOT） |
+| [AUTOTEST-REPORT.md](docs/AUTOTEST-REPORT.md) | 批量实测报告：104 道题的失败归因与修复 |
+| [FINAL-REPORT.md](docs/FINAL-REPORT.md) | 第三轮实测：rank 1–6 机制落地效果 |
+| [CHALLENGE-LOG.md](docs/CHALLENGE-LOG.md) | 逐题过程记录 |
+| [CTF2-ARENA-8题实战记录.md](docs/CTF2-ARENA-8题实战记录.md) | 8 道题完整 Writeup |
+| [OPTIMIZATION-PLAN.md](docs/OPTIMIZATION-PLAN.md) | 优化与完善计划（含每轮实测数据） |
+| [OPTIMIZATION-PLAN-V3.md](docs/OPTIMIZATION-PLAN-V3.md) | 优化计划 V3 |
+| [PLAN-autonomous-solving.md](docs/PLAN-autonomous-solving.md) | 从辅助解题到自主解题的路线图 |
+| [PLAN-cipher-identification.md](docs/PLAN-cipher-identification.md) | 分组密码识别能力规划 |
+| [PLAN-openclaude-adoption.md](docs/PLAN-openclaude-adoption.md) | agent 运行时优化计划 |
+| [CHANGELOG-ARCHIVE.md](docs/CHANGELOG-ARCHIVE.md) | v1.4.0 及更早的更新日志 |
 
 ## 更新日志
 
@@ -644,77 +627,7 @@ AI 的推理叙述常输出英文（"I'll start by analyzing this PE file…"）
 - AI Tool-Use 提示词加预算纪律（60 轮上限 + 冲刺指令）与「伴生文本必须 read_file 读全文」纪律。
 - max_tokens 截断自动续写；IDA `-o` 参数坑规避（同目录建库）。
 
-### v1.4.0 (2026-10-14) — 修复 Frida Hook 证据被噪音淹没 / 降噪失效 / 经验跨阶段丢失
-
-审查两次真实运行日志（一次 APK 自动解题、一次 Frida Hook）发现三个真实缺陷，全部修复。
-
-**一、Frida 输出"真证据被噪音挤出 AI 结论窗口"（高危，可能漏 flag）**
-
-Hook 输出回灌 AI 前，旧逻辑把 `[DATA]`/`[FLAG]` 真证据与 `[HIT]` 噪音**混在一个池子**里再 `slice(-120)`。而噪音（可达上百条）通常出现在真证据**之后** → 尾部 120 条几乎全是噪音，**真证据被整段丢弃**。
-本次实测复现：131 条关键行里 2 条真证据 + 129 条噪音，`slice(-120)` 后**真证据 0 条保留**。
-（这次 flag 没丢，是因为另有一条独立逻辑直接收割 `[FLAG]` 行兜底；但若 flag 只以 `[DATA]`/普通解密输出形式出现，就会彻底漏掉。）
-
-**修复**：改为**分级保留** —— 高价值行（`[DATA]`/`[FLAG]`/flag 形态/加解密实参/SP 读写）**全部保留、不参与截断**；仅对 `[HIT]` 噪音限量（保留末尾 40 条作线索）。实测：真证据 ✅必留。
-
-**二、Frida `String.equals` 降噪形同虚设（129 条 `[HIT]` 全是误报）**
-
-两条根因：
-- 关键词正则 `/flag|ctf|key|secret|token|pass|stage/i` **命中了应用包名本身** —— 本题包名 `com.nctf.hookmysecret` 同时含 `ctf` 与 `secret`，导致每条涉及包名的比较都被判"有意义"而刷屏；
-- 兜底规则"两串 ≥6 字且长度差 ≤2"太松，把 `include==ViewStub`、`pathInterpolator==linearInterpolator`、`res/*.xml` 等框架/资源串全部放行。
-
-**修复**：改为"**高熵优先 + 噪音形态黑名单**"——① 高熵串（flag 形态/长 hex/base64）**先**保留（`flag==flag` 这种最终校验不能被误杀）；② 双方均为噪音形态（包名/资源/绝对路径/算法名/框架词）排除；③ 语义词命中且非噪音形态才打印。修复前后对比：**129 条噪音 → 0 条**（降噪 100%），5 个正例（flag、hex key、password 对）全部保留。
-
-**三、经验"跨阶段丢失"（前序暂存的经验永远进不了库）**
-
-一次 APK 解题里，阶段2（初步分析）AI 产出的经验被"暂存"，阶段2.5（Tool-Use）解出 flag 后**只入库了它自己那条** —— 阶段2 那条滞留在内存 `pendingExperience`，既不入库、也不持久化（关应用即丢）。且该暂存区从不随换题清空，会跨题残留。
-
-**修复**：① 换题（加载新文件）时清空 `pendingExperience`；② 解题成功时把**本题前序暂存的全部经验**一并入库（含防御性去重）。实测：阶段2 暂存 1 条 + 阶段2.5 成功 1 条 → 库内 2 条、暂存清空、重复幂等。
-
-> 回归：修复项 #1 真证据必留 ✅ ｜ #2 降噪 128/128 且正例 5/5 ✅ ｜ #3 经验接管与幂等 ✅ ｜ 原有回归（经验流 6/6、相似度 5/5、finalizeSolve 契约 2/2、求解路径审计 10/10）无回退 ｜ `node --check` 全过。
-
-### v1.3.14 (2026-10-14) — 当日汇总
-
-> 本条目汇总 **2026-10-14 当天**的全部更新（原按里程碑分为 v1.3.6 ~ v1.3.14 多次提交，现合并为一个版本）。
-
-**解题结构根治**
-- **"三件套"收口**：把"验证闭环 + 经验沉淀"从散落 9 处的两步复制粘贴，收口为单一入口 `finalizeSolve(text, {source})` —— 内含「验证闭环 → 失败自动枚举 → 登记 flag → 解题成功则经验自动入库」，从结构上杜绝"修一处漏一处"。
-- **5 类"只指路"入口改为真正解题**：`.dex` / `.jar` / `.class` / Mach-O / `.luac` 此前只启动外部工具或打印指引（AI 不参与），现全部接入 AI 求解闭环 —— DEX/JAR 走 **JEB 优先**（不可用降级 jadx）、Mach-O 走 IDA、`.luac` 走字节/常量抽取。分流表 12/12 均路由到真实求解器。
-- **修复跨文件 MCP 缓存泄漏**：`analyzeJavaLike` 未清缓存、`state._keyClassesByContent` 从不重置 → 连解多题时上一题数据会串进本题提示词/类选择；现随 `clearMcpCache()` 一并清理。
-
-**经验与知识库"真正帮到解题"**
-- **经验自动入库 + 真去重**：解题成功即写入（无需手动「保存」）；去重从"按整行含日期比对（换日必重复）"改为**与日期无关的内容级去重**（精确 + 二元组相似度≥0.78 + 子串判定）。经验注入补全到所有求解路径。
-- **修复题库 meta 解析 bug**：`wiki_search` 解析 YAML 的 `m` 标志令 `$` 匹配行尾，导致**列表写法**的 `attack_chain`/`failed_attempts` 被解析为空 —— 43 篇题库仅 13 篇解法链可用。修复后 **13 → 38 篇**，检索摘要升级为 **要点 + 解法链 + 避坑**。
-- **主路径自动预取**：新增 `prefetchKnowledge()`，调用 AI 前按题面特征词检索题库并把攻略内联进提示词（已覆盖 APK/PE/ELF、PYC、Web/JS、DEX/JAR、Lua）。
-
-**PYC 逆向从"无解"到可用**
-- 多后端自动回退：**pycdc → xdis/pydisasm → 原生 marshal+dis → 纯字节串扫描**（永不空手）；内置零依赖助手 `electron/pyc_decompile.py`。
-- 求解器兼容 `xor` **单字节整数密钥**（`xor_key=199`）、`custom` 返回 `str`/`list[int]` 归一化。
-
-**验证闭环与动态 Hook 通用性**
-- **修复 IDA 采集 0 反编译（最严重）**：`window.electronApi` 拼写错被空 catch 吞掉，实测反编译 **0 → 19 个**。
-- 验证闭环不再"没契约就放弃"：`synthesizeHypotheses()` 自合成候选矩阵（≤24 组）。
-- AES/DES-CBC **缺 IV/错 IV** 不再必然失败（枚举全零/首块/前置 IV + 回退 ECB）；口令 key 自动派生（MD5/SHA-256/零填充）。
-- 多候选密文**交叉校验 + 自动裁决**（IDA `xrefs_to` 判"哪条被校验函数引用"），防"变种题"陷阱。
-- 动态 Hook：修复"抓到输出却报 0 条关键数据"、手动 Hook 自动驱动界面、枚举失败改按 PID attach、`String.equals` 降噪。
-
-**重构引入问题的修复**
-- v1.3.9：验证闭环 7 处复制粘贴收敛为 `verifyAndRecord()`（纯重构）。
-- v1.3.10：修复该重构遗漏 —— `autoSolveFlag`/`autoSolveBinaryFlag` 只解构 `verifiedFlags` 却引用裸 `flags`，导致 `ReferenceError: flags is not defined`。
-
-### v1.3.5 (2026-10-13) — 结构化知识库 + 解题成功率优化
-- **知识库重构为「结构化 + RAG 友好」**：新增全局检索索引 `AI-SEARCH-INDEX.md` 与速查表 `PAYLOAD-CHEATSHEET.md`
-- **历年逆向题条目库**：新增 `wiki/reverse/`，**43 篇**纯逆向题（从 132 候选筛选、剔除 PWN/杂项），每题带 `attack_chain`（解法链）/`reasoning_chain`（思维链）/`failed_attempts`（避坑）等 YAML meta
-- **修复结构化检索失效**：`wiki_search` 此前只解析 `---` front matter，而条目库把 meta 放在 ` ```yaml ` 围栏里，导致 tags/attack_chain 加权**完全失效**；现兼容两种写法，并新增 `vuln_type`/`contest`/`difficulty` 加权；命中片段优先展示 `one_liner`+`attack_chain` 且保留原文大小写（防止把大小写敏感的 flag 小写化）
-- **系统提示瘦身**：不再逐条列出 43 篇逆向条目路径（交给 `wiki_search` 检索），每次请求省约 1.5k tokens
-- **Frida 能力增强**：吸收两大开源 Frida Hook 项目精华——RegisterNatives 拦截、JCE 通杀自吐、SSL pinning 绕过（Java+native）、脱壳、反检测；兜底模板注入题目情报做针对性 Hook（不再是固定模板）
-- **AI 解题流程优化**：APK/PE/ELF 深度求解改为四阶段流水线提示词；AI 脚本语法错自动重新生成 2 轮
-- **环境自愈**：frida client/server 版本一致性自检、双 adb 互杀重连、装 APK 前 package 服务就绪轮询、GUI 窗口可见性修复（IDA/JEB/Nox）
-- **Frida 枚举失败自动降级为按 PID 附加**：某些模拟器（如 Nox Android9）上 `frida-ps`/`-f`/`-n`/`-F` 会抛 `queryIntentActivities NullPointerException`（**即使 client=server 版本完全一致**，是枚举路径本身的 quirk）——旧逻辑据此判"Frida 不可用"并跳过整个动态阶段。现改为 `adb pidof/ps` 取 PID → `frida -p <PID>` 附加（实测该路径正常），动态阶段继续
-- **隐私与安全**：移除源码/文档中硬编码的私有 AI 中转地址（Base URL 默认留空，未配置时明确报错）；`git-filter-repo` 抹除历史中的私有域名与本机路径；清理构建残留与一次性调试脚本
-- **发现并修复**：`wikiSearch` 结构化 meta 解析失效（见上）；`baseUrl` 为空时由 `Invalid URL` 改为明确的中文配置提示
-
-
-> v1.3.4 及更早版本见 [CHANGELOG-ARCHIVE.md](CHANGELOG-ARCHIVE.md)。
+> v1.4.0 及更早版本见 [CHANGELOG-ARCHIVE.md](docs/CHANGELOG-ARCHIVE.md)。
 
 ## 许可证
 

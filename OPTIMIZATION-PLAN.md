@@ -113,6 +113,58 @@
 
 全量：`node tests/run_all.js` → 单元测试 **72/72**、回归题集通过、exit 0。
 
+## 一之四、2026-10-20 三续：`gui_input` 自动喂输入（GUI 题动态调试闭环）
+
+**动机**：上一节实测发现 GUI 程序启动后阻塞在消息循环，`continue` 8 轮 IP 全程停在系统 DLL，
+`dbg_run_to(校验地址)` **永远等不到**（校验只在按钮点击 `WM_COMMAND` 时执行）。
+因此 GUI 题的动态调试必须先把输入喂进去。
+
+新增 `electron/gui-input.js` 与 AI 工具 `gui_input`：
+
+| 参数 | 作用 |
+|---|---|
+| `list_only` | 只列窗口与控件（hwnd / class / ctrl id / text），先用它定位目标 |
+| `pid` / `title_contains` | 定位目标窗口（pid 优先） |
+| `text` + `control_id` | 填入文本；不指定控件则取第一个 `Edit` |
+| `submit` | 点击按钮（默认 true；优先匹配 OK/确定/确认/提交/验证/注册/check/submit/login/confirm） |
+| `send_message` | 改用 `SendMessageTimeout`（默认 false，即 `PostMessage`） |
+
+**关键技术点**（都是实测踩出来的）：
+
+1. **必须用 `PostMessage`，不能用 `SendMessage`**：进程被调试器挂起时 `SendMessage` 会阻塞到超时。
+   `PostMessage` 只是排队，`continue` 后才处理——正好符合"先投递、再放行、然后断点命中"。
+2. **`WM_SETTEXT` 的 `lParam` 用字符串重载**：这是系统消息（`< WM_USER`），跨进程由系统封送，
+   不能传指针。
+3. **`BM_CLICK` 而不是手拼 `WM_COMMAND`**：让按钮自己向父窗口发 `BN_CLICKED`，更接近真实点击。
+4. **PowerShell 脚本必须是纯 ASCII**：Windows PowerShell 5.1 读无 BOM 的 `.ps1` 按系统 ANSI
+   代码页解码（中文系统 GBK），UTF-8 中文注释会被拆成乱码 → `Add-Type` 编译失败
+   （实测 stderr 全是 `???`）。中文说明只放 JS 侧 `description`，按钮匹配用 unicode 转义拼。
+5. **输出用 `[Console]::Out.Write` 单行写完**：管道/`Out-String` 会按控制台宽度折行并截断。
+6. **解析不能 `lastIndexOf('{')`**：会命中 JSON 内部最后一个嵌套对象，截出的片段必然解析失败
+   （枚举多个窗口时必现）。改为按行从后往前找第一个能整体解析的 JSON。
+
+**验证结果**：
+
+| 用例 | 结果 |
+|---|---|
+| `list_only`（当前进程） | `ok=true`，Win32 链路可执行 |
+| `list_only`（全窗口） | **枚举到 32 个真实窗口**（含任务栏/开始按钮/桌面），解析正确 |
+| 不存在的 PID | `NO_WINDOW` 优雅失败，不崩溃 |
+| 单元测试 | `test_gui_input.js` **41/41** |
+
+**诚实边界（已写进工具描述，避免 AI 空转）**：
+- 只对**标准控件**（Edit/Button）有效；自绘 UI、Qt 自绘窗口、游戏引擎不吃这套。
+- 这是模拟用户操作，程序逻辑一步不少跑，不是跳过 UI 的捷径。
+- 本机沙箱**没有可用桌面**（`spawn` GUI 程序报"无效类"），因此**注入动作未能在真实
+  CTF 样本上端到端验证**——已验证的是 Win32 调用链、窗口/控件枚举、参数解析与错误处理。
+  真实注入需要在有桌面会话的环境跑一次。
+
+**提示词同步**：`smcBlock` 后追加「动态调试决策顺序」：
+离线 Unicorn 优先 → GUI 题先 `gui_input` → 无交互程序（ELF/gdbserver）才直接 `run_to` →
+本地启动失败先 `clear_remote`。
+
+全量：`node tests/run_all.js` → 单元测试 **73/73**、回归题集通过、exit 0。
+
 **上一轮遗留的两项也已验证**：
 - P1 契约自动枚举 → 演进为 rank 5 的"契约驱动 verified + 重试循环"，本轮 xxor 实测转成功
 - P2 中间值自动推进 → 已落地（`electron/intermediate-advance.js`，17 项单测 + 3 项 E2E）

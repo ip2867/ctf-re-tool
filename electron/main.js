@@ -3267,6 +3267,7 @@ function toolLabel(name, input) {
     case 'remote_exec': return '远程执行 ' + short(i.host || 'local', 10) + ' ' + short(i.command, 40);
     case 'traffic_extract': return '解析流量 ' + short(i.path ? path.basename(i.path) : '', 36);
     case 'recipe': return '变换链 ' + (i.auto ? '自动解码' : ((i.recipe || []).map(x => (x && x.op) || '?').join(' → ') || '空'));
+    case 'gui_input': return 'GUI 喂输入' + (i.list_only ? '（列控件）' : (i.text ? ' ' + short(i.text, 24) : ''));
     case 'jeb_get_manifest': return 'JEB 读取 Manifest';
     case 'jeb_get_class_decompiled': return 'JEB 反编译 ' + short(i.class_name, 36);
     case 'jeb_get_method_decompiled': return 'JEB 反编译方法 ' + short(i.class_name + '::' + (i.method_name || ''), 36);
@@ -6091,7 +6092,7 @@ function parseTextToolCalls(rawText) {
     'jeb_get_exported_activities', 'jeb_get_all_classes', 'jeb_get_class_methods',
     'ida_decompile', 'ida_list_functions', 'ida_find_strings', 'ida_get_xrefs', 'ida_get_bytes',
     'ida_list_globals', 'ida_disasm', 'ida_dbg', 'ida_dbg_mem',
-    'remote_exec', 'traffic_extract', 'recipe',
+    'remote_exec', 'traffic_extract', 'recipe', 'gui_input',
     'browser_search', 'browser_open', 'run_command', 'run_python', 'adb_command', 'frida_hook',
     'read_skill', 'wiki_search', 'wiki_read', 'burp_get_history', 'burp_get_message', 'burp_call',
     'switch_to_next_stage'
@@ -6402,6 +6403,14 @@ function precheckToolCall(name, input) {
     }
     if (Array.isArray(i.recipe) && i.recipe.some(x => !x || !x.op)) {
       return 'recipe 的每一项都必须有 op 字段（如 {op:"xor", key:"0a"}）。';
+    }
+  }
+  if (name === 'gui_input') {
+    if (!i.list_only && (!i.pid && !i.title_contains)) {
+      return '需要 pid 或 title_contains 定位窗口。先用 gui_input({list_only:true}) 查看有哪些窗口与控件。';
+    }
+    if (!i.list_only && (i.text == null || String(i.text) === '')) {
+      return '需要 text（要喂给输入框的内容）。';
     }
   }
   if (name === 'ida_list_globals') {
@@ -7493,6 +7502,34 @@ function getToolDefinitions() {
         required: []
       }
     },
+    // ========== GUI 输入注入（动态调试前置） ==========
+    {
+      name: "gui_input",
+      description:
+        "给正在运行的 GUI 程序**喂输入并触发按钮**，用于动态调试对话框类题目。\n" +
+        "为什么需要：CrackMe 这类题的校验只在按钮点击（WM_COMMAND）时执行；" +
+        "程序启动后阻塞在消息循环，dbg_run_to(校验地址) 会永远等不到。必须先把输入喂进去。\n" +
+        "推荐流程：ida_dbg(action='start') → gui_input(list_only:true 看控件) → " +
+        "gui_input(text+submit) → ida_dbg(action='continue') → 断点命中后 regs/mem_read。\n" +
+        "⚠️ 只对**标准控件**（Edit/Button）有效；自绘 UI、Qt 自绘窗口、游戏引擎不吃这套。" +
+        "这是模拟用户操作，程序逻辑一步不少跑。\n" +
+        "实现细节：默认用 PostMessage（进程被调试器挂起时 SendMessage 会阻塞到超时）；" +
+        "需要同步效果可设 send_message:true（内部用 SendMessageTimeout，带 800ms 上限）。",
+      input_schema: {
+        type: "object",
+        properties: {
+          pid: { type: "number", description: "目标进程 PID（list_only:true 时可看到）" },
+          title_contains: { type: "string", description: "窗口标题包含的子串（与 pid 二选一，pid 优先）" },
+          text: { type: "string", description: "要填入输入框的文本" },
+          control_id: { type: "number", description: "指定控件 ID（GetDlgCtrlID）；不填则取第一个 Edit" },
+          submit: { type: "boolean", description: "是否点击按钮（默认 true；按 OK/确定/提交/验证 优先匹配）" },
+          list_only: { type: "boolean", description: "只列出窗口与控件，不注入（先用它确定 pid/控件）" },
+          send_message: { type: "boolean", description: "用 SendMessageTimeout 而非 PostMessage（默认 false）" },
+          send_timeout_ms: { type: "number", description: "send_message 时的超时（默认 800ms）" }
+        },
+        required: []
+      }
+    },
     // ========== 浏览器 MCP 工具 ==========
     {
       name: "browser_search",
@@ -7922,6 +7959,22 @@ async function executeToolCall(toolName, input) {
           lines.push('\n=== 最终输出（可打印文本）===\n' + r.output.text.slice(0, 8000));
         }
         return lines.join('\n');
+      }
+
+      case 'gui_input': {
+        // 动态调试前置：给 GUI 程序喂输入并触发按钮。
+        // 默认 PostMessage —— 进程被调试器挂起时 SendMessage 会阻塞到超时（实测）。
+        const { runGuiInput } = require('./gui-input');
+        const r = runGuiInput(input, { tempDir: app.getPath('temp') });
+        if (!r.ok) {
+          const detail = [
+            `gui_input 失败（${r.stage || 'unknown'}）: ${r.error}`,
+            r.script_stderr ? `脚本 stderr: ${String(r.script_stderr).slice(0, 400)}` : '',
+            r.script_stdout_tail ? `脚本输出尾部: ${String(r.script_stdout_tail).slice(0, 400)}` : '',
+          ].filter(Boolean).join('\n');
+          throw new ToolCallError(detail);
+        }
+        return JSON.stringify(r);
       }
 
       case 'traffic_extract': {

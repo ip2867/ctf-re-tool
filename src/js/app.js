@@ -9036,6 +9036,20 @@ ${smc.summary}
       } else {
         smcBlock = `\n## SMC/自修改特征\n未发现自修改特征（无 W+X 节、代码节不可写、无可疑导入）。**不建议动态调试**，按静态路线推进。\n`;
       }
+      // 动态调试的决策顺序必须写清楚，否则 AI 会在 GUI 题上盲目 run_to 挂死。
+      smcBlock += `\n## 动态调试决策顺序（GUI/ELF 通用）
+**先问：不动态能不能拿到答案？**
+1. **离线模拟优先**：校验若是纯计算（不依赖 GetTickCount/文件/网络），用静态映射 + Unicorn（py_eval）直接跑，最省预算。
+2. **GUI 对话框题必须先喂输入**：CrackMe 这类校验只在按钮点击（WM_COMMAND）时执行，
+   程序启动后阻塞在消息循环，\`dbg_run_to(校验地址)\` 会**永远等不到**——
+   实测 8 轮 continue，IP 全程停在系统 DLL。正确顺序：
+   \`ida_dbg(start)\` → \`gui_input(list_only:true)\` 看控件 → \`gui_input(text, submit:true)\` → \`dbg_continue\` → 断点命中。
+   注意：\`gui_input\` 只对**标准控件**（Edit/Button）有效；自绘 UI / Qt 自绘 / 游戏引擎不适用。
+3. **无交互程序（ELF/控制台）**：可直接 \`run_to\`；ELF 需要 Kali 上跑 gdbserver，
+   用 \`ida_dbg(start, mode:"remote", remote_host:"<kali ip>")\`。
+4. **本地启动报 Failed to start debugger**：先 \`ida_dbg(action:"clear_remote")\` —— IDA 的远程调试配置是
+   全局持久的，残留的 host/pass/port 会让本地 start_process 恒返回 -1。
+\n`;
       const h = smcHash.hash || {};
       if (!h.hasTarget) {
         hashBlock = `\n## 摘要目标\n文件内无 32 位 hex 摘要目标 → MD5 可能用于 KDF/掩码派生，不要做 MD5(候选)==目标 爆破。\n`;

@@ -77,8 +77,12 @@ console.log('B) 真实 PE 载荷仍应判定为 loader');
 
 console.log('C) 真实样本：编码表存在时不应把整个扫描结论变成"本层为 loader"');
 {
-  const sample = 'E:/ctf/pratice/ai/kanxue-ctf-gxustudent/8262c97c-2d27-40c0-96fe-34abb71d65b5_x/kanxue-ctf-gxustudent/kanxue-ctf-gxustudent.exe';
-  if (!fs.existsSync(sample)) { console.log('  (样本缺失，跳过)'); }
+  // 真样本校验改为可选：node tests/test_encoding_table_not_payload.js --real <path>
+  // CI 不依赖本机样本目录（干净 checkout 没有 E: 盘）。
+  const realIdx = process.argv.indexOf('--real');
+  const sample = realIdx >= 0 ? String(process.argv[realIdx + 1] || '') : '';
+  if (!sample) { console.log('  (未提供 --real <path>，跳过真样本校验)'); }
+  else if (!fs.existsSync(sample)) { console.log('  (样本缺失，跳过)'); }
   else {
     const r = scanCryptoFingerprints(sample);
     ok(!!r.success, '扫描成功');

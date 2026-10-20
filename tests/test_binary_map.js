@@ -150,7 +150,8 @@ console.log('\n[4] filterFunctionsInImage：把不属于本文件的函数剔掉
 
 console.log('\n[5] decideIdaAction：四态决策');
 {
-  const target = 'E:\\ctf\\pratice\\ai\\cnbragon\\KanxueCTF2016Keygenme.exe';
+  // 只用路径字符串验证归一化/比较逻辑，不读文件（不得依赖本机样本目录）
+  const target = 'C:\\work\\samples\\KanxueCTF2016Keygenme.exe';
   const a = M.decideIdaAction({ listening: false });
   ok(a.action === 'launch', '未监听 → launch', a.action);
 
@@ -160,7 +161,7 @@ console.log('\n[5] decideIdaAction：四态决策');
 
   const c = M.decideIdaAction({
     listening: true,
-    identity: { success: true, input_path: 'E:\\ctf\\other\\CrackMe.exe' },
+    identity: { success: true, input_path: 'C:\\work\\other\\CrackMe.exe' },
     targetPath: target,
   });
   ok(c.action === 'reload' && c.reason === 'mismatch', '路径不一致 → reload', JSON.stringify(c));

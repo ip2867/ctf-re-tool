@@ -33,6 +33,9 @@ const FAILURE_PREFIXES = [
   '未在文件中找到可提取的载荷', '不支持的编码方式', '未找到自定义分组密码结构',
   '无结构推理输入', '未找到知识页',
   '阶段接力失败', '未知工具', '文件不存在', '参数错误',
+  // 远程执行 / Burp 的固定失败前缀：靠行首字符串判定失败，不登记就会 is_error=false
+  'REMOTE_TIMEOUT', 'REMOTE_AUTH', 'REMOTE_REFUSED', 'REMOTE_UNCONFIGURED',
+  'BURP_DOWN',
 ];
 
 // 前缀表列不全时兜底：行首 16 字符内出现「失败/错误」且紧跟冒号的，是工具报错而不是分析结论。

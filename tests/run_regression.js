@@ -11,6 +11,7 @@
 // 回归题集的价值一半在正例，一半在负例——负例就是"不误导 AI"的护栏。
 const fs = require('fs'), p = require('path');
 const { scanCryptoFingerprints } = require('./scanner_loader.js');
+const pcap = require('../electron/pcap.js');
 
 const root = p.join(__dirname, 'regression');
 let pass = 0, fail = 0, skipped = 0;
@@ -25,6 +26,41 @@ for (const caseId of fs.readdirSync(root).sort()) {
   const expPath = p.join(dir, 'expect.json');
   if (!fs.existsSync(expPath)) { console.log(`⚠️  ${caseId}: 缺 expect.json，跳过`); continue; }
   const exp = JSON.parse(fs.readFileSync(expPath, 'utf8'));
+
+  // kind:'pcap' —— 抓包不是"伴随文件"：它本身就是该 case 的被测对象。
+  // 这类 case 不依赖 .gitignore 排除的题目二进制（pcap 已入库），因此必须真的跑，不能跳过。
+  if (exp.kind === 'pcap' && exp.pcap) {
+    const pcapFile = p.join(dir, exp.pcap.file || 'evidence.pcap');
+    if (!fs.existsSync(pcapFile)) {
+      console.log(`❌ ${caseId}: 缺少 pcap 文件（${exp.pcap.file}）`);
+      fail++; rows.push([caseId, 'FAIL', '缺少 pcap']);
+      continue;
+    }
+    const problems = [];
+    let r;
+    const t0 = Date.now();
+    try { r = pcap.analyzePcap(pcapFile); } catch (err) {
+      console.log(`❌ ${caseId}: pcap 解析抛错 ${err.message}`);
+      fail++; rows.push([caseId, 'ERROR', err.message]);
+      continue;
+    }
+    const ms = Date.now() - t0;
+    if (exp.pcap.magic && r.magic !== exp.pcap.magic) problems.push(`magic ${r.magic} ≠ ${exp.pcap.magic}`);
+    if (exp.pcap.packets != null && r.packets !== exp.pcap.packets) problems.push(`packets ${r.packets} ≠ ${exp.pcap.packets}`);
+    if (exp.pcap.flows != null && r.flows.length !== exp.pcap.flows) problems.push(`flows ${r.flows.length} ≠ ${exp.pcap.flows}`);
+    if (exp.pcap.http != null && r.http !== exp.pcap.http) problems.push(`http ${r.http} ≠ ${exp.pcap.http}`);
+    for (const port of (exp.pcap.ports || [])) {
+      if (!r.flows.some(f => f.ports.includes(port))) problems.push(`缺少端口 ${port}`);
+    }
+    const okPcap = problems.length === 0;
+    if (okPcap) pass++; else fail++;
+    rows.push([caseId, okPcap ? 'PASS' : 'FAIL', problems.join('; ') || `${ms}ms`]);
+    console.log(`${okPcap ? '✅' : '❌'} ${caseId.padEnd(34)} ${String(ms).padStart(6)}ms  ` +
+      `kind=pcap packets=${r.packets} flows=${r.flows.length} http=${r.http}` +
+      (okPcap ? '' : `\n     └─ ${problems.join('; ')}`));
+    continue;
+  }
+
   const mainPath = p.join(dir, exp.main || fs.readdirSync(dir).find(f => f !== 'expect.json'));
   // 题目二进制不入库（体积/版权）：本地未准备时跳过，不算失败。
   if (!fs.existsSync(mainPath)) {

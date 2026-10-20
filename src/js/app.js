@@ -711,6 +711,8 @@ async function analyzeFile(filePath, opts = {}) {
         state.caseName = cs.caseName;
         state.findings = newFindings(infoResult, typeResult.fileType);
         await persistFindings();
+        // 主进程没有 state.caseDir：run_python 的 cwd 与产物登记都靠这份副本
+        try { await window.electronAPI.setCaseDir(cs.caseDir); } catch (e2) { /* 可选 */ }
         addLog('info', `CASE 目录: ${cs.caseDir}`);
       }
     } catch (e) { /* CASE 失败不阻塞主流程 */ }
@@ -3097,6 +3099,31 @@ async function autoAnalyze() {
   addLog('info', '智能分析模式（基于ctf-agent）');
   addLog('info', '========================================');
 
+  // 能力分诊（一次决策）：路由依据是文件能力/容器，不是扩展名或用户口令。
+  // 旧实现把 UNKNOWN 无条件送 analyzeBIN（Kali 固件流程），而 pcap 样本恰好落进 UNKNOWN。
+  // decideRoute 在主进程（与 detectCapabilities 同源），渲染层只消费结论。
+  let capRoute = '';
+  try {
+    const cr = await window.electronAPI.detectCapabilities(state.currentFile, state.fileType);
+    if (cr && cr.success) {
+      state._capabilities = cr.capabilities;
+      capRoute = cr.route || '';
+      addLog('info', `[分诊] capabilities=${JSON.stringify(cr.capabilities)} → route=${capRoute}`);
+    }
+  } catch (e) { /* 能力分诊失败则退回按类型分派 */ }
+
+  if (capRoute === 'traffic' || capRoute === 'burp') {
+    // pcap：纯二进制 → 本地解析（不启动 Burp）；含 HTTP → 走 Burp 历史
+    await analyzePcapFile(state.currentFile, { useBurp: capRoute === 'burp' });
+    return;
+  }
+  if (capRoute === 'extract' && !['APK', 'ZIP', 'XLSX', 'JAR'].includes(state.fileType)) {
+    // 容器/文件系统（squashfs/cramfs/ubifs/ext…）：本地优先解包，不先打 Kali
+    addLog('info', '[分诊] 检测到容器/文件系统能力 → 本地优先解包');
+    await analyzeBinContainer(state.currentFile);
+    return;
+  }
+
   // 根据文件类型执行不同的分析流程
   switch (state.fileType) {
     case 'APK':
@@ -3201,13 +3228,28 @@ async function autoAnalyze() {
       await analyzeXMLText();
       break;
     }
-    case 'BIN':
-    case 'UNKNOWN':
-      // 尝试用Kali分析（固件/bin文件）
+    case 'PCAP': {
+      // detect-file-type 的 PCAP 分支命中时直接落到这里（分诊失败也不能回退到 Kali）
+      await analyzePcapFile(state.currentFile, { useBurp: !!(state._capabilities && state._capabilities.httpHint) });
+      break;
+    }
+    case 'WASM': {
+      // detect-file-type 会产出 WASM（main.js 的 0061736D 分支），但这里此前没有对应 case，
+      // 于是落到 default 走"未知类型"提示。Wasm 模块是结构化二进制：
+      // 走本地探测（magic/strings/熵），Kali 预检不可达时不会发远程命令。
+      addLog('info', '[WASM] WebAssembly 模块：本地探测 + AI 分析（不走 Burp）');
       await analyzeBIN();
       break;
+    }
+    case 'UNKNOWN': {
+      // 未知二进制：有 pcap/容器/文件系统能力时上面的分诊已接管；
+      // 走到这里说明确实没有可识别能力 → 本地探测 + Kali 预检（不可达则纯本地兜底）。
+      // （detect-file-type 从不产出 'BIN'，此前的 case 'BIN' 是死分支，已删除。）
+      await analyzeBIN();
+      break;
+    }
     default:
-      addLog('warning', '不支持的文件类型，尝试用Kali分析...');
+      addLog('warning', '不支持的文件类型，尝试本地探测 + Kali 预检...');
       await analyzeBIN();
   }
 }
@@ -3961,14 +4003,17 @@ async function collectIdaNativeIntel() {
   // 导致 fnText 为空 → 一个函数都反编译不了（本题「未取到反编译结果」的真因）。
   let fnText = '';
   for (const [tool, args] of [
-    ['list_funcs', { queries: {} }],                       // 全量函数列表（ida-pro-mcp 实际工具；{} 才返回全部，勿加 count:0）
+    // 分页版本：list_funcs 默认 count=100，只取一页会漏掉大量函数（SO 常上千个函数）
+    ['list_funcs', { paged: true }],
     ['func_query', { queries: {} }],
-    ['list_functions', { queries: {} }],                   // 旧/其他实现兼容
+    ['list_functions', { paged: true }],                   // 旧/其他实现兼容
     ['export_funcs', { addrs: [] }],                       // 万不得已（通常为空）
     ['survey_binary', {}]                                  // 最后兜底：至少给元数据/函数名
   ]) {
     try {
-      const r = await window.electronAPI.idaMcpCall(tool, args);
+      const r = args && args.paged
+        ? await window.electronAPI.idaMcpCallPaged(tool, {})
+        : await window.electronAPI.idaMcpCall(tool, args);
       if (r && r.success && r.result) {
         const txt = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
         // 判定"拿到了函数清单"：出现 sub_/Java_/函数名或 addr+name 结构
@@ -4063,7 +4108,8 @@ async function collectIdaNativeIntel() {
       const m = String(d.code || '').match(/\b(?:off|byte|word|dword|qword|unk|flt|dbl|stru|algn)_[0-9A-Fa-f]{4,}\b/g) || [];
       for (const s of m) refNames.add(s);
     }
-    const gRes = await window.electronAPI.idaMcpCall('list_globals', { queries: {} });
+    // 分页拿全量：strip 过的 so 常上千个全局符号，默认 100 条会漏掉真正的大表
+    const gRes = await window.electronAPI.idaMcpCallPaged('list_globals', {});
     const globals = (gRes && gRes.success && Array.isArray(gRes.result)) ? gRes.result : [];
     if (refAddrs.size || refNames.size || globals.length) {
       const byAddr = globals
@@ -4722,35 +4768,162 @@ async function localFirmwareProbe(filePath) {
   return r;
 }
 
+// PCAP 分析：纯二进制流量走本地解析（不启动 Burp）；含 HTTP 时才走 Burp 历史。
+// 为什么分开：样本（plutochat）是 31337 端口上的二进制协议、http=0，
+// 强行拉 Burp 只会白等 150s 且拿不到任何有用数据。
+async function analyzePcapFile(filePath, opts) {
+  const o = opts || {};
+  addLog('info', `[流量] 解析 pcap：${filePath}`);
+  let r = null;
+  try {
+    r = await window.electronAPI.trafficExtract({ path: filePath, protocol: 'auto', max_flows: 20 });
+  } catch (e) {
+    addLog('warning', '[流量] 解析失败: ' + e.message);
+  }
+  if (!r || !r.success) {
+    addLog('error', '[流量] 无法解析: ' + ((r && r.error) || '未知错误'));
+    addSystemMessage(`**❌ 流量解析失败**\n\n${(r && r.error) || '未知错误'}`);
+    return;
+  }
+  addLog('success', `✅ pcap 解析完成：packets=${r.packets} flows=${r.flows} http=${r.http}${r.outPath ? `（完整结果: ${r.outPath}）` : ''}`);
+  await caseAddEvidence('pcap_flows', 'pcap 流量解析', String(r.result || ''), 'txt')
+    .catch(() => null);
+
+  if (!o.useBurp) {
+    addSystemMessage(`**📦 流量已解析（二进制协议）**\n\n共 ${r.packets} 包 / ${r.flows} 条流，HTTP 流 ${r.http} 条。\n已交给 AI 分析。`);
+  } else {
+    addSystemMessage(`**🌐 流量含 HTTP**\n\n共 ${r.packets} 包 / ${r.flows} 条流。尝试读取 Burp 历史补充上下文...`);
+  }
+
+  const prompt = `我在解一道 CTF 流量分析题，已用工具解析抓包。
+
+文件路径：${filePath}
+${o.useBurp ? '（该抓包含 HTTP 流量；如需代理侧上下文可用 burp_get_history 查询）' : '（该抓包是二进制协议，没有 HTTP；不要当 Web 题处理）'}
+
+## 解析结果
+${String(r.result || '').slice(0, 12000)}
+
+## 你的任务
+1. 从每条流的 hex 预览里识别协议结构（长度前缀/魔数/字段边界）；
+2. 写 run_python 脚本解析载荷、还原被传输的数据；
+3. 明确说明每一步的证据（偏移/字节），不要凭猜；
+4. 输出契约：flag 单独一行 \`[FLAG]flag内容[/FLAG]\`，并附 \`${VERIFY_CONTRACT}\`。`;
+
+  try {
+    state.aiBusy = true;
+    beginStreamMessage();
+    const result = await window.electronAPI.claudeChat([{ role: 'user', content: prompt }], buildSystemPrompt());
+    endStreamMessage();
+    if (result && result.success && result.text) {
+      state.lastAiText = result.text;
+      addSolveNote('求解结果(流量)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 3000));
+      await finalizeSolve(result.text, { source: 'pcap' });
+      addSystemMessage(`**🎯 流量分析结果**\n\n${result.text.slice(0, 4000)}`);
+    } else {
+      addLog('warning', '[流量] AI 未返回内容: ' + ((result && result.error) || '未知'));
+    }
+  } catch (e) {
+    try { endStreamMessage(); } catch (e2) { }
+    addLog('error', '[流量] AI 分析异常: ' + e.message);
+  } finally {
+    state.aiBusy = false;
+  }
+}
+
+// 容器/文件系统（squashfs/cramfs/ubifs/jffs2/ext…）：本地优先。
+// 本机 binwalk 损坏、Kali 常不可达，所以这里只做纯本地的 magic/strings/熵采集，
+// 并把"本地兜底不能解包"的能力边界写进 AI 上下文，而不是先去打 3 条 SSH 超时。
+async function analyzeBinContainer(filePath) {
+  addLog('info', `[容器] 本地分析文件系统镜像：${filePath}`);
+  const probe = await localFirmwareProbe(filePath);
+  if (!probe || probe.bytes == null) {
+    addLog('error', '[容器] 本地采集失败: ' + ((probe && probe.note) || '未知'));
+    addSystemMessage(`**❌ 容器分析失败**\n\n${(probe && probe.note) || '本地采集不可用'}`);
+    return;
+  }
+  addLog('success', `[容器] 本地采集完成：${probe.bytes} 字节，magic=${probe.magic}`);
+  await caseAddEvidence('firmware_probe', '容器本地采集（magic/strings/熵）',
+    `magic: ${probe.magic}\n\nstrings:\n${probe.strings || '（无）'}\n\nentropy:\n${probe.entropy || '（无）'}`, 'txt')
+    .catch(() => null);
+
+  const prompt = `我在解一道 CTF 固件/文件系统镜像题，工具已在本地完成字节级采集。
+
+文件路径：${filePath}
+大小：${probe.bytes} 字节
+头部 16 字节：${probe.magic}
+
+## 本地采集（magic / strings / 高熵块）
+### strings
+${String(probe.strings || '（未找到 ≥6 字节的可打印字符串）').slice(0, 6000)}
+
+### 高熵块（>7.2/8，通常是压缩/加密/内嵌文件）
+${String(probe.entropy || '（无）').slice(0, 3000)}
+
+## 能力边界（必须如实说明）
+本地兜底**只能给 magic/strings/熵，不能解包**（本机 binwalk 不可用、Kali 未连接时不要假装解包成功）。
+若需要解包：优先写 \`run_python\` 按已知文件系统格式解析，或用远程 \`remote_exec({host:"kali", command:"binwalk -e ..."})\`（失败会返回 REMOTE_* 前缀）。
+
+## 你的任务
+1. 按 magic 判定文件系统/容器类型；
+2. 从 strings 里找 flag/密钥/提示；
+3. 需要结构解析时写 run_python（先小范围验证，再全量）；
+4. 输出契约：flag 单独一行 \`[FLAG]flag内容[/FLAG]\`，并附 \`${VERIFY_CONTRACT}\`。`;
+
+  state.aiBusy = true;
+  beginStreamMessage();
+  try {
+    const result = await window.electronAPI.claudeChat([{ role: 'user', content: prompt }], buildSystemPrompt());
+    endStreamMessage();
+    if (result && result.success && result.text) {
+      state.lastAiText = result.text;
+      addSolveNote('求解结果(容器)', String(result.text).replace(/\s+/g, ' ').trim().slice(0, 3000));
+      await finalizeSolve(result.text, { source: 'container' });
+      addSystemMessage(`**🎯 容器分析结果**\n\n${result.text.slice(0, 4000)}`);
+    } else {
+      addLog('warning', '[容器] AI 未返回内容: ' + ((result && result.error) || '未知'));
+    }
+  } catch (e) {
+    try { endStreamMessage(); } catch (e2) { }
+    addLog('error', '[容器] AI 分析异常: ' + e.message);
+  } finally {
+    state.aiBusy = false;
+  }
+}
+
 async function analyzeBIN() {
-  addLog('info', '执行固件分析流程（Kali 优先，失败回退本地采集）...');
+  addLog('info', '执行固件分析流程（Kali 预检 → 可达才远程，否则本地兜底）...');
 
-  // 第1步：测试Kali连接
-  addLog('info', '[1/4] 测试Kali连接...');
-  await testKaliConnection();
+  // 第0步：远程预检（必须在发任何远程命令之前）。
+  // 实测 Kali 不可达时，file/binwalk/strings 各 60s → 白等 3 分钟。
+  // 探活结果缓存 120s（同一轮内不重复探）；探活走 checkPort，可按端口探测注入。
+  const pre = await kaliPreflight();
+  addLog(pre.action === 'remote' ? 'info' : 'warning', pre.log);
 
-  // 第2步：使用file命令检查文件类型
-  addLog('info', '[2/4] 检查文件类型...');
-  let fileInfo = await execKaliCommand(`file ${shq(state.currentFile)}`);
-  if (fileInfo) {
-    addLog('info', '文件类型: ' + fileInfo.trim());
+  let fileInfo = null, binwalkInfo = null, stringsInfo = null;
+  if (pre.action === 'remote') {
+    // 第2步：使用file命令检查文件类型
+    addLog('info', '[2/4] 检查文件类型...');
+    fileInfo = await execKaliCommand(`file ${shq(state.currentFile)}`);
+    if (fileInfo) {
+      addLog('info', '文件类型: ' + fileInfo.trim());
+    }
+
+    // 第3步：使用binwalk分析
+    addLog('info', '[3/4] 使用binwalk分析固件...');
+    binwalkInfo = await execKaliCommand(`binwalk ${shq(state.currentFile)}`);
+    if (binwalkInfo) {
+      addLog('info', 'binwalk分析结果:\n' + binwalkInfo);
+    }
+
+    // 第4步：提取字符串
+    addLog('info', '[4/4] 提取字符串...');
+    stringsInfo = await execKaliCommand(`strings ${shq(state.currentFile)} | head -50`);
+    if (stringsInfo) {
+      addLog('info', '提取的字符串:\n' + stringsInfo);
+    }
   }
 
-  // 第3步：使用binwalk分析
-  addLog('info', '[3/4] 使用binwalk分析固件...');
-  let binwalkInfo = await execKaliCommand(`binwalk ${shq(state.currentFile)}`);
-  if (binwalkInfo) {
-    addLog('info', 'binwalk分析结果:\n' + binwalkInfo);
-  }
-
-  // 第4步：提取字符串
-  addLog('info', '[4/4] 提取字符串...');
-  let stringsInfo = await execKaliCommand(`strings ${shq(state.currentFile)} | head -50`);
-  if (stringsInfo) {
-    addLog('info', '提取的字符串:\n' + stringsInfo);
-  }
-
-  // ===== Kali 全空 → 本地兜底采集（不能把"四个空结果"丢给 AI）=====
+  // ===== Kali 跳过/全空 → 本地兜底采集（不能把"四个空结果"丢给 AI）=====
   let localProbe = null;
   if (!fileInfo && !binwalkInfo && !stringsInfo) {
     addLog('warning', '[固件] Kali 不可用，改用本地字节级采集（magic/strings/熵块）...');
@@ -4764,6 +4937,11 @@ async function analyzeBIN() {
       addLog('error', '[固件] 本地采集也失败: ' + localProbe.note);
     }
   }
+  // 预检 skip 时把能力边界写进上下文（本地兜底不能解包）
+  const kaliLocalNote = pre.action === 'skip'
+    ? `\n## Kali 不可达（已跳过远程命令）\n${pre.plan ? pre.plan.note : '本地兜底只能给 magic/strings/熵，不能解包。'}\n`
+      + `需要解包时：写 run_python 按格式自行解析，或调用 remote_exec({host:"kali", command:"..."})（会明确返回 REMOTE_* 错误）。\n`
+    : '';
 
   addSystemMessage(`**固件分析流程已启动（Kali模式）**
 
@@ -4783,6 +4961,7 @@ ${stringsInfo ? '```\n' + stringsInfo.substring(0, 500) + '...\n```' : '等待�
     `## 文件信息`, fileInfo ? fileInfo.trim() : '（file 命令无输出）',
     ``, `## binwalk 分析`, binwalkInfo ? binwalkInfo.slice(0, 8000) : '（无输出）',
     ``, `## strings（前 50 行）`, stringsInfo ? stringsInfo.slice(0, 8000) : '（无输出）',
+    kaliLocalNote,
   ].join('\n');
 
   addLog('info', '[5/5] 把 Kali 采集结果交给 AI 求解...');
@@ -4843,15 +5022,23 @@ ${sideFiles.length ? `\n## 同包伴生文件（用 read_file 读取）\n${sideF
 // ========== Web/JS 逆向自动化（像 IDA/JEB：自动拉起 Burp/浏览器 → 连 MCP → AI 分析） ==========
 
 // 代理历史空判断：兼容 JSON 数组/对象包装/常见空标记（供 analyzeWebJS 轮询复用）
+// ⚠️ 必须把**工具错误串**也判成"空"：Burp MCP 的失败走 result.isError + content[].text，
+// 主进程抛错后这条文本会以字符串形式回来；旧实现只认 "无/null/empty" 开头，
+// 于是 "Field 'offset' is required ..." 被判为非空 → 流程误以为已有流量、
+// 跳过拉起代理浏览器，并把报错当代理历史喂给 AI（实测 2026-10-20）。
+const BURP_ERROR_RE = /^(Error:|MCP_|BURP_DOWN|Burp MCP调用失败|Tool '.*' requires extension|Field '.*' is required|Failed to |Invalid |Unknown tool)/i;
 function burpHistoryLooksEmpty(t) {
   if (!t) return true;
   const s = String(t).trim();
   if (s.length < 8) return true;
   if (/^(无|null|empty|not found|没有)/i.test(s)) return true;
+  if (BURP_ERROR_RE.test(s)) return true;
   try {
     const j = JSON.parse(s);
     if (Array.isArray(j)) return j.length === 0;
     if (j && typeof j === 'object') {
+      // 结构化错误（{error:...} / {isError:true}）不是历史
+      if (j.isError === true || (j.error != null && j.error !== false && j.error !== 0)) return true;
       for (const key of ['entries', 'history', 'data', 'messages', 'results']) {
         if (Array.isArray(j[key])) return j[key].length === 0;
       }
@@ -4859,6 +5046,12 @@ function burpHistoryLooksEmpty(t) {
     }
   } catch (e) { /* 非JSON，按非空处理 */ }
   return false;
+}
+
+// 判断一条 Burp 返回是否为错误文本（供 analyzeWebJSCore 在"连接成功"判定处使用）
+function burpResultIsError(t) {
+  const s = String(t || '').trim();
+  return BURP_ERROR_RE.test(s);
 }
 
 async function analyzeWebJS(targetUrl) {
@@ -5013,9 +5206,11 @@ async function analyzeWebJSCore(targetUrl) {
     const localWeb = state.currentFile && /\.(html?|js|mjs)$/i.test(state.currentFile);
     if (localWeb) {
       addLog('warning', '[Web/JS] Burp 不可用，但目标是本地文件 → 跳过抓包，直接做文件级 JS 逆向');
+      addLog('warning', 'Burp 未就绪，已回退本地文件分析');
       addSystemMessage('**ℹ️ Burp 未就绪**\n\n目标是本地 HTML/JS 文件，不需要抓包——已自动切换为**文件级静态分析**。');
       return await analyzeLocalWebFile();
     }
+    addLog('error', 'Burp 未就绪，Web 流量无法读取');
     addSystemMessage('**❌ Burp 启动超时**\n\n请手动启动 Burp 并确认 MCP Server 扩展 Enabled，然后重新触发。');
     return;
   }
@@ -7802,7 +7997,7 @@ ${mcpCache.nativeIntel.globals && mcpCache.nativeIntel.globals.length ? `\n## SO
 - 常量数据：读 \`strings.xml\` / \`resources.arsc\`（\`bash\`/\`read_file\`）、\`SharedPreferences\` 键名。
 - **native SO（关键，最易漏）**：若含 \`lib/*.so\` 且校验在 native，**必须**采到：
   - 目标函数**反编译代码**（\`ida_decompile\`：JNI 入口 + 它调用的 sub_* ）；
-  - 函数**引用的常量表**（\`ida_list_globals\` + \`ida_get_bytes\`，密钥/密文/S盒/VM字节码都在 .data/.rodata）；
+  - 函数**引用的常量表**（\`ida_list_globals\`（自动分页）+ \`ida_get_bytes\`，密钥/密文/S盒/VM字节码都在 .data/.rodata）；
   - 关键字符串（\`ida_find_strings\`：flag/key/nonce/salt）。
   - ⚠️ **只给代码不给常量表 = 数学上无解**：算法认得出，但 key/密文拿不到，算不出 flag。
 
@@ -8000,12 +8195,14 @@ async function autoSolveBinaryFlag(fileType) {
   //（Disguise 实测：初次采集只得 sub_413CB0/sub_413CD0/sub_414060 三个，导致后续
   //  "选主体函数/读常量表"全部落空）。函数数过少时等待重试，给 IDA 分析时间。
   try {
-    let funcsResult = await window.electronAPI.idaMcpCall('list_functions', { queries: {} });
+    // 插件 list_funcs 默认 count=100 → 必须分页拿全量（否则函数表残缺，
+    // 函数选择/按地址读表/缺口计算全部建立在截断表上）。
+    let funcsResult = await window.electronAPI.idaMcpCallPaged('list_functions', { queries: {} });
     let funcs = (funcsResult && Array.isArray(funcsResult.result)) ? funcsResult.result : [];
     for (let retry = 0; retry < 4 && funcs.length < 8; retry++) {
       addLog('info', `函数列表仅 ${funcs.length} 个（IDA 可能仍在自动分析），等待 5s 后重试…`);
       await new Promise(r => setTimeout(r, 5000));
-      const r2 = await window.electronAPI.idaMcpCall('list_functions', { queries: {} });
+      const r2 = await window.electronAPI.idaMcpCallPaged('list_functions', { queries: {} });
       const f2 = (r2 && Array.isArray(r2.result)) ? r2.result : [];
       if (f2.length > funcs.length) { funcs = f2; funcsResult = r2; }
     }
@@ -8033,7 +8230,7 @@ async function autoSolveBinaryFlag(fileType) {
 
     if (funcsResult && funcsResult.success) {
       analysisData.functions = funcs;
-      addLog('success', `✅ 已获取函数列表（${funcs.length} 个）`);
+      addLog('success', `✅ 已获取函数列表（${funcs.length} 个${funcsResult.paged ? '，分页' : ''}）`);
 
       // 识别关键函数（语义加权：加解密/编解码/校验/VM 派发等，避免漏掉 vm_operad 这类核心函数）
       if (funcs.length) {
@@ -8075,7 +8272,22 @@ async function autoSolveBinaryFlag(fileType) {
 
   // 4. 反编译其他关键函数（语义加权挑选，含 VM/派发/解释器类函数）
   if (analysisData.functions && Array.isArray(analysisData.functions)) {
-    const keyFuncs = selectKeyFunctions(analysisData.functions, 6);
+    // 强制通道：入口/对话框过程及其 1 跳 callee 先入队，**不占 6 个名额**
+    let forced = [];
+    try {
+      forced = await collectForcedFuncs(analysisData.functions, window.electronAPI.idaMcpCall, 12);
+      if (forced.length) addLog('info', `[采集] 强制加入入口/Dialog 邻接函数: ${forced.join(', ')}`);
+    } catch (e) { addLog('warning', '[采集] 强制函数通道失败（不阻塞）: ' + e.message); }
+
+    const picked = selectKeyFunctions(analysisData.functions, 6);
+    const seenNames = new Set();
+    const keyFuncs = [];
+    for (const f of [...forced, ...picked]) {
+      const n = String((f && f.name) || f || '');
+      if (!n || seenNames.has(n)) continue;
+      seenNames.add(n);
+      keyFuncs.push(f);
+    }
     // thunk 兜底（加壳/混淆 PE 实测）：若入选者多为 j_xxx 跳转桩（说明函数表被 ILT 噪声占满），
     // 追加"体积最大的 sub_* 主体函数"——真逻辑在这些无语义命名的函数里（Disguise：sub_415D00/sub_411401）。
     const nameOfF = f => String((f && f.name) || f || '');
@@ -8109,13 +8321,34 @@ async function autoSolveBinaryFlag(fileType) {
       for (const n of extra) keyFuncs.push(n);
     }
 
+    // 单函数上限 60000（"轮函数不截断"），同时受全局预算约束：
+    // 6 个 30000 字符的函数各放宽 60000 会撑爆上下文，必须按入选顺序累加并降级。
+    let funcBudgetLeft = MAX_TOTAL_FUNC_CHARS;
+    let funcBudgetCompressed = 0;
     for (const func of keyFuncs) {
       try {
         const funcName = (func && typeof func === 'object') ? String(func.name || '') : String(func || '');
         if (!funcName || funcName === '[object Object]') continue;
         const funcResult = await window.electronAPI.idaMcpCall('decompile', { address: funcName });
-        const code = idaPickCode(funcResult && funcResult.result);
-        if (code) {
+        const rawCode = idaPickCode(funcResult && funcResult.result);
+        if (rawCode) {
+          let code = rawCode;
+          if (rawCode.length > funcBudgetLeft) {
+            // 超预算：降级为 head/tail 片段，且分配量不超过剩余预算（总长才能真的 ≤ 预算）
+            const allot = Math.max(0, Math.min(3000, funcBudgetLeft));
+            if (allot < 500) {
+              // 预算耗尽：该函数完全进不了上下文，同样计入"被预算压缩"
+              funcBudgetCompressed++;
+              addLog('info', `[采集] ${funcName} 跳过（函数预算已用尽）`);
+              continue;
+            }
+            code = buildFuncBody(funcName, rawCode, allot);
+            funcBudgetCompressed++;
+            addLog('info', `[采集] ${funcName} 超出函数预算，降级为 head/tail 片段（${allot} 字符）`);
+          } else if (rawCode.length > MAX_SINGLE_FUNC_CHARS) {
+            code = buildFuncBody(funcName, rawCode, MAX_SINGLE_FUNC_CHARS);
+          }
+          funcBudgetLeft -= code.length;
           analysisData.otherFunctions.push({
             name: funcName,
             code,
@@ -8129,52 +8362,127 @@ async function autoSolveBinaryFlag(fileType) {
         // 忽略单个函数的失败
       }
     }
+    if (funcBudgetCompressed) addLog('info', `[采集] 函数预算 ${MAX_TOTAL_FUNC_CHARS} 字符，压缩 ${funcBudgetCompressed} 个`);
   }
 
   // 5. 读取反编译里引用到的全局数据表
   //    VM 字节码 / 密文表 / S 盒 / 密钥常量通常放在全局数组里，只给代码 AI 无法还原。
   //    2.exe 的 src_（0x403040，114 个 int32）就是 VM 程序本体，缺它必解不出。
+  //    ⚠️ 关键表常是 dword 数组（lane 布局），符号名未必是 global；旧实现只把 refs 与
+  //    list_globals 的名字求交集，cnbragon 只命中 1 个 thunk。改为**按地址**收集。
   try {
+    const im = await window.electronAPI.fileImageMap(state.currentFile);
+    const imageMap = (im && im.success && im.map) ? im.map : null;
+    let globals = [];
+    try {
+      // list_globals 只用于补名字（分页拿全量；插件默认 100 条）
+      const gRes = await window.electronAPI.idaMcpCallPaged('list_globals', {});
+      globals = (gRes && gRes.success && Array.isArray(gRes.result)) ? gRes.result : [];
+    } catch (e) { /* 无 IDA 时按文本地址照常读 */ }
+    const nameToAddr = new Map();
+    for (const g of globals) {
+      if (g && g.name && g.addr) nameToAddr.set(String(g.name), String(g.addr));
+    }
+
+    const texts = [analysisData.mainCode]
+      .concat(analysisData.otherFunctions.map(f => f.code))
+      .filter(Boolean);
+    let regions = collectGlobalRegions(texts, imageMap, { resolver: (n) => nameToAddr.get(n) || '' });
+
+    // 反向补充：list_globals 里名字/地址命中 refAddrs 的条目（refs 是 IDA 直接给出的地址）
     const refAddrs = idaCollectRefAddrs([
       { refs: analysisData.mainRefs },
       ...analysisData.otherFunctions.map(f => ({ refs: f.refs }))
     ]);
+    const have = new Set(regions.map(r => r.addr.toLowerCase()));
     if (refAddrs.size) {
-      const gRes = await window.electronAPI.idaMcpCall('list_globals', { queries: {} });
-      const globals = (gRes && gRes.success && Array.isArray(gRes.result)) ? gRes.result : [];
       const byAddr = globals
         .map(g => ({ addr: String((g && g.addr) || ''), name: String((g && g.name) || ''), val: parseInt((g && g.addr) || '', 16) }))
         .filter(g => Number.isFinite(g.val))
         .sort((a, b) => a.val - b.val);
-      const wanted = [];
       for (let i = 0; i < byAddr.length; i++) {
         const g = byAddr[i];
-        if (!refAddrs.has(g.addr.toLowerCase())) continue;
+        if (!refAddrs.has(g.addr.toLowerCase()) || have.has(g.addr.toLowerCase())) continue;
         const next = byAddr[i + 1];
         let size = next ? next.val - g.val : 256;
-        // 大表（VM 字节码/密文表/S盒）常 >8KB：上限放宽到 64KB（超过则截，而非一刀切退 256）
         if (!(size > 0)) size = 256;
         else if (size > 65536) size = 65536;
-        wanted.push({ addr: g.addr, name: g.name, size });
+        regions.push({ addr: g.addr, size, stride: 0, referrers: [g.name].filter(Boolean) });
+        have.add(g.addr.toLowerCase());
       }
-      if (wanted.length) {
-        const bRes = await window.electronAPI.idaMcpCall('get_bytes', {
-          regions: wanted.map(w => ({ addr: w.addr, size: w.size }))
+    }
+    regions = regions.slice(0, 24);
+
+    if (regions.length) {
+      const bRes = await window.electronAPI.idaMcpCall('get_bytes', {
+        regions: regions.map(w => ({ addr: w.addr, size: w.size }))
+      });
+      if (bRes && bRes.success && Array.isArray(bRes.result)) {
+        analysisData.globals = bRes.result.map((r, i) => {
+          const want = regions[i] || {};
+          const hex = String((r && r.data) || '');
+          const raw = hex.replace(/0x/gi, '').replace(/[^0-9a-fA-F]/g, '');
+          const bytes = Buffer.from(raw, 'hex');
+          const stride = want.stride || (bytes.length ? probeStride(bytes, 0, bytes.length) : 0);
+          return {
+            name: (want.referrers && want.referrers[0]) || (r && r.addr) || 'global',
+            addr: (r && r.addr) || want.addr || '',
+            size: want.size || 0,
+            stride,
+            referrers: want.referrers || [],
+            data: hex
+          };
         });
-        if (bRes && bRes.success && Array.isArray(bRes.result)) {
-          analysisData.globals = bRes.result.map((r, i) => ({
-            name: (wanted[i] && wanted[i].name) || (r && r.addr) || 'global',
-            addr: (r && r.addr) || (wanted[i] && wanted[i].addr) || '',
-            data: (r && r.data) || ''
-          }));
-          addLog('success', `✅ 已读取 ${analysisData.globals.length} 个被引用的全局数据表: ${analysisData.globals.map(g => g.name).join(', ')}`);
-        }
-      } else {
-        addLog('info', '未发现需要读取的全局数据表');
+        addLog('success', `✅ 已按地址读取 ${analysisData.globals.length} 个全局数据表`
+          + `（stride/referrers 已标注）: ${analysisData.globals.map(g => g.name).join(', ')}`);
       }
+    } else {
+      addLog('info', '未发现需要读取的全局数据表');
     }
   } catch (e) {
     addLog('warning', '读取全局数据失败: ' + e.message);
+  }
+
+  // 5.5 可执行节缺口 + 续块（函数表没覆盖到的代码不能被当死代码）
+  try {
+    const im = await window.electronAPI.fileImageMap(state.currentFile);
+    const imageMap = (im && im.success && im.map) ? im.map : null;
+    const fnWithBodies = (analysisData.functions || []).map(f => {
+      const name = String((f && f.name) || '');
+      const body = name === analysisData.mainName ? analysisData.mainCode
+        : (analysisData.otherFunctions.find(x => x.name === name) || {}).code;
+      return Object.assign({}, f, body ? { code: body } : {});
+    });
+    const gapInfo = computeExecGaps(fnWithBodies, imageMap, {});
+    analysisData.execGaps = gapInfo;
+    addLog('info', gapInfo.log);
+
+    const targets = [];
+    for (const g of gapInfo.gaps.slice(0, 8)) targets.push({ addr: g.addr, source: 'gap' });
+    for (const c of gapInfo.continuation.slice(0, 8)) targets.push({ addr: c.addr, source: 'jmp-target' });
+
+    const blocks = [];
+    let insnBudget = 400;
+    for (const t of targets) {
+      if (insnBudget <= 0) break;
+      const n = Math.min(64, insnBudget);
+      try {
+        const d = await window.electronAPI.idaMcpCall('disasm', { addr: t.addr, max_instructions: n, offset: 0 });
+        const text = (d && d.success) ? (typeof d.result === 'string' ? d.result : JSON.stringify(d.result)) : '';
+        if (!text) continue;
+        blocks.push(`### ${t.addr}（来源: ${t.source}）\n\`\`\`\n${text.slice(0, 4000)}\n\`\`\``);
+        insnBudget -= n;
+      } catch (e) { /* 单段反汇编失败不阻塞 */ }
+    }
+    analysisData.execFlowText = blocks.length
+      ? `## 间接流/续块（不得当死代码）\n以下地址不在任何函数内，可能由间接跳转/VM 尾声到达；**不得**因为"不在函数表里"就当死代码或填充物。\n\n`
+        + blocks.join('\n\n')
+        + (gapInfo.continuation.length
+          ? `\n\n⚠️ 续块标记（continuation-missing）：${gapInfo.continuation.map(c => `${c.from} → ${c.addr}`).join('、')}`
+          : '')
+      : '';
+  } catch (e) {
+    addLog('warning', '[缺口] 计算失败（不阻塞）: ' + e.message);
   }
 
   // 前置短路：IDA 一点有效数据都没拿到时不要调 AI——模型只能凭空编造 flag，
@@ -8352,12 +8660,13 @@ async function autoSolveBinaryFlag(fileType) {
 
   try {
 
-    // 构建其他函数的代码
+    // 构建其他函数的代码（采集阶段已按 buildFuncBody 截断/预算；此处不再二次硬切，
+    // 否则"省略"标记后面的 tail 会被再次切掉，且偏移区间与实际内容不再对应）
     let otherFuncsText = '';
     if (analysisData.otherFunctions && analysisData.otherFunctions.length > 0) {
       otherFuncsText = '\n## 其他关键函数\n';
       for (const func of analysisData.otherFunctions) {
-        otherFuncsText += `\n### ${func.name}\n${func.code ? String(func.code).substring(0, 6000) : '暂无'}\n`;
+        otherFuncsText += `\n### ${func.name}\n${func.code ? String(func.code) : '暂无'}\n`;
       }
     }
 
@@ -8705,6 +9014,34 @@ ${constraint}`;
       }
     }
   } catch (e) { /* 扫描失败不阻塞 */ }
+
+  // SMC 特征 + 摘要目标存在性（只读文件字节）。两者都必须给**双向出口**：
+  //   · 有 W+X 节 ≠ 必须动态调试（CrackMe2 的 .WProtec 存在，但算法静态可判）
+  //   · 没有摘要目标时，不要做 MD5(候选)==目标 爆破
+  let smcBlock = '';
+  let hashBlock = '';
+  try {
+    const im = await window.electronAPI.fileImageMap(state.currentFile);
+    const smcHash = await window.electronAPI.analyzeSmc(state.currentFile);
+    if (smcHash && smcHash.success) {
+      const smc = smcHash.smc || {};
+      if (smc.hasSignal) {
+        smcBlock = `\n## SMC/自修改特征
+${smc.summary}
+**先走静态/离线路线**（直接反汇编该节、读解包后字节、离线模拟）；只有在静态路线拿不到解包后字节时，
+才建议动态：\`ida_dbg: start → bp_add(写节循环) → run_to/continue → ida_dbg_mem read → 重新反编译\`。
+⚠️ **W+X ≠ 必须动态调试**；W+X 节存在但算法可静态判定时（如常量/结构已经明确），不要为了"看一眼运行时"烧预算。
+⚠️ 若 ret 目标不是调用方压入的返回地址，按间接分支继续执行，**不得判定函数返回**；必须报告总指令数与最后 8 条 PC。\n`;
+      } else {
+        smcBlock = `\n## SMC/自修改特征\n未发现自修改特征（无 W+X 节、代码节不可写、无可疑导入）。**不建议动态调试**，按静态路线推进。\n`;
+      }
+      const h = smcHash.hash || {};
+      if (!h.hasTarget) {
+        hashBlock = `\n## 摘要目标\n文件内无 32 位 hex 摘要目标 → MD5 可能用于 KDF/掩码派生，不要做 MD5(候选)==目标 爆破。\n`;
+      }
+    }
+  } catch (e) { /* 特征采集失败不阻塞 */ }
+
   const prompt = `我在解一道 CTF ${fileType || '二进制'} 题，静态固定清单分析未得出 flag。请**使用工具**自主深入分析并求出 flag。
 ${algHint}${platDesc}${failHint}${excludedHint}${stageBlock}
 ${state._autoSm4Tried ? `\n## ⚠️ 工具已替你试过的路线（不要原样重复）
@@ -8716,9 +9053,11 @@ ${state._autoSm4Tried ? `\n## ⚠️ 工具已替你试过的路线（不要原�
 文件路径：${state.currentFile}
 ## 已获取的函数列表（节选）
 ${fnSummary}
-${analysisData.mainCode ? `\n## 入口函数反编译\n\`\`\`c\n${String(analysisData.mainCode).slice(0, 4000)}\n\`\`\`` : ''}
-${analysisData.otherFunctions && analysisData.otherFunctions.length ? `\n## 已反编译的其它函数\n${analysisData.otherFunctions.map(f => `### ${f.name}\n\`\`\`c\n${String(f.code).slice(0, 3000)}\n\`\`\``).join('\n\n')}` : ''}
+${analysisData.mainCode ? `\n## 入口函数反编译\n\`\`\`c\n${buildFuncBody(analysisData.mainName || 'main', analysisData.mainCode, 12000)}\n\`\`\`` : ''}
+${analysisData.otherFunctions && analysisData.otherFunctions.length ? `\n## 已反编译的其它函数\n${analysisData.otherFunctions.map(f => `### ${f.name}\n\`\`\`c\n${f.code}\n\`\`\``).join('\n\n')}` : ''}
 ${analysisData.strings ? `\n## 关键字符串\n${typeof analysisData.strings === 'string' ? analysisData.strings.slice(0, 2000) : JSON.stringify(analysisData.strings).slice(0, 2000)}` : ''}
+${analysisData.execFlowText || ''}
+${smcBlock}${hashBlock}
 ${sideFilesBlock}
 
 ## 你必须严格按 4 阶段推进（每阶段先出证据）
@@ -8737,7 +9076,7 @@ ${sideFilesBlock}
    - 分析过程中**任何时刻**都可以重新调用（例如换到提取出的新文件、或怀疑前面的结论）。
 
 ① **收集（代码+数据缺一不可）**：用 \`ida_decompile\` 反编译入口与关键函数；**务必**用
-   \`ida_get_bytes\`（读任意地址原始字节，hex+ASCII）+ \`ida_list_globals\` 取出被引用的**常量表/vtable 内容**
+   \`ida_get_bytes\`（读任意地址原始字节，hex+ASCII）+ \`ida_list_globals\`（**自动分页**，默认每页 500 条；需要更多用 offset/count 翻页）取出被引用的**常量表/vtable 内容**
    （密钥/密文/S盒/VM字节码/函数指针表都在 .data/.rodata）；
    用 \`ida_find_strings\` 搜 flag/key/密文特征串。⚠️ **只给代码不给常量表 = 无解**。
    （IDA MCP 未连接时，用 run_python 配 capstone/pefile 手工解析。）
@@ -8788,14 +9127,29 @@ ${sideFilesBlock}
    **分诊不中（输出与 flag 无字符关联）= 真运行型**：flag 在运行行为里（特定输入的输出/种子复现随机序列），
    才走 WSL（\`wsl --status\` 检测）/Unicorn/qiling 运行路线。
 ④ **结论**：有把握才给 flag；证据不足就写明"待人工验证 + 还缺什么"，不要猜。
-④' **多阶段题目（壳/packer）——解出新文件就接力**：若你在本阶段解出/提取出一个**新的可执行文件**
-   （壳解出的 stage2.exe、解密出的内嵌 PE/DEX/payload、从资源段 dump 的二进制等，写出到磁盘且能识别出
+④' **多阶段题目（壳/packer）——解出新文件就接力**：若你在本阶段解出/提取出一个**新的可执行文件**（壳解出的 stage2.exe、解密出的内嵌 PE/DEX/payload、从资源段 dump 的二进制等，写出到磁盘且能识别出
    MZ/ELF/DEX 头），**不要试图在当前进程里硬啃它**（IDA/JEB 单实例、当前数据库绑的是旧文件）——
    直接调用 \`switch_to_next_stage\`（参数 path=新文件绝对路径, reason=判定理由, carried=你要传下去的关键结论）。
    工具会：关闭当前反编译进程 → 保留你的结论 → 以新文件重建分析上下文并自动继续。
    ⚠️ 同一文件不要重复接力；不确定是否真有下一阶段时不要调用（层数上限 3）。
    ⚠️ 若当前文件本身是 decoy（如校验表解出 "This is a fake flag"、程序是壳/loader），**必须**找真载体接力，
    而不是报告"这是假 flag"就收工。
+
+## 动态调试/流量/远程工具（仅在证据需要时使用）
+
+- \`ida_list_globals({filter:"key"})\`：列出全局符号（**自动分页**，每页 500 条直到 next_offset=null）。
+  需要更多时用 \`{offset:500, count:500}\` 手动翻页；不要假定第一页就是全部。
+- \`ida_disasm({address:"0x401000", max_instructions:64})\`：反汇编任意地址（含不在函数表里的代码/间接跳转目标）。
+- \`ida_dbg({action:"start"})\` → \`ida_dbg({action:"bp_add", addrs:["0x401000"]})\` → \`ida_dbg({action:"continue"})\`
+  → \`ida_dbg({action:"regs"})\` / \`ida_dbg({action:"regs_named", regs:"RAX,RBX"})\`；
+  退出用 \`ida_dbg({action:"exit"})\`，断点列表 \`{action:"bp_list"}\`。
+  带参数启动：\`ida_dbg({action:"start", path:"", args:"-d", cwd:"..."})\`（path 空串 = 调试 IDA 当前已加载的库）。
+- \`ida_dbg_mem({action:"read", regions:[{addr:"0x401000", size:32}]})\`：读内存（返回带空格的 hex）；
+  \`ida_dbg_mem({action:"write", regions:[{addr:"0x401000", data:"9090"}]})\`：写内存。
+- \`remote_exec({host:"kali", command:"binwalk -e fw.bin"})\`：远程执行（local 也可）。
+  失败返回 \`REMOTE_TIMEOUT/REMOTE_AUTH/REMOTE_REFUSED/REMOTE_UNCONFIGURED\` 前缀，**都是错误**，不要当成成功空输出。
+- \`traffic_extract({path:"x.pcap", protocol:"auto"})\`：解析抓包（每流端口/包数/字节数/熵/hex 预览）。
+  http=0 表示二进制协议，不要当 Web 流量处理。
 
 ⏱ **预算纪律（必读）**：本轮你共有约 **60 次工具调用**（充足，但别挥霍）。
 - 收集阶段（反编译/读伴生文件/常量）：目标 **15 次内**完成。
@@ -9213,6 +9567,61 @@ async function stopKaliVm() {
   }
 }
 
+// Kali 远程预检（决策在 electron/kali-preflight.js，纯函数可单测）。
+// 只测远程预检阶段耗时；skip 之后的 localFirmwareProbe 会 spawn Python，不计入。
+// 探活缓存 120s，避免同一轮里反复握手。
+const KALI_PREFLIGHT_TTL = 120000;
+let _kaliProbeCache = { at: 0, reachable: false };
+
+// 决策逻辑在主进程（electron/kali-preflight.js），渲染层只传事实、消费结论。
+async function decideKaliPreflight(input) {
+  try {
+    const r = await window.electronAPI.kaliPreflightDecide(input);
+    if (r && r.success) return r.decision;
+  } catch (e) { /* 回退到最小本地判定 */ }
+  return input && input.reachable
+    ? { action: 'remote', log: '[Kali] 可达 → 远程命令' }
+    : { action: 'skip', log: `[Kali] ${(input && input.port) || 22}/TIMEOUT → 跳过远程命令，使用本地兜底` };
+}
+
+async function decideKaliRemotePlan(input) {
+  try {
+    const r = await window.electronAPI.kaliRemotePlan(input);
+    if (r && r.success) return r.plan;
+  } catch (e) { /* 回退 */ }
+  return input && input.reachable
+    ? { reachable: true, commands: ['file', 'binwalk', 'strings'], note: '' }
+    : { reachable: false, commands: [], note: '本地兜底只能给 magic/strings/熵，不能解包。' };
+}
+
+async function kaliPreflight() {
+  const cfg = (state.config && state.config.kali) || {};
+  const host = String(cfg.sshHost || '').trim();
+  const port = Number(cfg.sshPort) || 22;
+  const age = _kaliProbeCache.at ? (Date.now() - _kaliProbeCache.at) : null;
+
+  let reachable = _kaliProbeCache.reachable;
+  // 缓存过期或无缓存 → 探活（TCP 端口级；失败不抛）
+  if (!host) {
+    reachable = false;
+  } else if (age == null || age >= KALI_PREFLIGHT_TTL) {
+    try {
+      const p = await window.electronAPI.checkPort(`http://${host}:${port}`);
+      reachable = !!(p && p.listening);
+    } catch (e) {
+      reachable = false;
+    }
+    _kaliProbeCache = { at: Date.now(), reachable };
+  }
+
+  if (!host) {
+    return { action: 'skip', log: `[Kali] ${port}/TIMEOUT → 跳过远程命令，使用本地兜底（未配置 sshHost）`, plan: await decideKaliRemotePlan({ reachable: false }) };
+  }
+  const d = await decideKaliPreflight({ reachable, cacheAgeMs: age, ttlMs: KALI_PREFLIGHT_TTL, host, port });
+  d.plan = await decideKaliRemotePlan({ reachable: d.action === 'remote', capabilities: state._capabilities });
+  return d;
+}
+
 // 测试Kali连接
 async function testKaliConnection() {
   addLog('info', '正在测试Kali连接...');
@@ -9317,6 +9726,47 @@ function isDegenerateDigest(s) {
   // 同时接受 flag{...} 包裹的形态
   const inner = (t.match(/\{([^}]+)\}/) || [, t])[1];
   return DEGENERATE_DIGESTS.has(inner.trim());
+}
+
+// ===== 本地枚举纪律（纯函数；与 electron/verify-discipline.js 语义一致） =====
+// 只要存在假设就必须执行：与 vr 是否为 null 无关（无 [VERIFY] 时 vr=null）。
+function shouldRunHypotheses(vr, hypothesisCount) {
+  return Number(hypothesisCount) > 0;
+}
+
+const CIPHERTEXT_ALGOS_RE = /^(aes|des|3des|blowfish|sm4|rc4|tea|xtea|xxtea|chacha|salsa|camellia|twofish|present|aria|base64|hex)/i;
+
+// 仅三种 invalid：(a) 算法需密文但密文为空；(b) 输入非空输出为空；(c) 退化摘要输出。
+// 无 key 的合法变换（algo=custom/node_js 且带 code）必须放行。
+function validateCandidateAttempt(a) {
+  const att = a || {};
+  const algo = String(att.algo || '').trim();
+  const ct = String(att.ciphertext == null ? '' : att.ciphertext).trim();
+  const out = String(att.output == null ? '' : att.output).trim();
+  if (CIPHERTEXT_ALGOS_RE.test(algo) && !ct) {
+    return { ok: false, reason: `algo=${algo} 需要密文，但 ciphertext 为空` };
+  }
+  if (ct && !out) return { ok: false, reason: '输入非空但输出为空（解密/变换未真正执行）' };
+  if (out && isDegenerateDigest(out)) return { ok: false, reason: `输出是退化摘要 ${out}（说明输入没取到）` };
+  return { ok: true, reason: '' };
+}
+
+// 结构化尝试记录（algo/key/ct/错误/结论）
+function recordAttemptRecord(a, result) {
+  const att = a || {};
+  const r = result || {};
+  return {
+    algo: String(att.algo || ''),
+    key: att.key == null ? '' : String(att.key),
+    key_encoding: String(att.key_encoding || ''),
+    ciphertext_len: String(att.ciphertext == null ? '' : att.ciphertext).replace(/\s+/g, '').length,
+    error: r.error == null ? '' : String(r.error),
+    output_len: String(r.output == null ? '' : r.output).length,
+    valid: r.valid === undefined ? true : !!r.valid,
+    hit: !!r.hit,
+    reason: r.reason == null ? '' : String(r.reason),
+    ts: new Date().toISOString(),
+  };
 }
 
 function looksLikeFlag(v) {
@@ -10306,7 +10756,7 @@ async function crossCheckCandidates(contract) {
 }
 
 // 【统一入口】验证闭环 + 失败自动枚举 + flag 登记（此前 7 处复制粘贴，语义已漂移：
-// 有的用 `if (!vr)` 门控 recordFlag、有的无条件登记，源码字符串也各不相同）。
+//   有的用 `if (!vr)` 门控 recordFlag、有的无条件登记，源码字符串也各不相同）。
 // 统一语义：先按 source 登记 AI 抽到的 flag（未验证，去重），再跑本地复现；复现失败
 // 自动合成候选枚举；返回 { vr, flags, verifiedFlags } 供调用方拼结果消息。
 async function verifyAndRecord(aiText, opts = {}) {
@@ -10319,7 +10769,18 @@ async function verifyAndRecord(aiText, opts = {}) {
   const vr = await runVerification(aiText);
   // augmentSynth：走到这里说明契约已经失败（!vr.verified），
   // 此时即使 AI 给过 [HYPOTHESES]，也要追加工具合成的维度（P1）。
-  if (vr && !vr.verified) await runHypotheses(aiText, { synthFrom: vr.contracts, augmentSynth: true });
+  // ⚠️ 门控不能写成 `if (vr && !vr.verified)`：没有 [VERIFY] 时 runVerification 返回 null，
+  // 假设永远不会在本地执行（"最终轮没有任何契约被本地执行"的根因）。
+  // 判定抽到 electron/verify-discipline.js（纯函数），与 vr 是否为 null 无关。
+  const hypotheses = parseHypotheses(aiText);
+  const synthCount = Array.isArray(vr && vr.contracts) ? vr.contracts.length : 0;
+  if (shouldRunHypotheses(vr, hypotheses.length + synthCount)) {
+    if (!vr) addLog('info', `[本地枚举] 无 [VERIFY] 但仍执行 ${hypotheses.length || synthCount} 组假设`);
+    await runHypotheses(aiText, {
+      synthFrom: (vr && vr.contracts) || state.lastVerifyContracts || undefined,
+      augmentSynth: !!(vr && !vr.verified),
+    });
+  }
 
   // ── 契约驱动的"裸答案"判定（rank 5）──
   // 记 verified 的条件必须同时成立，绝不把"顺手给的 key"标成已验证：
@@ -10519,6 +10980,31 @@ async function finalizeSolve(aiText, opts = {}) {
   } catch (e) { addLog('warning', '[反证] 异常（已隔离，不阻塞求解）: ' + e.message); }
 
   let vr = null, flags = [], verifiedFlags = [];
+  // run_python 的产物由主进程登记在 evidence/artifacts.jsonl（主进程不写 findings.json，
+  // 那是渲染层整份覆盖写的）。这里逐条转成 findings.evidence，避免产物从取证链里消失。
+  try {
+    const ar = await window.electronAPI.caseArtifacts();
+    if (ar && ar.success && Array.isArray(ar.artifacts) && ar.artifacts.length) {
+      const seen = new Set((state.findings && state.findings.evidence ? state.findings.evidence : [])
+        .map(e => `${e.kind}|${e.path || e.file || ''}`));
+      let added = 0;
+      for (const a of ar.artifacts) {
+        const k = `run_python_artifact|${a.path || ''}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        // 文件内容不重复落盘（已在 scripts/ 里），只登记指针
+        state.findings.evidence.push({
+          kind: 'run_python_artifact',
+          label: `run_python 产物 ${a.rel || a.path}`,
+          file: a.path,
+          size: a.size,
+          ts: a.ts || new Date().toISOString(),
+        });
+        added++;
+      }
+      if (added) { await persistFindings(); addLog('info', `[产物] 登记 ${added} 个 run_python 产物到 findings.evidence`); }
+    }
+  } catch (e) { addLog('warning', '[产物] 登记异常（已隔离）: ' + e.message); }
   try {
     const r = await verifyAndRecord(aiText, opts);
     vr = r.vr; flags = r.flags || []; verifiedFlags = r.verifiedFlags || [];
@@ -10926,17 +11412,24 @@ function checkNegativeAssertions(aiText, ctx) {
   const rules = buildNegativeAssertionRules();
   const refuted = [];
   const prompts = [];
+  // xref 闸门状态只取 `unreferenced` 作为"表未被引用"的证据；
+  // `unverified`（x64/ELF 的 RIP-relative 未解析到）不得用于反证，否则会把真表说成库数据。
+  const ctx2 = Object.assign({}, ctx || {});
+  ctx2.refutedTables = (((ctx || {}).algScan || {}).fingerprints || [])
+    .filter(f => f && f.xref && f.xref.status === 'referenced');
+  ctx2.downgradedTables = (((ctx || {}).algScan || {}).fingerprints || [])
+    .filter(f => f && f.xref && f.xref.status === 'unreferenced');
   for (const rule of rules) {
     if (refuted.length >= 2) break;
     let hit = false;
     try { hit = rule.detect(text); } catch (e) { continue; }
     if (!hit) continue;
     let evidence = null;
-    try { evidence = rule.verify(ctx || {}); } catch (e) { evidence = null; }
+    try { evidence = rule.verify(ctx2); } catch (e) { evidence = null; }
     if (!evidence) continue;   // 断言成立（或无确定性证据）→ 不反驳
     refuted.push({ id: rule.id, evidence });
     try {
-      const rp = rule.retryPrompt ? rule.retryPrompt(ctx || {}) : null;
+      const rp = rule.retryPrompt ? rule.retryPrompt(ctx2) : null;
       if (rp) prompts.push(rp);
     } catch (e) { /* 忽略 */ }
   }
@@ -11422,7 +11915,28 @@ async function runHypotheses(aiText, opts = {}) {
     if (knownAlgos.length) addLog('info', `[本地枚举] 已按信息增益排序（优先：${knownAlgos.join('/')}）`);
   } catch (e) { /* 排序失败不阻塞 */ }
   addLog('info', `[本地枚举] ${attempts.length} 个候选组合（算法/密钥/字节序）...`);
+  // 逐条做形态校验：只有三种 invalid（需密文却空 / 输入非空输出空 / 退化摘要）。
+  // 无 key 无密文的合法变换必须放行（synthesizeHypotheses 明确允许无 ciphertext）。
+  const attemptRecords = [];
+  attempts = attempts.filter(a => {
+    const v = validateCandidateAttempt(a);
+    if (!v.ok) {
+      addLog('warning', `[本地枚举] 候选无效: ${v.reason}`);
+      attemptRecords.push(recordAttemptRecord(a, { valid: false, reason: v.reason }));
+      return false;
+    }
+    return true;
+  });
+  if (!attempts.length) {
+    addLog('warning', '[本地枚举] 全部候选均被形态校验判为无效，未执行本地复现');
+    state.lastAttemptRecords = attemptRecords;
+    return null;
+  }
   const r = await runContractScript(attempts);
+  for (const a of attempts) {
+    attemptRecords.push(recordAttemptRecord(a, { valid: true, hit: false }));
+  }
+  state.lastAttemptRecords = attemptRecords;
   if (r.output) caseAddEvidence('hypotheses', '假设枚举输出', r.output, 'log');
 
   // Phase 3.2：结构化归因（失败也有信息量）
@@ -11793,6 +12307,227 @@ function idaCollectRefAddrs(results) {
   return set;
 }
 
+// ========== 函数体截断与预算 ==========
+// 为什么必须显式传 maxChars：规则若按"函数特征"隐式放宽（例如轮函数给 60000），
+// 14552 字符的函数根本不会截断，而"必须含省略标记"的验收就永远失败；
+// 反过来 6 个函数各放宽 60000 又没有总预算，会直接撑爆上下文。
+const MAX_SINGLE_FUNC_CHARS = 60000;
+const MAX_TOTAL_FUNC_CHARS = 120000;
+
+function buildFuncBody(name, code, maxChars) {
+  const s = String(code == null ? '' : code);
+  const n = Number(maxChars);
+  if (!Number.isFinite(n) || n <= 0 || s.length <= n) return s;
+  // head 60% / tail 40%；标记本身另算，调用方预算按返回值长度累减
+  const headLen = Math.floor(n * 0.6);
+  const tailLen = Math.max(0, n - headLen);
+  const a = headLen;
+  const b = s.length - tailLen;
+  const omitted = Math.max(0, b - a);
+  const marker = `\n… 省略 ${omitted} 字符（原偏移 ${a}..${b}），需要全文请调 ida_decompile(function_name="${name}") …\n`;
+  addLog('info', `[采集] ${name} 截断 head/tail（省略 ${omitted} @${a}..${b}，maxChars=${n}）`);
+  return s.slice(0, headLen) + marker + (tailLen ? s.slice(b) : '');
+}
+
+// ========== 按地址读全局表（不依赖 list_globals 的名字交集） ==========
+// 旧实现只把 raw.refs 与 list_globals 的名字求交集（cnbragon 只命中 1 个 thunk）。
+// 关键表是 dword 数组（lane 布局），名字未必是 global —— 必须能从反编译文本里
+// 抽地址/符号，再按地址读。
+function parseAddrValue(v) {
+  if (typeof v === 'number') return v;
+  const s = String(v == null ? '' : v).trim();
+  if (!/^(0x)?[0-9a-fA-F]+$/.test(s)) return NaN;
+  return parseInt(s.replace(/^0x/i, ''), 16);
+}
+
+function collectGlobalRegions(decompileTexts, imageMap, opts) {
+  const o = opts || {};
+  const texts = Array.isArray(decompileTexts) ? decompileTexts : [decompileTexts];
+  const resolver = typeof o.resolver === 'function' ? o.resolver : (typeof opts === 'function' ? opts : null);
+  const buf = o.buf && Buffer.isBuffer(o.buf) ? o.buf : null;
+
+  const hits = new Map();   // addr -> Set(referrer)
+  const add = (addr, who) => {
+    if (!Number.isFinite(addr) || addr <= 0) return;
+    if (!hits.has(addr)) hits.set(addr, new Set());
+    if (who) hits.get(addr).add(String(who));
+  };
+
+  for (const t of texts) {
+    const text = String(t == null ? '' : t);
+    // 0x... 绝对地址（过滤明显不是数据地址的：小于 0x1000 的常量）
+    for (const m of text.matchAll(/\b0x([0-9a-fA-F]{4,})\b/g)) {
+      const v = parseInt(m[1], 16);
+      if (v >= 0x1000) add(v, '');
+    }
+    // off_/byte_/dword_/qword_/unk_ 符号名 → resolver
+    for (const m of text.matchAll(/\b((?:off|byte|word|dword|qword|unk|flt|dbl|stru|algn)_[0-9A-Fa-f]{4,})\b/g)) {
+      if (!resolver) continue;
+      const v = parseAddrValue(resolver(m[1]));
+      add(v, m[1]);
+    }
+  }
+
+  // 只保留落在非可执行节（PE !X、ELF !(PF_X)）的地址
+  const keep = [];
+  for (const [addr, refs] of hits) {
+    if (!imageMap || !Array.isArray(imageMap.sections)) continue;
+    const abs = (s) => (imageMap.vaIsAbsolute ? s.va : (imageMap.imageBase || 0) + s.va);
+    for (const s of imageMap.sections) {
+      const start = abs(s);
+      const size = s.vsize || s.rawSize || 0;
+      if (!(size > 0) || addr < start || addr >= start + size) continue;
+      const executable = s.executable === true;
+      if (executable) break;
+      keep.push({ addr, refs });
+      break;
+    }
+  }
+
+  keep.sort((x, y) => x.addr - y.addr);
+  const regions = [];
+  for (const k of keep) {
+    const last = regions[regions.length - 1];
+    // "相邻"：间隔 <= 8 字节视为同一张表（lane 布局的 dword 数组是 4 字节步长）
+    if (last && k.addr - (last.addr + last.size) <= 8) {
+      last.size = Math.min(65536, k.addr + 16 - last.addr);
+      k.refs.forEach(r => last.referrers.add(r));
+      continue;
+    }
+    regions.push({ addr: k.addr, size: 16, referrers: new Set(k.refs) });
+  }
+
+  return regions.map(r => ({
+    addr: '0x' + r.addr.toString(16),
+    size: Math.min(r.size, 65536),
+    stride: buf ? probeStride(buf, r.addr, r.size) : 0,
+    referrers: [...r.referrers].filter(Boolean).slice(0, 8),
+  }));
+}
+
+// 表项步长探测：1/2/4 三档，统计"跨步重复率高且高位恒零"的那一档。
+function probeStride(buf, addr, size) {
+  const n = Math.min(size, 256);
+  if (!buf || addr + n > buf.length || n < 8) return 0;
+  let best = 1, bestScore = -1;
+  for (const stride of [1, 2, 4]) {
+    if (n < stride * 4) continue;
+    const seen = new Set();
+    let highZero = 0, total = 0;
+    for (let off = 0; off + stride <= n; off += stride) {
+      const v = buf[addr + off];
+      seen.add(v);
+      for (let k = 1; k < stride; k++) { total++; if (buf[addr + off + k] === 0) highZero++; }
+    }
+    // 跨步重复越少、高位零越多 → 越像该步长的表
+    const score = (seen.size / Math.max(1, n / stride)) * 0.5 + (total ? highZero / total : 0) * 0.5;
+    if (score > bestScore) { bestScore = score; best = stride; }
+  }
+  return best;
+}
+
+// ========== 可执行节缺口（函数表没覆盖到的代码） ==========
+// 只在**代码节**内计算：PE 取 .text 且 X 且 !W；ELF 取 PF_X 且 !PF_W。
+// 显式排除 W+X 节（如加壳程序的 .WProtec：va=0x42f000、约 117KB、无任何函数，
+// 按"所有可执行节"会产生大量伪缺口）与 .rsrc/.reloc。
+const EXEC_GAP_MAX = 4096;
+const EXEC_GAP_TOTAL = 32;
+
+function computeExecGaps(functions, imageMap, opts) {
+  const o = opts || {};
+  const maxGap = Number(o.maxGap) > 0 ? Number(o.maxGap) : EXEC_GAP_MAX;
+  const maxTotal = Number(o.maxTotal) > 0 ? Number(o.maxTotal) : EXEC_GAP_TOTAL;
+  const out = { gaps: [], continuation: [], log: '' };
+  if (!imageMap || !Array.isArray(imageMap.sections) || !imageMap.sections.length) {
+    out.log = '[缺口] 无节表信息，跳过缺口计算';
+    return out;
+  }
+
+  const isCode = (s) => {
+    if (imageMap.format === 'pe') {
+      if (s.executable !== true || s.writable === true) return false;
+      if (/^\.(rsrc|reloc)$/i.test(String(s.name || ''))) return false;
+      return /^\.text$/i.test(String(s.name || ''));
+    }
+    return s.executable === true && s.writable !== true;
+  };
+
+  const abs = (s) => (imageMap.vaIsAbsolute ? s.va : (imageMap.imageBase || 0) + s.va);
+  const covers = [];
+  for (const s of imageMap.sections) {
+    if (!isCode(s)) continue;
+    const start = abs(s);
+    const size = s.vsize || s.rawSize || 0;
+    if (size > 0) covers.push({ start, end: start + size, name: s.name });
+  }
+  if (!covers.length) {
+    out.log = '[缺口] 未找到代码节（PE .text X!W / ELF PF_X!PF_W）';
+    return out;
+  }
+
+  const fnRanges = [];
+  for (const f of (functions || [])) {
+    const a = parseAddrValue(f && (f.address != null ? f.address : (f.addr != null ? f.addr : f.start)));
+    if (!Number.isFinite(a) || a <= 0) continue;
+    const sz = parseAddrValue(f && (f.size != null ? f.size : (f.length != null ? f.length : 0))) || 0;
+    fnRanges.push({ start: a, end: a + Math.max(sz, 1) });
+  }
+  fnRanges.sort((x, y) => x.start - y.start);
+
+  for (const c of covers) {
+    let cursor = c.start;
+    const inSec = fnRanges.filter(r => r.end > c.start && r.start < c.end);
+    for (const r of inSec) {
+      if (r.start > cursor) pushGap(out, cursor, Math.min(r.start, c.end), maxGap, maxTotal);
+      if (r.end > cursor) cursor = r.end;
+      if (out.gaps.length >= maxTotal) break;
+    }
+    if (cursor < c.end) pushGap(out, cursor, c.end, maxGap, maxTotal);
+    if (out.gaps.length >= maxTotal) break;
+  }
+
+  // 续块：反编译体以无条件 jmp <函数外> 结尾 → 该目标不在任何函数内，必须单独反汇编
+  for (const f of (functions || [])) {
+    const code = String((f && (f.code || f.body)) || '');
+    if (!code) continue;
+    // 末尾的 `}` 是函数收尾，不算"最后一条指令"
+    const lines = code.trim().split(/\r?\n/).map(s => s.trim()).filter(s => s && s !== '}' && s !== '};');
+    const lastLine = lines.length ? lines[lines.length - 1] : '';
+    const m = lastLine.match(/^jmp\s+(?:near\s+)?(?:loc_|sub_)?(0x[0-9a-fA-F]+|[0-9a-fA-F]+)\b/);
+    if (!m) continue;
+    const target = parseAddrValue(/^0x/i.test(m[1]) ? m[1] : '0x' + m[1]);
+    if (!Number.isFinite(target)) continue;
+    const selfStart = parseAddrValue(f.address != null ? f.address : f.addr);
+    const selfSize = parseAddrValue(f.size != null ? f.size : f.length) || 0;
+    const insideSelf = Number.isFinite(selfStart) && target >= selfStart && target < selfStart + selfSize;
+    const insideAny = fnRanges.some(r => target >= r.start && target < r.end);
+    if (insideSelf || insideAny) continue;
+    out.continuation.push({
+      addr: '0x' + target.toString(16),
+      from: String(f.name || (f && (f.address || f.addr)) || ''),
+      reason: 'continuation-missing',
+    });
+    if (out.continuation.length >= 16) break;
+  }
+
+  out.log = `[缺口] 代码节 ${covers.length} 个，函数 ${fnRanges.length} 个，缺口 ${out.gaps.length} 段`
+    + `（单段上限 ${maxGap}B，总数上限 ${maxTotal}），续块 ${out.continuation.length} 个`;
+  return out;
+}
+
+function pushGap(out, start, end, maxGap, maxTotal) {
+  let s = start;
+  while (s < end && out.gaps.length < maxTotal) {
+    const len = Math.min(maxGap, end - s);
+    out.gaps.push({
+      addr: '0x' + s.toString(16),
+      size: len,
+      truncated: len < (end - s),
+    });
+    s += len;
+  }
+}
+
 // 反编译入口函数。入口名随工具链而异（mingw→_main、MSVC→main/_WinMainCRTStartup），
 // 逐个候选尝试，命中「有代码」即返回；全失败时退回函数表里形如 main 的符号。
 async function decompileEntryFunction(functionList) {
@@ -11897,6 +12632,10 @@ function selectKeyFunctions(funcs, limit) {
     if (/encrypt|decrypt|encode|decode|crypt|cipher|flag|key|check|verify|hash|digest|md5|sha\d?|base64|rc4|tea|aes|sm4/i.test(n)) s += 4;
     if (/vm_|operad|operand|opcode|bytecode|dispatch|handler|interp|exec|eval|table|scramble|obfuscat|translat|transform/i.test(n)) s += 3;
     if (/^_*(win)?main(_?crtstartup)?(@\d+)?$/i.test(n) || /^_?start$/i.test(n)) s += 2;
+    // 对话框/窗口过程是**校验逻辑最常见的落点**（按钮点击 → 校验）。
+    // 实测：30 个 sub_*(0x150) + DialogFunc(0xa9) 时，+3 仍全被 sub_* 挤出 top10；
+    // 必须 +5 才能让 DialogFunc 进入（sub_*=4 分，DialogFunc=5 分）。
+    if (/(DialogFunc|DlgProc|DialogProc|WndProc|WinProc|WindowProc|MainWndProc)$/i.test(n)) s += 5;
     if (runtimeNoise.test(n)) s -= 5;
     // thunk/极小函数：重罚（几乎不会被选中），让真正的主体函数浮上来
     if (isThunk(n, sz)) s -= 100;
@@ -11915,6 +12654,65 @@ function selectKeyFunctions(funcs, limit) {
     .sort((a, b) => b.s - a.s)
     .slice(0, max)
     .map(x => x.f);
+}
+
+// 强制通道：入口函数与对话框过程相邻的 1 跳 callee 必须进采集集，不占 selectKeyFunctions 的 6 个名额。
+// 为什么额外调 callees：`_collect_decompile_refs` 只收 cot_obj（数据/对象）引用，不含函数调用，
+// 所以从 decompile 的 refs 里拿不到 callee；必须显式调插件的 callees 工具。
+async function collectForcedFuncs(funcList, callMcp, limit = 12) {
+  if (!Array.isArray(funcList) || !funcList.length) return [];
+  const max = limit || 12;
+  const nameOf = f => String((f && f.name) || f || '');
+  const entryRe = /^_*(win)?main(@\d+)?$/i;
+  const dlgRe = /(DialogFunc|DlgProc|DialogProc|WndProc|WinProc|WindowProc|MainWndProc)$/i;
+  const byName = new Map();
+  for (const f of funcList) {
+    const n = nameOf(f);
+    if (n && n !== '[object Object]') byName.set(n, f);
+  }
+
+  const seeds = [...byName.keys()].filter(n => entryRe.test(n) || dlgRe.test(n)).slice(0, 8);
+  if (!seeds.length) return [];
+
+  // 名字 -> 地址：callees 需要地址；没有地址时退回名字（插件 addrs 也接受符号名）
+  const addrOf = (n) => {
+    const f = byName.get(n);
+    const a = f && (f.address != null ? f.address : (f.addr != null ? f.addr : f.start));
+    return a == null || a === '' ? n : String(a);
+  };
+
+  const forced = [];
+  const seen = new Set();
+  const push = (n) => {
+    const s = String(n == null ? '' : n).trim();
+    if (!s || s === '[object Object]' || seen.has(s)) return;
+    seen.add(s);
+    forced.push(s);
+  };
+
+  for (const seed of seeds) {
+    push(seed);
+    if (typeof callMcp !== 'function') continue;
+    try {
+      const r = await callMcp('callees', { addrs: [addrOf(seed)] });
+      const data = r && r.success !== undefined ? r.result : r;
+      const arr = Array.isArray(data) ? data : [];
+      for (const item of arr) {
+        const callees = Array.isArray(item && item.callees) ? item.callees
+          : (Array.isArray(item && item.calls) ? item.calls : []);
+        for (const c of callees) {
+          if (typeof c === 'string') { push(c); continue; }
+          if (c && typeof c === 'object') {
+            push(c.name || c.func || c.addr || c.address);
+            // 有名有址时把地址也补进来（按名反编译可能失败）
+            if (c.name && (c.addr || c.address)) push(String(c.addr || c.address));
+          }
+        }
+      }
+    } catch (e) { /* 单个入口取 callee 失败不影响其余 */ }
+    if (forced.length >= max) break;
+  }
+  return forced.slice(0, max);
 }
 
 // 从 JEB 类列表中挑选"最可能承载本题算法"的类。
@@ -12284,30 +13082,29 @@ ${JSON.stringify({ meta: state.findings.meta, algorithms: state.findings.algorit
 
 // ========== MCP 连接函数 ==========
 
-// 检测当前 IDA MCP 是否暴露了动态调试类工具（断点/单步/进程/寄存器/内存）
-function detectIdaDebugCapability(tools) {
+// 日志化 IDA 调试能力（判定在主进程 electron/ida-debug-capability.js，渲染层只消费结论）。
+// 旧实现用关键词数组过滤 tools/list，'ea'/'ip'/'start' 几乎命中所有静态工具，
+// 打出"检测到 44 个调试相关工具"的错误结论。
+// 两个连接路径（connectIdaMcpWithWait / connectIdaMcp）都必须走这一个函数。
+function logIdaDebugCapability(cap) {
   try {
-    if (!Array.isArray(tools) || tools.length === 0) {
+    if (!cap) {
       addLog('info', '[IDA调试能力] 未取得工具列表，无法判断是否支持动态调试');
       return;
     }
-    const kw = ['breakpoint', 'debug', 'debugger', 'continue', 'step', 'memory', 'register', 'attach', 'process', 'start', 'pause', 'resume', 'write_mem', 'read_mem', 'get_reg', 'set_reg', 'get_state', 'ea', 'ip', 'rip', 'regs'];
-    const debugTools = tools.filter(t => {
-      const name = (t && (t.name || t.title)) || '';
-      const desc = (t && t.description) || '';
-      return kw.some(k => name.toLowerCase().includes(k) || desc.toLowerCase().includes(k));
-    });
-
-    if (debugTools.length === 0) {
-      addLog('info', '[IDA调试能力] 当前 IDA MCP 仅提供静态分析工具，不包含断点/单步/内存/寄存器控制');
-      addLog('info', '[IDA调试能力] 动态调试请使用 IDA Local Windows Debugger，或本软件“生成RC4动态脚本”');
-    } else {
-      addLog('success', `[IDA调试能力] 检测到 ${debugTools.length} 个调试相关工具，可用自动化动态调试`);
-      addLog('info', '[IDA调试能力] ' + debugTools.slice(0, 30).map(t => t.name || t.title).join(', '));
+    addLog(cap.enabled ? 'success' : 'info', cap.log || '[IDA调试能力] 结论缺失');
+    if (cap.enabled) {
+      addLog('info', '[IDA调试能力] 扩展已启用但调试器未启动（仅工具可见）');
     }
   } catch (e) {
     addLog('info', '[IDA调试能力] 检测异常: ' + e.message);
   }
+}
+
+function detectIdaDebugCapability(toolsResult) {
+  // 兼容两种入参：主进程返回体 {tools, debugCapability} 或裸能力对象
+  const cap = toolsResult && toolsResult.debugCapability ? toolsResult.debugCapability : toolsResult;
+  logIdaDebugCapability(cap);
 }
 
 // 生成面向 RC4 题目的 Frida 自动化动态调试脚本（Windows PE，模块名/偏移可参数化）
@@ -12590,7 +13387,7 @@ async function connectIdaMcpWithWait(opts) {
         const toolsResult = await window.electronAPI.idaMcpAnalyze();
         if (toolsResult.success && toolsResult.tools) {
           addLog('info', `IDA MCP 可用工具: ${toolsResult.tools.length}个`);
-          detectIdaDebugCapability(toolsResult.tools);
+          detectIdaDebugCapability(toolsResult);
         }
         return true;
       }
@@ -12618,7 +13415,7 @@ async function connectIdaMcp() {
       const toolsResult = await window.electronAPI.idaMcpAnalyze();
       if (toolsResult.success && toolsResult.tools) {
         addLog('info', `IDA MCP 可用工具: ${toolsResult.tools.length}个`);
-        detectIdaDebugCapability(toolsResult.tools);
+        detectIdaDebugCapability(toolsResult);
       }
 
       addSystemMessage(`**IDA MCP 已连接**

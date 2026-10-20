@@ -20,6 +20,32 @@ const {
 } = require('./tool-result');
 // 编译器产物层面的确定性指纹：散落的 MD5 K 轮常量、多 lane 存放的双射表（rank 6）
 const { detectMd5RoundConstants, detectLaneBijectionTables } = require('./crypto-detect');
+// IDA 列表工具的分页契约（插件默认 count=100，只取一页会得到残缺函数表/全局表）
+const { callPaged } = require('./ida-paging');
+// IDA MCP 扩展组 URL（?ext=dbg）与会话重置判定
+const { idaMcpEffectiveUrl, needsSessionReset } = require('./ida-mcp-url');
+// dbg_* 真实工具名 -> 两个合并 AI 工具（ida_dbg / ida_dbg_mem）的映射
+const { buildDbgCall, normalizeHex, normalizeAddrList, normalizeRegions, normalizeBpItems } = require('./ida-dbg');
+// tools/list 结果 -> 调试能力判定（白名单完整词，替代 'ea'/'ip' 子串匹配）
+const { classifyIdaDebugTools } = require('./ida-debug-capability');
+// 自修改特征（W+X 节/可写代码段/反调试导入）
+const { detectSmcSignals } = require('./smc-detect');
+// MD5 摘要目标的"存在性"闸门（16B 对齐 + Shannon>=7.5，排除 .rsrc/.reloc）
+const { assessHashTarget, buildMd5Note, extractDigestCallSites } = require('./hash-hint');
+// 指纹表的 xref 闸门（32 位 PE 绝对引用回退；x64/ELF 不降级）
+const { assessTableRefs, isRefutedByRefs } = require('./xref-gate');
+// 表地址/节表解析（缺口计算与 xref 闸门共用）
+const { parseImageMap } = require('./binary-map');
+// 文件能力分诊（容器/文件系统/流量/文本/可执行）
+const { detectCapabilities, decideRoute } = require('./file-capability');
+// 远程执行错误分类（Kali SSH）
+const { classifyRemoteError } = require('./remote-exec');
+// Kali 远程预检决策（不可达时跳过远程命令，别白等 3 次 60s 超时）
+const { decideKaliPreflight, decideKaliRemotePlan } = require('./kali-preflight');
+// PCAP 解析（仅 Node 标准库）
+const pcap = require('./pcap');
+// run_python 的工作目录与产物扫描
+const { pickPythonCwd, snapshotDir, scanNewArtifacts } = require('./py-artifacts');
 
 // ============ 全局异常兜底（防闪退） ============
 // 之前主进程没有任何 uncaughtException/unhandledRejection 处理：任意一个后台任务
@@ -117,6 +143,9 @@ const DEFAULT_CONFIG = {
   },
   mcp: {
     ida: 'http://127.0.0.1:13337/mcp',
+    // 插件把 dbg_* 标为 @ext("dbg")，未在 URL 上启用该组时 tools/list 根本看不到它们。
+    // 主进程会在 idaMcpGetBaseUrl 里追加 ?ext=...（见 electron/ida-mcp-url.js）。
+    idaExtensions: ['dbg'],
     jebMcp: 'http://127.0.0.1:16161/mcp',
     // Burp MCP（官方 PortSwigger 扩展为 SSE 传输，默认 9876；客户端 auto 兼容 SSE/Streamable HTTP）
     burp: 'http://127.0.0.1:9876',
@@ -454,6 +483,21 @@ ipcMain.handle('detect-file-type', async (event, filePath) => {
 
     let fileType = 'UNKNOWN';
     let description = '';
+
+    // PCAP/PCAPNG：魔数优先于扩展名。四种 pcap 魔数（LE/BE × 微秒/纳秒）+ pcapng。
+    // 旧代码没有这一分支 → 样本落进 UNKNOWN → 被送进 Kali 固件流程（3 次 SSH 超时白等）。
+    if (['D4C3B2A1', 'A1B2C3D4', '4D3CB2A1', 'A1B23C4D', '0A0D0D0A'].includes(magic)) {
+      fileType = 'PCAP';
+      description = magic === '0A0D0D0A' ? 'PCAPNG 抓包' : 'PCAP 抓包（可提取 TCP 流）';
+      return {
+        success: true,
+        fileType,
+        capabilities: { pcap: true, pcapng: magic === '0A0D0D0A' },
+        description,
+        extension: ext,
+        fileName
+      };
+    }
 
     // DEX 检测（魔数优先于扩展名）
     if (magic === '6465780A' || ext === '.dex') {
@@ -2371,6 +2415,19 @@ function scanCryptoFingerprints(filePath) {
   let buf;
   try { buf = fs.readFileSync(filePath); } catch (e) { return { success: false, error: '读取失败: ' + e.message }; }
   const size = buf.length;
+  // 表地址的 xref 闸门要用节表把文件偏移换算成 VA（32 位 PE 绝对引用 / x64 RIP-relative）。
+  let imageMap = null;
+  try { imageMap = parseImageMap(buf); } catch (e) { imageMap = null; }
+  const fileOffToVa = (off) => {
+    if (!imageMap || !Array.isArray(imageMap.sections)) return NaN;
+    for (const s of imageMap.sections) {
+      const rawPtr = Number(s.rawPtr), rawSize = Number(s.rawSize);
+      if (!(rawSize > 0) || off < rawPtr || off >= rawPtr + rawSize) continue;
+      const secVa = Number(s.va) + (imageMap.vaIsAbsolute ? 0 : (Number(imageMap.imageBase) || 0));
+      return secVa + (off - rawPtr);
+    }
+    return NaN;
+  };
 
   // 1) 已知常量/表模式
   for (const [name, hexPat, desc] of CRYPTO_FP) {
@@ -2506,6 +2563,16 @@ function scanCryptoFingerprints(filePath) {
       : `（表项按 ${stride} 字节步长存放，值在 lane ${lane}${lane === 0 ? '（低字节）' : ''}）`;
     const readOff = (valueOff === undefined) ? off : valueOff;
     // 窗口起点（off）里含 lane 位置；值读取起点是 readOff。分析函数按 readOff 取表。
+    // xref 闸门：表必须在代码里有引用；但 x64/ELF 的 RIP-relative 解析不到时只能标
+    // "未验证"，**不能**降级（假阴性比假阳性更糟）。32 位 PE 才用绝对 imm32 回退。
+    let xref = null;
+    try {
+      if (imageMap) {
+        const algoLabel = isSM4 ? 'SM4' : (isAES ? 'AES' : (isAESInv ? 'AES' : 'CUSTOM-BLOCK'));
+        xref = assessTableRefs({ buf, imageMap, tableVa: fileOffToVa(off), algo: algoLabel });
+        if (xref && xref.log) console.log(xref.log);
+      }
+    } catch (e) { xref = null; }
     const item = {
       fp: 'SBOX-256', algo: isSM4 ? 'SM4' : (isAES ? 'AES' : (isAESInv ? 'AES' : 'CUSTOM-BLOCK')),
       desc: isSM4 ? 'SM4 标准 S 盒（256 项双射）'
@@ -2514,6 +2581,7 @@ function scanCryptoFingerprints(filePath) {
         : `自定义分组密码 S 盒（256 项双射，非常见算法）${strideNote}`)),
       offset: '0x' + off.toString(16), head, stride,
       valueLane: lane,
+      ...(xref ? { xref: { status: xref.status, refs: xref.refs, evidence: xref.evidence } } : {}),
       ...(constLanes && constLanes.length ? { constLanes } : {}),
     };
     // 自定义 S 盒 → 做**常量差分分析**（纯确定性推导，不猜算法）：
@@ -2635,11 +2703,23 @@ function scanCryptoFingerprints(filePath) {
       + `请按对应结构另写实现，不要因为脚本失败就断定"算法认错了"。\n`
       + '```python\n' + ca.decryptScript.script + '\n```\n'
     ) : '';
+    // xref 闸门（三态）：unreferenced 才降级并在 evidence 标注"未引用/库数据"；
+    // unverified 保留原置信度，只标注"xref 未验证"（x64/ELF 的 RIP-relative 未解析到 ≠ 没被引用）。
+    const xrefStates = cb.map(o => o.xref && o.xref.status).filter(Boolean);
+    const anyUnreferenced = xrefStates.includes('unreferenced');
+    const anyUnverified = xrefStates.includes('unverified');
+    const xrefNote = anyUnreferenced
+      ? '\n⚠️ **表未引用/库数据**：该 S 盒在代码节里没有可解析的引用，可能是密码库自带表而非本题算法；'
+        + '在反编译里确认它是否出现在输入→变换→比较的路径上，再决定是否照此实现。'
+      : (anyUnverified
+        ? '\nℹ️ xref 未验证：x64/ELF 的 RIP-relative 引用未解析到，这不等于"没被引用"；按常量结构判断即可。'
+        : '');
     summary.push({
       algo: bigBinary ? '疑似自定义分组密码' : '自定义分组密码（已确认）',
-      confidence: bigBinary ? 'low' : 'high',
+      confidence: (bigBinary || anyUnreferenced) ? 'low' : 'high',
       evidence: `发现 ${cb.length} 个 256 项双射 S 盒（非常见算法）：` + cb.map(o => `${o.offset} 首字节 ${o.head.slice(0, 2)}`).join('、')
-        + (bigBinary ? `（文件 ${(size / 1048576).toFixed(0)}MB，属通用程序量级，含密码库/置换表属正常）` : ''),
+        + (bigBinary ? `（文件 ${(size / 1048576).toFixed(0)}MB，属通用程序量级，含密码库/置换表属正常）` : '')
+        + (anyUnreferenced ? '（表未引用/库数据）' : (anyUnverified ? '（xref 未验证）' : '')),
       note: (bigBinary
         ? '文件偏大，可能是通用程序自带的密码实现，**不一定是本题算法**；请结合本题的输入校验点/密文常量判断，勿直接照此下结论。'
         : '**确定存在分组密码**（双射 S 盒不会偶然出现），常量被改成自定义值。'
@@ -2647,7 +2727,7 @@ function scanCryptoFingerprints(filePath) {
           + '10/12/14 轮 + SubBytes/ShiftRows/MixColumns → AES 骨架。'
           + '② 结构确认后，直接套对应框架、把 S 盒/常量换成题目表手写实现（禁止硬逆/写通用 VM 解释器）。'
           + '③ 参照技能 ctf-crypto-identify 的"魔改变体识别三问"。')
-        + caText + scriptText
+        + caText + scriptText + xrefNote
     });
   }
   // AES 判定来源有两处：①连续字节的 AES-SBOX 常量 ②双射扫描发现 stride 形态的标准 AES 表
@@ -2668,12 +2748,17 @@ function scanCryptoFingerprints(filePath) {
   {
     const kHit = out.find(o => o.fp === 'MD5-K');
     if (kHit) {
+      // 摘要目标存在性闸门：文件里没有 32 位 hex 摘要、也没有 16B 对齐的高熵窗口时，
+      // "MD5(候选)==目标"的爆破方向是错的（MD5 更可能用于 KDF/掩码派生）。
+      const imgForHash = (() => { try { return parseImageMap(buf); } catch (e) { return null; } })();
+      const hashTarget = assessHashTarget(buf, imgForHash);
+      const md5Note = buildMd5Note(hashTarget, []);
       summary.push({
         algo: 'MD5', confidence: 'high',
-        evidence: `内联 MD5 轮常量：K 常量命中 ${kHit.kHits}/64，IV ${kHit.ivHits}/4，首个 K @${kHit.offset}`,
-        note: '确认是本层内联的 MD5（不是"可能是哈希"）。哈希不可逆：按 `MD5(候选)==目标` 爆破（字典/规则/长度扩展）；' +
-          '若被截断比较，比对长度与比较点。⚠️ K 表散落说明实现是手写/内联的，可能存在**轮数/IV/输出字节序**改动，' +
-          '先在反编译里确认 IV 与轮数，再决定用标准 MD5 还是按其实现照抄。',
+        evidence: `内联 MD5 轮常量：K 常量命中 ${kHit.kHits}/64，IV ${kHit.ivHits}/4，首个 K @${kHit.offset}`
+          + `；文件内 32 位 hex 字面量 ${hashTarget.hexLiterals} 个、16B 高熵窗口 ${hashTarget.highEntropy16} 个`,
+        note: md5Note + '⚠️ K 表散落说明实现是手写/内联的，可能存在**轮数/IV/输出字节序**改动。',
+        hashTarget,
       });
     }
   }
@@ -3175,6 +3260,12 @@ function toolLabel(name, input) {
     case 'ida_list_functions': return 'IDA 列出函数';
     case 'ida_find_strings': return 'IDA 查找字符串 ' + short(i.keyword || i.pattern || '', 30);
     case 'ida_get_xrefs': return 'IDA 交叉引用 ' + short(i.address || i.function_name || i.name, 30);
+    case 'ida_list_globals': return 'IDA 列出全局' + (i.filter ? ' ' + short(i.filter, 24) : '');
+    case 'ida_disasm': return 'IDA 反汇编 ' + short(i.address, 28);
+    case 'ida_dbg': return 'IDA 调试 ' + short(i.action, 24) + (i.addr || i.addrs ? ' ' + short(Array.isArray(i.addrs) ? i.addrs.join(',') : (i.addrs || i.addr), 26) : '');
+    case 'ida_dbg_mem': return 'IDA 调试内存' + (i.action ? ' ' + short(i.action, 12) : '');
+    case 'remote_exec': return '远程执行 ' + short(i.host || 'local', 10) + ' ' + short(i.command, 40);
+    case 'traffic_extract': return '解析流量 ' + short(i.path ? path.basename(i.path) : '', 36);
     case 'jeb_get_manifest': return 'JEB 读取 Manifest';
     case 'jeb_get_class_decompiled': return 'JEB 反编译 ' + short(i.class_name, 36);
     case 'jeb_get_method_decompiled': return 'JEB 反编译方法 ' + short(i.class_name + '::' + (i.method_name || ''), 36);
@@ -3758,15 +3849,23 @@ async function sendMCPRequest(url, method, params = {}, extraHeaders = {}, timeo
 let idaMcpState = { sessionId: null, toolMap: null, baseUrl: null };
 
 async function idaMcpGetBaseUrl() {
-  return config.mcp.ida;
+  // 扩展组在主进程层统一附加，保证 initialize / tools/list / tools/call 用的是同一个
+  // 带 ?ext=dbg 的 URL（否则会话建立后看到的工具表与调用端点不一致）。
+  const exts = (config.mcp && config.mcp.idaExtensions) || ['dbg'];
+  const url = idaMcpEffectiveUrl(config.mcp && config.mcp.ida, exts);
+  if (!idaMcpState._extLogged) {
+    idaMcpState._extLogged = true;
+    console.log(`[IDA MCP] 扩展组: ${(Array.isArray(exts) ? exts : [exts]).join(',')} → ${url}`);
+  }
+  return url;
 }
 
 // 建立/复用 IDA MCP 会话
 async function idaMcpEnsureSession() {
   const baseUrl = await idaMcpGetBaseUrl();
-  // 会话 URL 变化则重置
-  if (idaMcpState.baseUrl !== baseUrl) {
-    idaMcpState = { sessionId: null, toolMap: null, baseUrl };
+  // 会话 URL 变化则重置（ext 组变化也必须重建，否则旧会话里没有新组的工具）
+  if (needsSessionReset(idaMcpState.baseUrl, baseUrl)) {
+    idaMcpState = { sessionId: null, toolMap: null, baseUrl, _extLogged: true };
   }
 
   if (idaMcpState.sessionId) return idaMcpState.sessionId;
@@ -3895,6 +3994,17 @@ function normalizeIdaArgs(logicalName, args, realName) {
     }
     case 'list_functions':
       return { queries: args.queries || {} };
+    case 'list_globals': {
+      // 插件 api_core.py 的 list_globals 只认 {queries:{filter,offset,count}}，
+      // 缺省 count=100 → 全局符号表被截断。把顶层 filter/offset/count 收进 queries，
+      // count 兜底 500（分页版本会再按需覆盖）。
+      const q = Object.assign({}, args.queries || {});
+      if (q.filter === undefined && args.filter !== undefined) q.filter = args.filter;
+      if (q.offset === undefined && args.offset !== undefined) q.offset = args.offset;
+      if (q.count === undefined && args.count !== undefined) q.count = args.count;
+      if (q.count === undefined) q.count = 500;
+      return { queries: q };
+    }
     default:
       return args;
   }
@@ -3940,8 +4050,8 @@ async function idaMcpCallTool(logicalName, args) {
     arguments: realArgs
   }, headers, 60000);
 
-  if (resp && resp.error) {
-    throw new Error(resp.error.message || JSON.stringify(resp.error));
+  if (mcpResultIsError(resp)) {
+    throw new Error(mcpErrorText(resp));
   }
 
   let data = unwrapMcpContent(resp);
@@ -3963,9 +4073,45 @@ async function idaMcpCallTool(logicalName, args) {
   return data;
 }
 
-// 拆掉 ida-pro-mcp 列表结果的 data 信封，返回扁平数组。
+// 分页调用列表类工具（list_functions / list_globals），把每页的 data 合并成完整数组。
+// 关键点：必须在解包**之前**读 next_offset——unwrapIdaDataEnvelope 会把信封拍平，
+// 游标随之丢失，只能拿到第一页（插件默认 count=100）。
+async function idaMcpCallPaged(logicalName, baseQuery) {
+  const sessionId = await idaMcpEnsureSession();
+  const realName = await idaMcpResolveTool(logicalName);
+  const baseUrl = await idaMcpGetBaseUrl();
+  const headers = {};
+  if (sessionId) headers['Mcp-Session-Id'] = sessionId;
+
+  const r = await callPaged(async (queries) => {
+    const realArgs = normalizeIdaArgs(logicalName, { queries }, realName);
+    const resp = await sendMCPRequest(baseUrl, 'tools/call', {
+      name: realName,
+      arguments: realArgs
+    }, headers, 60000);
+    if (mcpResultIsError(resp)) {
+      throw new Error(mcpErrorText(resp));
+    }
+    let data = unwrapMcpContent(resp);
+    if (typeof data === 'string') {
+      const t = data.trim();
+      if (t && (t.startsWith('{') || t.startsWith('['))) {
+        try { data = JSON.parse(t); } catch (e) { /* 保留原始文本 */ }
+      }
+    }
+    return data;
+  }, baseQuery || {}, {
+    tool: realName,
+    count: 500,
+    log: (text) => console.log(text),
+  });
+
+  return r.items;
+}
+
 // 只对"元素含 data 数组"的信封生效，因此 decompile（{addr,code,refs}）、
 // find_regex（{n,matches,cursor}）、get_bytes（[{addr,data:"0x.. 0x.."}]）等不受影响。
+// ⚠️ 会丢掉 next_offset——分页场景必须走 idaMcpCallPaged（它在解包前取游标）。
 function unwrapIdaDataEnvelope(data) {
   const innerArray = v => (v && !Array.isArray(v) && Array.isArray(v.data)) ? v.data : null;
   if (Array.isArray(data)) {
@@ -3999,9 +4145,15 @@ ipcMain.handle('ida-mcp-analyze', async (event, args) => {
       return { success: true, result: result };
     }
 
+    const tools = (toolsResult.result && toolsResult.result.tools) || [];
+    // 调试能力判定集中到这里：渲染层两个连接路径都只消费这个结论，
+    // 不再各自用关键词过滤（旧实现的 'ea'/'ip' 子串几乎命中了所有静态工具）。
+    const debugCapability = classifyIdaDebugTools(tools.map(t => (t && (t.name || t.title)) || ''));
+
     return {
       success: true,
-      tools: (toolsResult.result && toolsResult.result.tools) || [],
+      tools,
+      debugCapability,
       message: 'IDA MCP 连接成功'
     };
   } catch (err) {
@@ -4012,8 +4164,29 @@ ipcMain.handle('ida-mcp-analyze', async (event, args) => {
 // IDA MCP - 调用特定工具（逻辑名，自动匹配真实工具 + 解包）
 ipcMain.handle('ida-mcp-call', async (event, toolName, args) => {
   try {
+    // 列表类工具默认只返回 100 条（插件 query.get("count", 100)）→ 必须走分页，
+    // 否则函数表/全局表永远是残缺的。
+    const paged = { list_funcs: 'list_functions', list_functions: 'list_functions', list_globals: 'list_globals' };
+    const logical = paged[toolName];
+    if (logical && !(args && args.paged === false)) {
+      const q = (args && args.queries) || {};
+      const result = await idaMcpCallPaged(logical, q);
+      return { success: true, result, paged: true };
+    }
     const result = await idaMcpCallTool(toolName, args);
     return { success: true, result: result };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// 显式分页版本（渲染层采集用；语义上是"拿全量列表"）
+ipcMain.handle('ida-mcp-call-paged', async (event, toolName, args) => {
+  try {
+    const logical = toolName === 'list_globals' ? 'list_globals' : 'list_functions';
+    const q = (args && args.queries) || {};
+    const result = await idaMcpCallPaged(logical, q);
+    return { success: true, result, paged: true };
   } catch (err) {
     return { success: false, error: err.message };
   }
@@ -4427,6 +4600,7 @@ async function burpHttpRequest(method, params, timeoutMs = 30000) {
   const headers = {};
   if (burpMcpState.sessionId) headers['Mcp-Session-Id'] = burpMcpState.sessionId;
   const resp = await sendMCPRequest(config.mcp.burp, method, params || {}, headers, timeoutMs);
+  // tools/call 的失败走 result.isError（见 mcpResultIsError）；其它方法只可能有 JSON-RPC error。
   if (resp && resp.error) {
     throw new Error(resp.error.message || JSON.stringify(resp.error));
   }
@@ -4771,7 +4945,47 @@ function adaptBurpArgs(toolDef, args) {
   if (Object.keys(out).length === 0 && Object.keys(args).length > 0) {
     return args;
   }
+  // 4) 补齐 schema 的必填字段。插件把 count/offset 都标成 required，而调用方习惯只给
+  //    max（被改名为 count）→ offset 缺失时服务器直接返回
+  //    "Field 'offset' is required ... GetProxyHttpHistory"，整条 history 链路失效。
+  //    这里按 schema 类型给"中性初值"（数字 0 / 字符串空 / 数组空），只补缺不覆盖。
+  const required = Array.isArray(schema.required) ? schema.required : [];
+  for (const key of required) {
+    if (out[key] !== undefined) continue;
+    const spec = props[key] || {};
+    const type = Array.isArray(spec.type) ? spec.type[0] : spec.type;
+    if (type === 'integer' || type === 'number') out[key] = 0;
+    else if (type === 'boolean') out[key] = false;
+    else if (type === 'array') out[key] = [];
+    else if (type === 'object') out[key] = {};
+    else out[key] = '';
+  }
   return out;
+}
+
+// MCP 的失败既可能走 JSON-RPC error，也可能走 result.isError + content[].text
+//（ida-pro-mcp / Burp MCP 都是后者）。旧实现只认前者，于是
+// "Tool 'dbg_start' requires extension 'dbg'" 这类失败被当成成功文本交给 AI。
+function mcpResultIsError(resp) {
+  if (!resp) return false;
+  if (resp.error) return true;
+  const r = resp.result;
+  if (!r) return false;
+  if (r.isError === true) return true;
+  if (Array.isArray(r.content) && r.content.some(c => c && c.isError === true)) return true;
+  return false;
+}
+function mcpErrorText(resp) {
+  if (!resp) return '';
+  if (resp.error) return resp.error.message || JSON.stringify(resp.error);
+  const r = resp.result || {};
+  const parts = [];
+  if (Array.isArray(r.content)) {
+    for (const c of r.content) {
+      if (c && typeof c.text === 'string' && c.text) parts.push(c.text);
+    }
+  }
+  return parts.join('\n').slice(0, 800) || 'MCP 返回 isError=true（无错误文本）';
 }
 
 async function burpMcpCallTool(logicalName, args) {
@@ -4811,8 +5025,8 @@ async function burpMcpCallTool(logicalName, args) {
     const resp = burpMcpState.transport === 'sse'
       ? await burpSseRequest('tools/call', { name: realName, arguments: adaptBurpArgs(toolDef, args) }, 60000)
       : await burpHttpRequest('tools/call', { name: realName, arguments: adaptBurpArgs(toolDef, args) }, 60000);
-    if (resp && resp.error) {
-      throw new Error(resp.error.message || JSON.stringify(resp.error));
+    if (mcpResultIsError(resp)) {
+      throw new Error(mcpErrorText(resp));
     }
     return unwrapMcpContent(resp);
   };
@@ -4893,6 +5107,9 @@ async function ctf2McpCallTool(toolName, args) {
     const resp = await sendMCPRequest(ctf2BaseUrl(), 'tools/call', {
       name: toolName, arguments: args || {}
     }, ctf2Headers(), 60000);
+    // 平台提交的结果语义由 ctf2SubmitAccepted 判定（accepted:false 是**正常返回**，
+    // 不是传输失败），所以这里只认 JSON-RPC error，不把 isError 一律当异常——
+    // 否则"提交被拒"会被吞成调用失败，丢失 accepted/earned_points 等可回看字段。
     if (resp && resp.error) throw new Error(resp.error.message || JSON.stringify(resp.error));
     return unwrapMcpContent(resp);
   };
@@ -5872,6 +6089,8 @@ function parseTextToolCalls(rawText) {
     'jeb_get_manifest', 'jeb_get_class_decompiled', 'jeb_get_method_decompiled',
     'jeb_get_exported_activities', 'jeb_get_all_classes', 'jeb_get_class_methods',
     'ida_decompile', 'ida_list_functions', 'ida_find_strings', 'ida_get_xrefs', 'ida_get_bytes',
+    'ida_list_globals', 'ida_disasm', 'ida_dbg', 'ida_dbg_mem',
+    'remote_exec', 'traffic_extract',
     'browser_search', 'browser_open', 'run_command', 'run_python', 'adb_command', 'frida_hook',
     'read_skill', 'wiki_search', 'wiki_read', 'burp_get_history', 'burp_get_message', 'burp_call',
     'switch_to_next_stage'
@@ -5881,7 +6100,9 @@ function parseTextToolCalls(rawText) {
     bash: 'command', run_command: 'command', run_python: 'script', glob: 'pattern', grep: 'pattern',
     read_file: 'path', write_file: 'path', read_skill: 'name', wiki_read: 'name', wiki_search: 'query',
     browser_open: 'url', browser_search: 'query', ida_decompile: 'function_name', ida_get_xrefs: 'address',
-    ida_get_bytes: 'address', ida_find_strings: 'regex', frida_hook: 'script', adb_command: 'command'
+    ida_get_bytes: 'address', ida_find_strings: 'regex', frida_hook: 'script', adb_command: 'command',
+    ida_disasm: 'address', ida_dbg: 'action', ida_dbg_mem: 'action', remote_exec: 'command', traffic_extract: 'path',
+    ida_list_globals: 'filter'
   };
   // 标记：<｜｜tool▁calls▁begin｜｜> / <|tool_calls_begin|> / 变体（全角/半角竖线、▁/_ 分隔）
   const MARK = /<\s*[|｜]\s*[|｜]?\s*tool[\u2581_ ]?calls[\u2581_ ]?begin\s*[|｜]?\s*[|｜]\s*>/gi;
@@ -6129,6 +6350,59 @@ function precheckToolCall(name, input) {
   }
   if (name === 'ida_get_bytes' && !i.address) {
     return '缺少 address 参数。请传入虚拟地址（如 0x41C000）；不确定时可先用 ida_list_functions 定位。';
+  }
+  if (name === 'ida_disasm' && !i.address) {
+    return '缺少 address 参数。请传入要反汇编的虚拟地址（如 0x402000）。';
+  }
+  if (name === 'ida_dbg') {
+    if (!i.action) {
+      return '缺少 action 参数。可选：start/exit/continue/run_to/step_into/step_over/'
+        + 'bp_list/bp_add/bp_del/bp_toggle/regs/regs_named/stack。'
+        + (i.addr || i.addrs ? '' : '');
+    }
+    const act = String(i.action).toLowerCase();
+    const allowed = ['start', 'exit', 'continue', 'run_to', 'step_into', 'step_over',
+      'bp_list', 'bp_add', 'bp_del', 'bp_toggle', 'regs', 'regs_named', 'stack'];
+    if (!allowed.includes(act)) {
+      return `未知的调试 action: ${i.action}。可选：${allowed.join('/')}。`;
+    }
+    if (act === 'run_to' && !i.addr) {
+      return 'action=run_to 需要 addr 参数（目标地址，如 0x401000）。';
+    }
+    if ((act === 'bp_add' || act === 'bp_del') && !i.addrs && !i.addr) {
+      return `action=${act} 需要 addrs 参数（地址或地址数组，如 '0x401000,0x401010'）。`;
+    }
+    if (act === 'bp_toggle' && !i.items && !i.addrs && !i.addr) {
+      return 'action=bp_toggle 需要 items 参数（[{addr,enabled}] 或地址数组）。';
+    }
+    if (act === 'regs_named' && !i.regs) {
+      return 'action=regs_named 需要 regs 参数（逗号分隔的寄存器名，如 "RAX,RBX"）。';
+    }
+  }
+  if (name === 'ida_dbg_mem') {
+    if (!i.action) return '缺少 action 参数。可选：read/write。';
+    const act = String(i.action).toLowerCase();
+    if (act !== 'read' && act !== 'write') return `未知的内存 action: ${i.action}。可选：read/write。`;
+    if (!i.regions && !i.addr) {
+      return act === 'read'
+        ? 'action=read 需要 regions（[{addr,size}]）或 addr+size。'
+        : 'action=write 需要 regions（[{addr,data}]）或 addr+data。';
+    }
+  }
+  if (name === 'remote_exec' && (!i.command || !String(i.command).trim())) {
+    return '缺少必填参数 command。例如 remote_exec({host:"kali", command:"binwalk -e file"})。';
+  }
+  if (name === 'traffic_extract' && (!i.path || !String(i.path).trim())) {
+    return '缺少必填参数 path。请传入 pcap/pcapng 文件的绝对路径。';
+  }
+  if (name === 'ida_list_globals') {
+    // 参数都可选，但类型错了会让插件静默退回默认（count=100）→ 表又被截断
+    if (i.count != null && !(Number(i.count) > 0)) {
+      return 'count 必须是正整数（默认 500，避免插件默认 100 截断全局表）。';
+    }
+    if (i.offset != null && !(Number(i.offset) >= 0)) {
+      return 'offset 必须是非负整数（按 count 递增翻页，如 0/500/1000）。';
+    }
   }
   return null;
 }
@@ -7056,6 +7330,120 @@ function getToolDefinitions() {
         required: ["address"]
       }
     },
+    {
+      name: "ida_disasm",
+      description: "反汇编指定地址（IDA x86/x64/arm 由插件决定）。用于查看「不在任何函数内」的代码、间接跳转目标、以及函数表缺口里的指令。",
+      input_schema: {
+        type: "object",
+        properties: {
+          address: { type: "string", description: "起始地址（如 0x402000）" },
+          max_instructions: { type: "number", description: "最多返回的指令条数（默认 64，上限 400）" },
+          offset: { type: "number", description: "从起始地址再偏移的字节数（默认 0）" }
+        },
+        required: ["address"]
+      }
+    },
+    {
+      name: "ida_list_globals",
+      description: "列出 IDA 中的全局符号（自动分页，默认每页 500 条直到 next_offset=null）。可按 filter 过滤名字，用 offset/count 手动翻页。",
+      input_schema: {
+        type: "object",
+        properties: {
+          queries: {
+            type: "object",
+            description: "插件原始 queries 对象（filter/offset/count）；与顶层同名字段二选一",
+            properties: {
+              filter: { type: "string", description: "名字过滤（子串）" },
+              offset: { type: "number", description: "起始偏移" },
+              count: { type: "number", description: "每页条数，默认 500" }
+            }
+          },
+          filter: { type: "string", description: "名字过滤（子串）" },
+          offset: { type: "number", description: "起始偏移" },
+          count: { type: "number", description: "每页条数（默认 500，避免插件默认 100 截断）" }
+        },
+        required: []
+      }
+    },
+    // ========== 动态调试（合并 dbg_* 的 20 个工具） ==========
+    {
+      name: "ida_dbg",
+      description:
+        "IDA 动态调试控制。action 可选：start（提供 args/cwd 时用 py_eval 调 idaapi.start_process）、exit、continue、run_to（需 addr）、" +
+        "step_into、step_over、bp_list、bp_add（addrs）、bp_del（addrs）、bp_toggle（items: [{addr,enabled}]）、" +
+        "regs、regs_named（regs: 'RAX,RBX'）、stack。未 start 时上游会报 Debugger not running。",
+      input_schema: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["start", "exit", "continue", "run_to", "step_into", "step_over",
+                   "bp_list", "bp_add", "bp_del", "bp_toggle", "regs", "regs_named", "stack"],
+            description: "调试动作"
+          },
+          addr: { type: "string", description: "run_to 的目标地址 / bp_add 的单地址" },
+          addrs: { description: "断点地址：字符串或字符串数组（如 '0x401000,0x401010'）" },
+          items: { description: "bp_toggle 的条目：[{addr, enabled}]（也接受地址数组）" },
+          regs: { type: "string", description: "regs_named 的寄存器名，逗号分隔（如 'RAX,RBX'）" },
+          path: {
+            type: "string",
+            description: "start 时要调试的可执行文件路径；**留空表示调试 IDA 当前已加载的数据库**（主进程不持有当前文件路径）"
+          },
+          file: { type: "string", description: "path 的别名" },
+          args: { type: "string", description: "start 时传给进程的命令行参数（提供即走 py_eval 的 start_process）" },
+          cwd: { type: "string", description: "start 时进程的工作目录" }
+        },
+        required: ["action"]
+      }
+    },
+    {
+      name: "ida_dbg_mem",
+      description:
+        "IDA 调试器内存读写。action=read：regions=[{addr,size}] 或 addr+size，返回 hex（带空格）；" +
+        "action=write：regions=[{addr,data}] 或 addr+data，data 接受 'abcd' / 'ab cd' / 字节数组。",
+      input_schema: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["read", "write"], description: "read 或 write" },
+          regions: { description: "read: [{addr,size}]；write: [{addr,data}]（单对象也接受）" },
+          addr: { type: "string", description: "单区域时的地址" },
+          size: { type: "number", description: "read 时单区域的大小（默认 16）" },
+          data: { description: "write 时单区域的数据（hex 串/字节数组）" }
+        },
+        required: ["action"]
+      }
+    },
+    // ========== 远程 / 流量 ==========
+    {
+      name: "remote_exec",
+      description:
+        "执行命令。host='kali' 走 SSH（config.kali），host='local' 走本地 shell。默认 20s 超时。" +
+        "失败返回固定前缀：REMOTE_TIMEOUT / REMOTE_AUTH / REMOTE_REFUSED / REMOTE_UNCONFIGURED（均为错误）。",
+      input_schema: {
+        type: "object",
+        properties: {
+          host: { type: "string", enum: ["kali", "local"], description: "执行位置（默认 local）" },
+          command: { type: "string", description: "要执行的命令" },
+          timeout_ms: { type: "number", description: "超时毫秒（默认 20000）" }
+        },
+        required: ["command"]
+      }
+    },
+    {
+      name: "traffic_extract",
+      description:
+        "解析 pcap/pcapng：每流给端口/包数/字节数/熵/hex 预览（预览 ≤2048B，总输出 ≤24000 字符，超限落盘并给路径）。" +
+        "protocol: auto|http|tcp。样本是二进制协议时 http=0，不要当 Web 流量。",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "pcap/pcapng 文件绝对路径" },
+          protocol: { type: "string", enum: ["auto", "http", "tcp"], description: "流过滤（默认 auto）" },
+          max_flows: { type: "number", description: "最多返回的流数（默认 20）" }
+        },
+        required: ["path"]
+      }
+    },
     // ========== 浏览器 MCP 工具 ==========
     {
       name: "browser_search",
@@ -7093,11 +7481,12 @@ function getToolDefinitions() {
     },
     {
       name: "run_python",
-      description: "执行Python脚本，可用于解密、数据分析等",
+      description: "执行Python脚本，可用于解密、数据分析等。脚本里的相对路径默认落在当前题目的 scripts/ 目录（产物会自动登记为 evidence）。",
       input_schema: {
         type: "object",
         properties: {
-          script: { type: "string", description: "Python脚本内容" }
+          script: { type: "string", description: "Python脚本内容" },
+          cwd: { type: "string", description: "可选：工作目录（默认 <caseDir>/scripts；不传就走默认）" }
         },
         required: ["script"]
       }
@@ -7361,7 +7750,7 @@ async function executeToolCall(toolName, input) {
         return await callIdaMcp('decompile', { address: input.function_name });
 
       case 'ida_list_functions':
-        return await callIdaMcp('list_functions', { queries: {} });
+        return await idaMcpCallPaged('list_functions', {});
 
       case 'ida_find_strings':
         return await callIdaMcp('find_strings', { pattern: input.regex });
@@ -7371,6 +7760,74 @@ async function executeToolCall(toolName, input) {
 
       case 'ida_get_bytes':
         return await idaGetBytes({ callMcp: callIdaMcp, writeTemp: writeTempFile, topLevelDir: currentWorkDir }, input);
+
+      case 'ida_list_globals':
+        return await idaMcpCallPaged('list_globals', {
+          filter: input.filter || '',
+          offset: input.offset,
+          count: input.count,
+        });
+
+      case 'ida_disasm': {
+        const addr = String(input.address || '').trim();
+        if (!addr) return '缺少 address 参数。请传入要反汇编的虚拟地址（如 0x402000）。';
+        const maxInsn = Math.min(Math.max(Number(input.max_instructions) || 64, 1), 400);
+        return await callIdaMcp('disasm', {
+          addr,
+          max_instructions: maxInsn,
+          offset: Number(input.offset) || 0,
+        });
+      }
+
+      case 'ida_dbg': {
+        const call = buildDbgCall(input.action, input);
+        if (call.error) return `参数错误：${call.error}`;
+        try {
+          const r = await callIdaMcp(call.tool, call.args);
+          return r;
+        } catch (err) {
+          // IDA 9 的异步调试器：idaapi.step_over()/step_into() 在"命令已投递"时返回 False，
+          // 但单步**确实执行了**（实测 IP 0x77d284cc → 0x4012d1）。插件按返回值判定 →
+          // 报 "Failed to step over"，把成功当失败。
+          // 判据改为**验证结果**：失败后读一次 IP，若与失败前不同即视为成功。
+          const stepAction = /^step_(over|into)$/.test(String(input.action || '').toLowerCase());
+          if (stepAction) {
+            const rescued = await rescueStepFailure(call, err);
+            if (rescued) return rescued;
+          }
+          // 上游失败必须如实报错（ToolCallError 会被主循环标 is_error）
+          throw new ToolCallError(`IDA 调试调用失败: ${translateDbgError(err.message)}`);
+        }
+      }
+
+      case 'ida_dbg_mem': {
+        const act = String(input.action || '').toLowerCase() === 'write' ? 'mem_write' : 'mem_read';
+        const call = buildDbgCall(act, input);
+        if (call.error) return `参数错误：${call.error}`;
+        try {
+          const r = await callIdaMcp(call.tool, call.args);
+          const text = typeof r === 'string' ? r : JSON.stringify(r);
+          // dbg_read 返回无空格 hex（插件 data.hex()），统一加空格；write 回显原文
+          if (act === 'mem_read') {
+            return text.replace(/\b([0-9a-fA-F]{16,})\b/g, (m) => normalizeHex(m));
+          }
+          return text;
+        } catch (err) {
+          throw new ToolCallError(`IDA 调试内存调用失败: ${translateDbgError(err.message)}`);
+        }
+      }
+
+      case 'remote_exec':
+        return await remoteExecTool(input);
+
+      case 'traffic_extract': {
+        const p = String(input.path || '').trim();
+        if (!p) return '参数错误：path 为空';
+        if (!fs.existsSync(p)) return `文件不存在: ${p}`;
+        const r = trafficExtract(p, input);
+        if (!r.success) return r.error;
+        return r.result;
+      }
 
       // ========== 浏览器 MCP 工具 ==========
       case 'browser_search':
@@ -7393,7 +7850,7 @@ async function executeToolCall(toolName, input) {
         return await execCommandAsync(input.command);
 
       case 'run_python':
-        return await runPythonScript(input.script);
+        return await runPythonScript(input.script, input.cwd);
 
       // ========== ADB/Frida 工具 ==========
       case 'adb_command':
@@ -7577,6 +8034,76 @@ async function executeToolCall(toolName, input) {
   }
 }
 
+// 单步"假失败"兜底。
+// IDA 9 的异步调试器投递命令后立即返回，插件却把 idaapi.step_over() 的返回值当结果：
+// 命令已生效但返回 False → 插件抛 "Failed to step over"，AI 会误以为单步不可用。
+// 这里在失败后再读一次 IP：与失败前不同就说明单步确实执行了，按成功返回。
+async function rescueStepFailure(call, err) {
+  if (!/Failed to step (over|into)/i.test(String(err && err.message))) return null;
+  try {
+    const before = await readDbgIp();
+    // 给异步调试器一点时间落地
+    await new Promise(r => setTimeout(r, 350));
+    const retried = await callIdaMcp(call.tool, call.args);
+    const after = await readDbgIp();
+    if (before && after && before !== after) {
+      // 上游这次成功了就返回它的结果；否则用读到的 IP 组成等价结果
+      return retried !== undefined ? retried : { ip: after, recovered: true };
+    }
+    if (retried !== undefined) return retried;
+  } catch (e) { /* 兜底失败，保留原始错误 */ }
+  return null;
+}
+
+// 从 dbg_regs 里取当前 IP（x86 EIP / x64 RIP）。读不到返回 null。
+async function readDbgIp() {
+  try {
+    const regs = await callIdaMcp('dbg_regs', {});
+    const arr = Array.isArray(regs) ? regs : (regs && regs.registers) || [];
+    const hit = arr.find(r => r && /^(eip|rip)$/i.test(String(r.name || '')));
+    return hit ? String(hit.value).toLowerCase() : null;
+  } catch (e) { return null; }
+}
+
+// remote_exec：local 走本地 shell，kali 走 sshExec。失败必须如实抛 ToolCallError。
+async function remoteExecTool(input) {
+  const i = input || {};
+  const cmd = String(i.command || '').trim();
+  if (!cmd) return '参数错误：command 为空';
+  const host = String(i.host || 'local').toLowerCase();
+  const timeoutMs = Math.min(Math.max(Number(i.timeout_ms) || 20000, 1000), 600000);
+
+  if (host === 'local') {
+    const r = await new Promise((resolve) => {
+      exec(cmd, { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
+        resolve({ success: !error, stdout: stdout || '', stderr: stderr || '', error: error ? error.message : null });
+      });
+    });
+    if (!r.success) {
+      // 本地失败也用同一套前缀，便于 AI 与失败前缀表统一识别
+      const cls = classifyRemoteError({
+        success: false, error: r.error, stdout: r.stderr, exitCode: 1, host: 'local', port: 0,
+      });
+      throw new ToolCallError(cls.message.replace(/^REMOTE_REFUSED \(未配置\):0/, 'LOCAL_EXEC_FAILED'));
+    }
+    return r.stdout ? truncateOutput(r.stdout) : '（命令成功，无输出）';
+  }
+
+  const { sshHost, sshPort } = config.kali || {};
+  if (!sshHost) {
+    throw new ToolCallError(classifyRemoteError({ host: '' }).message);
+  }
+  const r = await sshExec(cmd, timeoutMs);
+  // sshExec 现在会带回真实退出码；旧式 {success:true,exitCode:undefined} 仍按 0 处理。
+  const exitCode = r.exitCode !== undefined ? r.exitCode : (r.success ? 0 : 1);
+  const cls = classifyRemoteError({
+    success: r.success, error: r.error || r.stderr, stdout: r.stdout, exitCode,
+    host: sshHost, port: sshPort,
+  });
+  if (cls.isError) throw new ToolCallError(cls.message);
+  return r.stdout ? truncateOutput(r.stdout) : '（远程命令成功，无输出）';
+}
+
 // 调用IDA MCP（逻辑名 -> 会话化 + 工具名匹配 + 信封解包）
 async function callIdaMcp(method, params) {
   try {
@@ -7591,6 +8118,12 @@ async function callBurpMcp(method, params) {
   try {
     return await burpMcpCallTool(method, params);
   } catch (err) {
+    // 连接类失败给固定前缀：BURP_DOWN 已登记到 tool-result.js 的 FAILURE_PREFIXES，
+    // 否则字符串失败不会被标 is_error（AI 会把它当成功继续）。
+    if (/ECONNREFUSED|ECONNRESET|socket hang up|connect ETIMEDOUT|fetch failed/i.test(String(err.message))) {
+      const bat = (config.tools && config.tools.burp) || '';
+      return `BURP_DOWN ${config.mcp.burp}（${err.message}）；启动：${bat || '请在设置中配置 tools.burp 指向 MCP_Burp.bat'}`;
+    }
     return `Burp MCP调用失败: ${err.message}（请确认 Burp 已启动且 MCP 插件监听 ${config.mcp.burp}）`;
   }
 }
@@ -7713,6 +8246,9 @@ async function browserMcpOpenTool(url) {
 
 // 当前工作目录（渲染层加载题目文件时同步，AI 的 glob/grep 由此定位）
 let currentWorkDir = null;
+// 当前案件目录（渲染层 caseInit 成功后通过 set-case-dir 同步）。
+// 主进程没有 state.caseDir：run_python 的 cwd 与产物登记都依赖这份主进程侧副本。
+let currentCaseDir = null;
 
 function writeTempFile(name, content) {
   const tmp = path.join(app.getPath('temp'), name);
@@ -7756,13 +8292,43 @@ function killPythonTree() {
   currentPythonChild = null;
 }
 
-async function runPythonScript(script) {
+async function runPythonScript(script, cwdOpt) {
   const tempFile = path.join(app.getPath('temp'), `ctf_script_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.py`);
   fs.writeFileSync(tempFile, script);
 
+  // 脚本里的相对路径必须落在题目目录里，而不是进程 cwd（实测会写进仓库根目录）。
+  const cwd = pickPythonCwd({ explicitCwd: cwdOpt, caseDir: currentCaseDir, workDir: currentWorkDir });
+  let before = null;
+  const sinceMs = Date.now();
+  try {
+    fs.mkdirSync(cwd, { recursive: true });
+    before = snapshotDir(cwd);
+  } catch (e) { /* 目录不可用则退化为不扫描 */ }
+
+  const wrap = (text) => {
+    if (!before) return text;
+    let arts = [];
+    try { arts = scanNewArtifacts(cwd, sinceMs, before); } catch (e) { arts = []; }
+    if (!arts.length) return text;
+    // 产物登记追加到 evidence/artifacts.jsonl，由渲染层在 finalize 时读回。
+    // 不写 findings.json：那是渲染层整份覆盖写的文件，主进程写会被覆盖。
+    if (currentCaseDir) {
+      try {
+        const rec = path.join(currentCaseDir, 'evidence', 'artifacts.jsonl');
+        fs.mkdirSync(path.dirname(rec), { recursive: true });
+        for (const a of arts) {
+          fs.appendFileSync(rec, JSON.stringify({
+            kind: 'run_python_artifact', path: a.path, size: a.size, rel: a.name, ts: new Date().toISOString(),
+          }) + '\n');
+        }
+      } catch (e) { /* 登记失败不影响执行结果 */ }
+    }
+    return text + '\n' + arts.map(a => `artifact: ${a.path} (${a.size} bytes)`).join('\n');
+  };
+
   return new Promise((resolve) => {
     // 用 spawn（shell:false）直接起 python：kill 能命中本体；Windows 上用 taskkill /T 杀树。
-    const child = spawn('python', [tempFile], { windowsHide: true });
+    const child = spawn('python', [tempFile], { windowsHide: true, cwd });
     currentPythonChild = child;
 
     let stdout = '', stderr = '', total = 0;
@@ -7773,7 +8339,7 @@ async function runPythonScript(script) {
       settled = true;
       if (currentPythonChild === child) currentPythonChild = null;
       try { fs.unlinkSync(tempFile); } catch (e) {}
-      resolve(text);
+      resolve(wrap(text));
     };
     const timer = setTimeout(() => {
       killPythonTree();
@@ -8442,9 +9008,22 @@ function sshExec(command, timeoutMs = 60000) {
           return done({ success: false, stdout: '', stderr: '', error: err.message });
         }
         let stdout = '', stderr = '';
-        stream.on('close', () => {
+        // ssh2 的 close 回调带 (code, signal)。旧实现忽略它，于是 `binwalk ...` 以退出码 1
+        // 失败时仍然返回 success:true + 空 stdout —— 上层只能看到"成功了但没输出"，
+        // 这正是 Kali 链路把失败当空结果、继续往下走的根因。
+        stream.on('close', (code, signal) => {
           clearTimeout(timer);
-          done({ success: true, stdout: truncateOutput(stdout), stderr: truncateOutput(stderr), error: null });
+          const exitCode = Number.isFinite(code) ? code : (signal ? 1 : 0);
+          // 退出码非 0 = 命令失败；但保留 stdout/stderr 原文，便于上层展示真实错误。
+          done({
+            success: exitCode === 0,
+            exitCode,
+            signal: signal || null,
+            stdout: truncateOutput(stdout),
+            stderr: truncateOutput(stderr),
+            error: exitCode === 0 ? null
+              : (truncateOutput(stderr).trim() || `命令退出码 ${exitCode}`),
+          });
         });
         stream.on('data', (d) => { stdout += d.toString(); });
         stream.stderr.on('data', (d) => { stderr += d.toString(); });
@@ -8496,6 +9075,127 @@ ipcMain.handle('kali-test-connection', async (event) => {
 ipcMain.handle('set-workdir', async (event, dir) => {
   currentWorkDir = dir || null;
   return { success: true };
+});
+
+// 渲染层在 caseInit 成功后同步 CASE 目录（主进程没有 state.caseDir）
+ipcMain.handle('set-case-dir', async (event, dir) => {
+  currentCaseDir = dir ? String(dir) : null;
+  return { success: true, caseDir: currentCaseDir };
+});
+
+// 读取 run_python 产物登记（渲染层在 finalizeSolve 时逐条转成 evidence）
+ipcMain.handle('case-artifacts', async () => {
+  try {
+    if (!currentCaseDir) return { success: true, artifacts: [] };
+    const file = path.join(currentCaseDir, 'evidence', 'artifacts.jsonl');
+    if (!fs.existsSync(file)) return { success: true, artifacts: [] };
+    const artifacts = fs.readFileSync(file, 'utf8')
+      .split(/\r?\n/).filter(Boolean)
+      .map(line => { try { return JSON.parse(line); } catch (e) { return null; } })
+      .filter(Boolean);
+    return { success: true, artifacts };
+  } catch (e) {
+    return { success: false, error: e.message, artifacts: [] };
+  }
+});
+
+// Kali 预检决策（渲染层需要先知道"要不要发远程命令"；决策逻辑留在纯模块里可单测）
+ipcMain.handle('kali-preflight-decide', async (event, input) => {
+  try { return { success: true, decision: decideKaliPreflight(input || {}) }; }
+  catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('kali-remote-plan', async (event, input) => {
+  try { return { success: true, plan: decideKaliRemotePlan(input || {}) }; }
+  catch (e) { return { success: false, error: e.message }; }
+});
+
+// 远程执行错误分类（渲染层/工具共用一份前缀语义）
+ipcMain.handle('classify-remote-error', async (event, input) => {
+  try { return { success: true, result: classifyRemoteError(input || {}) }; }
+  catch (e) { return { success: false, error: e.message }; }
+});
+
+// 文件能力分诊（渲染层在分派前调用，取代按扩展名/口令的路由）
+ipcMain.handle('detect-capabilities', async (event, filePath, fileTypeHint) => {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return { success: false, error: '文件不存在: ' + filePath };
+    const buf = fs.readFileSync(filePath);
+    const ext = path.extname(filePath).toLowerCase();
+    const capabilities = detectCapabilities(buf, ext);
+    // 路由决策与能力判定同源，避免渲染层再写一份规则（两处规则必然漂移）
+    return { success: true, capabilities, ext, route: decideRoute({ fileType: fileTypeHint, ext, capabilities }) };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+// 自修改特征 + 摘要目标存在性（渲染层提示词用；两者都只读文件字节，不依赖 IDA）
+ipcMain.handle('analyze-smc', async (event, filePath) => {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return { success: false, error: '文件不存在: ' + filePath };
+    const buf = fs.readFileSync(filePath);
+    const imageMap = parseImageMap(buf);
+    const smc = detectSmcSignals(buf, imageMap);
+    const hash = assessHashTarget(buf, imageMap);
+    return { success: true, smc, hash };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+// 流量提取的公共实现（AI 工具 traffic_extract 与 IPC traffic-extract 共用）。
+// 输出限额：每流 previewHex ≤2048 字节、总返回 ≤24000 字符；超限部分落盘并返回路径，
+// 否则会被 truncateOutput(8000) 或 persistToolResult(24000) 从尾部截断。
+function trafficExtract(filePath, opts) {
+  const o = opts || {};
+  const r = pcap.analyzePcap(filePath, { previewBytes: 2048 });
+  if (!r.success) return { success: false, error: `traffic_extract 失败: ${r.error}` };
+
+  const proto = String(o.protocol || 'auto').toLowerCase();
+  let flows = r.flows;
+  if (proto === 'http') flows = flows.filter(f => f.http);
+  else if (proto === 'tcp') flows = flows.slice();
+  const maxFlows = Number(o.max_flows) > 0 ? Number(o.max_flows) : 20;
+  flows = flows.slice(0, maxFlows);
+
+  const lines = [];
+  lines.push(`pcap: ${path.basename(filePath)}  magic=${r.magic}  packets=${r.packets}  flows=${r.flows.length}  http=${r.http}`);
+  for (const f of flows) {
+    lines.push('');
+    lines.push(`## ${f.src} ↔ ${f.dst}（ports ${f.ports.join('/')}）`);
+    lines.push(`- packets=${f.packets} bytes=${f.bytes} payload=${f.payloadBytes} http=${f.http} entropy=${f.entropy}`);
+    lines.push(`- previewHex${f.previewTruncated ? `（前 2048B，原 ${f.payloadBytes}B）` : ''}: ${f.previewHex}`);
+  }
+  let text = lines.join('\n');
+
+  const MAX_RET = 24000;
+  let outPath = '';
+  if (text.length > MAX_RET) {
+    try {
+      const dir = currentCaseDir ? path.join(currentCaseDir, 'evidence') : app.getPath('temp');
+      fs.mkdirSync(dir, { recursive: true });
+      outPath = path.join(dir, `traffic_${Date.now()}.json`);
+      fs.writeFileSync(outPath, JSON.stringify(r, null, 1));
+      text = text.slice(0, MAX_RET) + `\n...[已截断，完整结果落盘: ${outPath}]`;
+    } catch (e) {
+      text = text.slice(0, MAX_RET) + '\n...[已截断]';
+    }
+  }
+  return { success: true, result: text, magic: r.magic, packets: r.packets, flows: r.flows.length, http: r.http, outPath };
+}
+
+// 流量提取（渲染层走这条：executeToolCall 只在 AI 循环内，渲染层没有通用工具通道）
+ipcMain.handle('traffic-extract', async (event, args) => {
+  try {
+    const a = args || {};
+    const p = String(a.path || '').trim();
+    if (!p) return { success: false, error: '参数错误：path 为空' };
+    if (!fs.existsSync(p)) return { success: false, error: '文件不存在: ' + p };
+    return trafficExtract(p, a);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
 });
 
 // 获取应用路径（渲染层保存脚本/WP 用，替代硬编码桌面路径）

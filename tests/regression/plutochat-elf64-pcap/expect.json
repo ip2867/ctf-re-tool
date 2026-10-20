@@ -4,6 +4,15 @@
   "main": "plutochat",
   "type": "ELF64",
   "notes": "ELF64 + pcap 伴生文件；自定义分组密码 S 盒 @0x3120",
+  "kind": "pcap",
+  "pcap": {
+    "file": "evidence.pcap",
+    "magic": "D4C3B2A1",
+    "packets": 22,
+    "flows": 2,
+    "http": 0,
+    "ports": [31337]
+  },
   "expect": {
     "payloads": [],
     "summaryMustContain": ["自定义分组密码"],

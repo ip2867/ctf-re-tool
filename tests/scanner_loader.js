@@ -19,10 +19,14 @@ const localRequire = (name) => {
 };
 const mod = { exports: {} };
 const cryptoDetect = require(p.join(electronDir, 'crypto-detect.js'));
+const hashHint = require(p.join(electronDir, 'hash-hint.js'));
 // eslint-disable-next-line no-new-func
 new Function('fs', 'path', 'module', 'exports', 'require',
   'detectMd5RoundConstants', 'detectLaneBijectionTables',
+  'assessHashTarget', 'buildMd5Note', 'parseImageMap',
   body + '\nmodule.exports = { scanCryptoFingerprints, CRYPTO_FP, classifySbox, gf2AffineFit, analyzeCustomBlockConstants, inferCipherStructure, findCiphertextCandidate };'
 )(fs, p, mod, mod.exports, localRequire,
-  cryptoDetect.detectMd5RoundConstants, cryptoDetect.detectLaneBijectionTables);
+  cryptoDetect.detectMd5RoundConstants, cryptoDetect.detectLaneBijectionTables,
+  hashHint.assessHashTarget, hashHint.buildMd5Note,
+  require(p.join(electronDir, 'binary-map.js')).parseImageMap);
 module.exports = mod.exports;

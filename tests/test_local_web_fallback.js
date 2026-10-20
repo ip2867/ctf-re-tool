@@ -38,8 +38,13 @@ function extractLocalWeb(raw, file) {
   return { scripts, picked, clues, total: raw.length };
 }
 
-const sample = 'E:/ctf/pratice/ai/equation/ea7c3b5c-a04d-48ca-a741-8715d31ff2b5_x/output/equation.html';
-if (!fs.existsSync(sample)) {
+// 真样本改为可选：node tests/test_local_web_fallback.js --real <x.html>
+// CI 只跑合成用例（不依赖本机 E: 盘）。
+const realIdx = process.argv.indexOf('--real');
+const sample = realIdx >= 0 ? String(process.argv[realIdx + 1] || '') : '';
+if (!sample) {
+  console.log('（未提供 --real <path>，仅跑合成用例）');
+} else if (!fs.existsSync(sample)) {
   console.log('（样本不存在，仅跑合成用例）');
 } else {
   console.log('[真实样本 equation.html]');

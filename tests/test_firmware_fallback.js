@@ -21,8 +21,20 @@ const py = pyLines.join('\n');
 let pass = 0, fail = 0;
 const ok = (c, m, extra) => { if (c) { pass++; console.log('  ✓ ' + m); } else { fail++; console.log('  ✗ ' + m + (extra ? ' → ' + extra : '')); } };
 
-const sample = 'E:/ctf/pratice/ai/firmware/51475f91-7b90-41dd-81a3-8b82df4f29d0.bin';
-console.log('样本:', sample);
+// 真样本改为可选：node tests/test_firmware_fallback.js --real <firmware.bin>
+// CI 用合成样本（随机字节 + 可读字符串），不依赖本机 E: 盘。
+const realIdx = process.argv.indexOf('--real');
+const realSample = realIdx >= 0 ? String(process.argv[realIdx + 1] || '') : '';
+let sample = realSample;
+if (!sample) {
+  sample = p.join(require('os').tmpdir(), 'fw_synth_sample.bin');
+  const synth = Buffer.alloc(2048, 0xAA);
+  Buffer.from(('flag{synthetic_probe_marker}\nhello-firmware\n' + 'lorem ipsum dolor sit amet '.repeat(8) + '\n'), 'latin1').copy(synth, 128);
+  fs.writeFileSync(sample, synth);
+  console.log('合成样本:', sample);
+} else {
+  console.log('样本:', sample);
+}
 if (!fs.existsSync(sample)) {
   console.log('（样本不存在，跳过实际执行）');
 } else {

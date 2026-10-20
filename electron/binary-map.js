@@ -53,7 +53,14 @@ function parsePE(b) {
     const va = b.readUInt32LE(o + 12);
     const rawSize = b.readUInt32LE(o + 16);
     const rawPtr = b.readUInt32LE(o + 20);
-    sections.push({ name, va, vsize, rawSize, rawPtr });
+    // Characteristics：只增字段、不改既有字段（下游按旧形状读取不受影响）。
+    // W=0x80000000，X=0x20000000 —— 自修改/代码节判定与代码缺口都依赖它。
+    const characteristics = b.readUInt32LE(o + 36);
+    sections.push({
+      name, va, vsize, rawSize, rawPtr, characteristics,
+      writable: (characteristics & 0x80000000) !== 0,
+      executable: (characteristics & 0x20000000) !== 0,
+    });
   }
   if (!sections.length) return null;
 
@@ -84,10 +91,16 @@ function parseELF(b) {
     if (o + phentsize > b.length) break;
     const type = is64 ? b.readUInt32LE(o) : b.readUInt32LE(o);
     if (type !== 1) continue;   // PT_LOAD
+    // p_flags：PF_X=1, PF_W=2, PF_R=4 —— SMC/代码节判定与缺口计算都要用
+    const flags = is64 ? b.readUInt32LE(o + 4) : b.readUInt32LE(o + 24);
     const vaddr = is64 ? Number(b.readBigUInt64LE(o + 16)) : b.readUInt32LE(o + 8);
     const memsz = is64 ? Number(b.readBigUInt64LE(o + 40)) : b.readUInt32LE(o + 20);
     const off = is64 ? Number(b.readBigUInt64LE(o + 8)) : b.readUInt32LE(o + 4);
-    sections.push({ name: 'LOAD', va: vaddr, vsize: memsz, rawSize: memsz, rawPtr: off });
+    sections.push({
+      name: 'LOAD', va: vaddr, vsize: memsz, rawSize: memsz, rawPtr: off, flags,
+      writable: (flags & 2) !== 0,
+      executable: (flags & 1) !== 0,
+    });
   }
   if (!sections.length) return null;
 

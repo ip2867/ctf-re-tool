@@ -73,6 +73,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // MCP 功能
   idaMcpAnalyze: (args) => ipcRenderer.invoke('ida-mcp-analyze', args),
   idaMcpCall: (toolName, args) => ipcRenderer.invoke('ida-mcp-call', toolName, args),
+  // 分页版本：列表类工具必须拿全量（插件默认每页 100 条）
+  idaMcpCallPaged: (toolName, args) => ipcRenderer.invoke('ida-mcp-call-paged', toolName, args),
   jebMcpStart: () => ipcRenderer.invoke('jeb-mcp-start'),
   jebMcpCall: (toolName, args) => ipcRenderer.invoke('jeb-mcp-call', toolName, args),
   browserMcpFetch: (url) => ipcRenderer.invoke('browser-mcp-fetch', url),
@@ -108,6 +110,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // 工作目录 / 应用路径 / 设备就绪
   setWorkdir: (dir) => ipcRenderer.invoke('set-workdir', dir),
+  // CASE 目录同步（主进程没有 state.caseDir；run_python 的 cwd/产物登记靠它）
+  setCaseDir: (dir) => ipcRenderer.invoke('set-case-dir', dir),
+  // run_python 产物登记（渲染层在 finalize 时逐条转成 evidence）
+  caseArtifacts: () => ipcRenderer.invoke('case-artifacts'),
+  // 文件能力分诊（容器/文件系统/流量/文本/可执行）
+  detectCapabilities: (filePath) => ipcRenderer.invoke('detect-capabilities', filePath),
+  // 自修改特征 + 摘要目标存在性（只读文件字节，不依赖 IDA）
+  analyzeSmc: (filePath) => ipcRenderer.invoke('analyze-smc', filePath),
+  // pcap 流量提取（渲染层专用通道：executeToolCall 只在 AI 循环内）
+  trafficExtract: (args) => ipcRenderer.invoke('traffic-extract', args),
   getAppPaths: () => ipcRenderer.invoke('get-app-paths'),
   adbWaitDevice: (timeoutMs) => ipcRenderer.invoke('adb-wait-device', timeoutMs),
   driveAppUi: (steps) => ipcRenderer.invoke('drive-app-ui', steps),
@@ -133,5 +145,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   kaliStartVm: () => ipcRenderer.invoke('kali-start-vm'),
   kaliStopVm: () => ipcRenderer.invoke('kali-stop-vm'),
   kaliExecCommand: (command) => ipcRenderer.invoke('kali-exec-command', command),
-  kaliTestConnection: () => ipcRenderer.invoke('kali-test-connection')
+  kaliTestConnection: () => ipcRenderer.invoke('kali-test-connection'),
+  // Kali 远程预检决策（纯模块在主进程；渲染层只传事实、消费结论）
+  kaliPreflightDecide: (input) => ipcRenderer.invoke('kali-preflight-decide', input),
+  kaliRemotePlan: (input) => ipcRenderer.invoke('kali-remote-plan', input),
+  classifyRemoteError: (input) => ipcRenderer.invoke('classify-remote-error', input)
 });

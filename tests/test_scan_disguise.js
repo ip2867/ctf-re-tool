@@ -15,10 +15,19 @@ function show(label, file) {
   return r;
 }
 
-const d = 'E:/ctf/pratice/nai/Disguise/Disguise.exe';
+// 可选真样本诊断脚本：node tests/test_scan_disguise.js --real <Disguise.exe>
+// 默认不跑（CI 不依赖本机样本目录）。仓库内的同类样本见
+// tests/regression/disguise-loader-xor-dword/Disguise.exe。
+const realIdx = process.argv.indexOf('--real');
+const d = realIdx >= 0 ? String(process.argv[realIdx + 1] || '') : '';
+if (!d) {
+  console.log('SKIP 未提供 --real <Disguise.exe>（本脚本是真样本诊断工具，不参与 CI 判定）');
+  process.exit(0);
+}
 show('第一层 Disguise.exe', d);
 
 // 解出 stage2 后再扫（复现题解的释放逻辑：.data 0x41C000 每 dword 取低字节 XOR 7）
+if (!fs.existsSync(d)) { console.log('（样本缺失，跳过 stage2 复现）'); process.exit(0); }
 try {
   const pe = require('fs').readFileSync(d);
   // 用 PE 头算 0x41C000 的文件偏移

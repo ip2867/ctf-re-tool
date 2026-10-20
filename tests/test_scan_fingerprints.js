@@ -183,10 +183,14 @@ console.log('\nF) 误报安全（真实系统大二进制）');
   check(`测试了 ${tested} 个真实二进制，无 high 置信度误报`, tested > 0 && falsePos === 0, `误报 ${falsePos} 个`);
 }
 
-console.log('\nG) 真实样本回归（路径不存在则跳过）');
+console.log('\nG) 真实样本回归（--real <crackme2> <cnbragon>，缺省跳过）');
 {
-  const crackme2 = 'E:/ctf/pratice/ai/CrackMe2/19248a41-b7fc-440d-ad52-d3fcf287cab9_x/CrackMe/CrackMe.exe';
-  if (fs.existsSync(crackme2)) {
+  // 真样本不入库（体积/版权），CI 不依赖本机样本目录。
+  const realArgs = process.argv.reduce((acc, a, i, arr) => (a === '--real' ? arr.slice(i + 1).filter(Boolean) : acc), []);
+  const crackme2 = realArgs[0] || '';
+  const cnbragon = realArgs[1] || '';
+  if (!crackme2) console.log('     （未提供 --real，跳过真样本校验）');
+  if (crackme2 && fs.existsSync(crackme2)) {
     const r = scanCryptoFingerprints(crackme2);
     check('CrackMe2 → summary 含 MD5（散落 K 表）', has(r, /^MD5$/), sumText(r));
     const md5 = (r.summary || []).find(s => s.algo === 'MD5') || {};
@@ -196,9 +200,9 @@ console.log('\nG) 真实样本回归（路径不存在则跳过）');
     console.log('     （跳过 CrackMe2：样本不存在）');
   }
 
-  const cnbragon = 'E:/ctf/pratice/ai/cnbragon/4e785e8e-9fc0-493a-ad8f-059bf1e4b804_x/cnbragon/KanxueCTF2016Keygenme.exe';
-  if (fs.existsSync(cnbragon)) {
-    const r = scanCryptoFingerprints(cnbragon);
+  const cnbragonPath = cnbragon;
+  if (cnbragonPath && fs.existsSync(cnbragonPath)) {
+    const r = scanCryptoFingerprints(cnbragonPath);
     check('cnbragon → summary 含自定义分组密码', has(r, /自定义分组密码/), sumText(r));
     // 真实布局是 `00 v v v`：只保留 valueLane=1 的那条（0x1fb98）
     const h = (r.fingerprints || []).find(x => x.fp === 'SBOX-256' && x.algo === 'CUSTOM-BLOCK' && x.valueLane === 1);

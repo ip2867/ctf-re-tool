@@ -26,7 +26,7 @@ function extractSchema(src, name) {
 
 const TOOLS = ['read_file', 'write_file', 'bash', 'run_python', 'glob', 'grep',
   'scan_crypto', 'extract_payload', 'analyze_structure', 'gen_block_cipher_solver',
-  'gen_sm4_solver', 'ida_decompile', 'ida_get_bytes'];
+  'gen_sm4_solver', 'ida_decompile', 'ida_get_bytes', 'ida_list_globals'];
 
 console.log('A) schema 可解析');
 const schemas = {};
@@ -110,8 +110,7 @@ console.log('\nG) toolLabel 的 case 必须对应真实工具名');
   for (const t of MUST) ok(caseNames.includes(t), `toolLabel 覆盖 ${t}`);
 }
 
-console.log('\nH) MCP 字节读取的参数形态与解析（从 tool-result.js require）');
-{
+console.log('\nH) MCP 字节读取的参数形态与解析（从 tool-result.js require）');{
   const { buildGetBytesAttempts, pyExecArgs } = require('../electron/tool-result.js');
   const at = buildGetBytesAttempts('0x401000', 16);
   ok(at.length === 5, `五形态（实际 ${at.length}）`);
@@ -126,6 +125,17 @@ console.log('\nH) MCP 字节读取的参数形态与解析（从 tool-result.js 
   ok(at[4].address === '0x401000' && at[4].count === 16 && !('size' in at[4]), '形态5 = {address,count}');
   const py = pyExecArgs('X');
   ok(Object.keys(py).length === 1 && py.file_path === 'X', 'pyExecArgs 深等于 {file_path:"X"}');
+}
+
+console.log('\nI) ida_list_globals 的 schema 与 dispatch');
+{
+  const s = schemas.ida_list_globals;
+  ok(!!s, 'ida_list_globals schema 可解析');
+  for (const p of ['queries', 'filter', 'offset', 'count']) {
+    ok(s && s.props.includes(p), `schema 含 ${p}`);
+  }
+  ok(/case 'ida_list_globals':[\s\S]{0,120}idaMcpCallPaged\('list_globals'/.test(mainSrc),
+    'dispatch 调用 list_globals（分页）');
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

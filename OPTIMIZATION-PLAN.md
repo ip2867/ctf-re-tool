@@ -16,6 +16,36 @@
 
 全量：`node tests/run_all.js` → 单元测试 **49/49**、回归题集通过、exit 0。
 
+## 一之二、2026-10-20 修复与真实联调（已完成）
+
+在 rank 1–6 之上，针对工作流复核暴露的契约级缺口与工具链可用性做了 6 项修复，并完成 4 条真实联调。
+
+### 修复项
+
+| # | 缺陷 | 修法 | 回归用例 |
+|---|---|---|---|
+| 1 | Burp `get_proxy_http_history` 的 `count`/`offset` 都是必填，`adaptBurpArgs` 只改名 `max→count`，缺 `offset` → 整条 history 报错 | `adaptBurpArgs` 按 schema 的 `required` 补中性初值（数字 0 / 字符串空 / 数组空 / 布尔 false），只补缺不覆盖 | `test_protocol_contracts.js` [1] |
+| 2 | MCP `result.isError` 未透传：`requires extension`、`Field 'offset' is required` 这类失败被当成功文本交给 AI | 新增 `mcpResultIsError`/`mcpErrorText`，接入 IDA 与 Burp 两个客户端 | 同上 [2] |
+| 3 | `sshExec` 忽略退出码：命令失败仍返回 `success:true` + 空 stdout | `stream.on('close', (code, signal))` 透传真实退出码；`remote_exec` 消费它 | 同上 [3] |
+| 4 | `file-capability.js` 用 4 字节 `head` 全等比较 2 字节的 `'1F8B'`，gzip 头永远判不出 | 改用 `startsWith` | 同上 [4] |
+| 5 | `detect-file-type` 产出 `WASM`，但 `autoAnalyze` 的 switch 没有对应 case → 落进未知类型提示 | 新增 `case 'WASM'` 走本地探测 | 同上 [5] |
+| 6 | Burp 返回的错误串被 `burpHistoryLooksEmpty` 判成"有流量" → 跳过拉起浏览器 + 把报错喂给 AI | 新增错误前缀识别（`Error:` / `BURP_DOWN` / `requires extension` / `Field '...' is required` 等）+ 结构化 `isError` 识别 | 同上 [6] |
+| 7 | IDA 9 异步调试器：`idaapi.step_over()` 投递成功却返回 False，插件报 `Failed to step over`，而 IP 实际已前进 | 新增 `rescueStepFailure`：单步失败后读 IP，确实变化即判成功 | `test_ida_dynamic.js` [4] |
+| 8 | 调试能力白名单必须与 `buildDbgCall` 产出严格一致，否则又变成"宣称了 AI 调不到的能力" | 白名单收敛为 15 个已包装工具 | `test_ida_dbg_wiring.js` [7] |
+
+### 真实联调结果（全部 PASS）
+
+| 链路 | 证据 |
+|---|---|
+| **Burp offset** | 同一活服务上三态对比：`{max:5}` → 服务器拒绝未知键；旧适配 `{count:5}` → `Field 'offset' is required`；新适配 `{count:5,offset:0}` → 返回真实 `GET / HTTP/1.1` 历史 |
+| **IDA 动态调试** | 不带 `?ext=dbg` 时 62 个工具、dbg_* = **0**；带上后 82 个工具、dbg_* = **20**。`dbg_start` 返回 `{started:true, ip:"0x77d2a6b0"}`；`dbg_regs` 返回真实寄存器；单步后 IP `0x77d284cc → 0x4012d1`；`dbg_read@0x4012d3` 读出 `6aff68c0504000689c1f400064a10000`；`dbg_add_bp(0x4012d0)` → `dbg_bps` 可见 → `dbg_run_to` 命中；`dbg_exit` 正常 |
+| **Kali SSH** | 修正凭据后 `uname -a` 返回 Kali 6.12.38；`binwalk 2.4.3` / `file` / `strings` / `python3` 均可用；失败命令返回退出码 2 并被 `classifyRemoteError` 判为 `REMOTE_REFUSED` |
+| **Kali 端到端** | 按能力分诊：ELF→static、gzip→extract、squashfs→extract、裸 .bin→local-probe、pcap→traffic。把样本传到 Kali 后 `file`/`binwalk`/`strings` 全部 code=0 并返回真实输出 |
+
+全量：`node tests/run_all.js` → 单元测试 **71/71**、回归题集通过、exit 0。
+
+**凭据修正**：`config.json` 的 `kali.sshUser/sshPass` 由占位值 `kali/kali` 改为本机实际账号（连接验证通过后写入，密码不回显）。
+
 **上一轮遗留的两项也已验证**：
 - P1 契约自动枚举 → 演进为 rank 5 的"契约驱动 verified + 重试循环"，本轮 xxor 实测转成功
 - P2 中间值自动推进 → 已落地（`electron/intermediate-advance.js`，17 项单测 + 3 项 E2E）
@@ -61,7 +91,7 @@
 
 ### P1 — MD5 目标串自动定位（rank 6 的直接后续）
 
-**数据**：CrackMe2 已能识别 `MD5(high)`（K 64/64），但 607 秒内 AI 没把"用户名/序列号校验"的目标串找全。
+**数据**：CrackMe2 已能识别 `MD5(high)`（K 64/64），但 607 秒（总耗时；Tool-Use 阶段 579.4/323.2）内 AI 没把"用户名/序列号校验"的目标串找全。
 
 **现状**：工具告诉 AI "这是 MD5"，但没告诉它"和什么比、比多少字节"。
 
@@ -74,7 +104,7 @@
 
 ### P2 — 单题预算按形态分层
 
-**数据**：本轮 6 道平均 59s，但 CrackMe2 跑到 607s、cnbragon 349s 仍无产出。
+**数据**：本轮 6 道平均 59s，但 CrackMe2 跑到 607 秒（总耗时；Tool-Use 阶段 579.4/323.2）、cnbragon 349 秒（总耗时；Tool-Use 阶段 579.4/323.2）仍无产出。
 
 **现状**：一刀切的 60 轮 / 12 分钟。简单题浪费预算，难题预算不够。
 

@@ -1,19 +1,39 @@
 @echo off
+title CTF-RE-TOOL v1.8.0
+
 echo ========================================
-echo   CTF Reverse Engineering Tool 1.6.0
+echo   CTF-RE-TOOL v1.8.0
+echo   CTF Reverse Engineering AI Workbench
 echo ========================================
 echo.
-echo 功能特�?
-echo   - 文件拖入自动识别
-echo   - 一键调用逆向工具
-echo   - Frida自动Hook
-echo   - 解密脚本生成
-echo   - 反调试绕�?
+echo   [1] Drag files in for auto-detection
+echo   [2] One-click tools: IDA / JEB / jadx / Burp
+echo   [3] Frida auto hook
+echo   [4] Directed dynamic debugging: local PE / remote ELF
+echo   [5] Offline crypto and recipe chains
+echo   [6] Local verification loop
 echo.
-echo 启动�?..
+echo Starting...
 echo.
 
 cd /d "%~dp0"
-npm start
+
+if not exist node_modules (
+  echo [INFO] node_modules not found, installing dependencies...
+  call npm install
+  if errorlevel 1 (
+    echo.
+    echo [ERROR] npm install failed. Please check Node.js installation.
+    pause
+    exit /b 1
+  )
+)
+
+call npm start
+
+if errorlevel 1 (
+  echo.
+  echo [ERROR] Failed to start. See output above.
+)
 
 pause

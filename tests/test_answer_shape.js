@@ -93,10 +93,12 @@ console.log('\n[4] 契约驱动 verified 的三条件');
   ok(/contracts\.some\(c => c && String\(c\.key/.test(seg.replace(/\s+/g, ' ')),
     '条件②：存在契约 key 等于该值');
   ok(/hits\.length > 0/.test(seg), '条件③：契约本地复现有命中');
-  ok(/byKey && hits\.length > 0/.test(seg.replace(/\s+/g, ' ')), '两个条件必须同时成立');
+  // 近失升级后判定为三通道：(byKey || byHit || byOutput) && (hits.length>0 || byOutput)
+  ok(/\(byKey \|\| byHit \|\| byOutput\) && \(hits\.length > 0 \|\| byOutput\)/.test(seg.replace(/\s+/g, ' ')),
+    '三通道任一命中（byKey 仍要求有 hits）');
   ok(/verified:\s*true/.test(seg), '命中时标 verified:true');
   ok(/verified:\s*false/.test(seg), '未命中时标 verified:false（不冒充已验证）');
-  ok(/裸答案 .* 经契约复现确认/.test(seg), '有可观察日志');
+  ok(/裸答案 .* 经本地复现确认/.test(seg), '有可观察日志');
   // 条件①：值必须来自 extractFlags(aiText)
   ok(/flags\.length/.test(seg) && /for \(const v of flags\)/.test(seg),
     '条件①：只对 extractFlags 抽出的候选判定');
@@ -116,8 +118,10 @@ console.log('\n[5] 提交路径：裸答案按外壳包装后提交');
   ok(/if \(!submitCandidates\.length\)/.test(seg), '空候选判断改用 submitCandidates');
   // 早退分支必须用 submitCandidates，不能再用旧的 verified
   const guardIdx = seg.indexOf('if (!submitCandidates.length)');
-  const afterGuard = seg.slice(guardIdx, guardIdx + 600);
-  ok(/no-verified-flag/.test(afterGuard), '空候选分支返回 no-verified-flag');
+  const afterGuard = seg.slice(guardIdx, guardIdx + 900);
+  // 近失分级后 note 是三档：blocked-by-av > near-miss-answer > no-verified-flag
+  ok(/near-miss-answer/.test(afterGuard) && /no-verified-flag/.test(afterGuard), '空候选分支区分近失与颗粒无收');
+  ok(/blocked-by-av/.test(afterGuard), 'AV 阻断优先于两者');
   ok(!/if \(!verified\.length\)/.test(seg), '旧的 verified 早退已移除');
 }
 

@@ -1,4 +1,4 @@
-# CTF-RE-TOOL v1.8.0
+# CTF-RE-TOOL v1.9.1
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -11,11 +11,12 @@
 
 - **AI 工具循环（Tool-Use）**：AI 自主调用 JEB/IDA/Frida/Python 等工具反复推进，而不是一次性问答；分阶段提示词（①收集 → ②定位算法 → ③写脚本本地验证 → ④结论）。
 - **动态调试闭环**：IDA 调试器可直接下断点、单步、读写内存，覆盖本地 PE 与 Kali 远程 ELF；先静态取数锁定函数，再定向取证。
+- **花指令自动修复**：11 类花指令特征识别 + 只 nop 跳转本身的等长修补（字节偏移与语义都不变），修复后自动让 IDA 重新分析并等到就绪；实测把非对齐跳转降 78%、边界冲突点降 98%，让原本反编译失败的关键函数变得可读。
 - **本地验证闭环**：AI 给出的每个 flag 都附 `[VERIFY]` 契约，工具自动生成 Python 复现脚本本地跑一遍，标注 ✅已验证 / ⚠️未验证——**不靠"AI 说解出来了"就当解出来了**。
 - **结构化知识库**：50 条可检索条目（43 篇历年题 + 7 篇方法论），每条带 `attack_chain` 解法链 / `failed_attempts` 避坑；按题目特征自动预取，命中即注入 AI 上下文。
 - **经验自进化**：每次解题沉淀的多步攻击链写入经验库，下次同类题自动速查复用。
 
-**下载**：[v1.8.0 便携版 CTF-RE-TOOL.exe](https://github.com/ip2867/ctf-re-tool/releases/download/v1.8.0/CTF-RE-TOOL.exe)（74.11 MB，单文件双击即用，无需安装 / 无需 Node.js）
+**下载**：[v1.9.1 便携版 CTF-RE-TOOL.exe](https://github.com/ip2867/ctf-re-tool/releases/download/v1.9.1/CTF-RE-TOOL.exe)（74.11 MB，单文件双击即用，无需安装 / 无需 Node.js）
 
 > 校验：`SHA256 = 0b81078183312a1e8acb31ab1c4f784ad430284c7423ed64b8d3d29ed32ee167`
 >
@@ -367,7 +368,39 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 ## 更新日志
 
-### v1.8.0 (2026-10-20) — 动态调试打通 + 知识库可达性修复
+### v1.9.1 (2026-10-26) — 花指令（junk code）识别与修复闭环 + 安全性审查
+
+新增一整条**花指令自动修复**能力，并修掉代码审查发现的 7 类会静默改坏正常程序的缺陷。
+
+**花指令能力（新）**
+
+- `junk_scan` / `junk_patch` / `junk_repair` 三个 AI 工具，覆盖 11 类特征
+  （假跳转、永真永假 jcc、call/ret 地址操纵、跳转链、伪造函数、异常 XREF、垃圾序列、
+  栈指针混淆、跳转到数据）。
+- 核心判据：**跳转目标必须落在指令边界上**。"目标不在边界"是纠错依据而不是病症本身。
+- 修复策略只把**跳转指令本身**换成等长 NOP，字节偏移与可执行语义都不变。
+- 写出修补文件后**自动**让 IDA 重新分析并等到就绪（`ida_open_file` + `idaReloadAndWait`），
+  解决"AI 在旧 IDB 上反编译 → 误判修补无效 → 退回自己写脚本 nop"的死循环。
+- 多实例兜底：`open_file` 拿不到新实例端口时，用 `list_instances` 按路径匹配 + `select_instance` 精确切换。
+- 实测 Matr1x（ELF32）：非对齐跳转 301 → 63（-78.6%），边界图冲突点 403 → 6（-98.5%），
+  不可解码 647 → 259，IDA 识别函数 54 → 90，可反编译函数 35 → 50。
+
+**安全性修复（代码审查发现，均已补回归测试）**
+
+| 问题 | 后果 |
+|---|---|
+| `decodeInsn` 的 `0F 8x` 分支丢弃 `rel` | jcc32 目标恒为 null → 边界图崩溃；线性扫描把 xor + 整条 jnz 一起 nop |
+| `isFlagSetter` 把 `test/cmp/and r,imm` 当"条件恒定" | 把编译器最常见的空指针检查 `test eax,eax; jz` 改成无条件 jmp，跳过真实代码 |
+| F02 不看条件方向 | "永不跳"被改成"永远跳"；反向跳被改成 `EB FE` 死循环 |
+| F05 nop 短 jmp | 执行落进被跳过的字节，垃圾变代码 |
+| `scanJunkFeatures` 不校验 `end <= buf.length` | ELF 的 `p_memsz > filesz` 时扫到文件外，主进程 OOM |
+| `idaReloadAndWait` 忽略 `new_database`、180s 撞传输层 60s、失败伪装成功 | 丢失旧库；大程序假失败；失败被记成成功 |
+| `features` 参数名与 schema 不一致 | 按文档传参 = 静默关闭全部检测 |
+| 解码器缺口（`0x40` 当 REX、`0F 77` 多吃一字节、`25/2D/35/3D` 返回 null） | 指令边界整体错位——正是花指令要解决的问题本身 |
+
+新增 `tests/test_junk_safety.js`（58 条断言）专门锁死上述每一类，回归 **88/88**。
+
+### v1.9.0 (2026-10-20) — 动态调试打通 + 知识库可达性修复
 
 这一版只有一件事：**让工具真的能参与解题**，而不是只把能力写进文档。
 

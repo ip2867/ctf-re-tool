@@ -33,6 +33,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 写入文件（供脚本保存/VS Code 打开）
   writeFile: (filePath, content) => ipcRenderer.invoke('write-file', filePath, content),
   readFile: (filePath) => ipcRenderer.invoke('read-file', filePath),
+  // 裸 .class 常量池摘要（JEB/jadx 双失败的兜底，主进程解析二进制）
+  classFileSummary: (filePath) => ipcRenderer.invoke('class-file-summary', filePath),
+  // 花指令主动探测（从二进制本身判断是否存在花指令，供知识库检索与提示词引导）
+  junkProbe: (filePath) => ipcRenderer.invoke('junk-probe', filePath),
   // 抽取文件内可打印字符串（中间值自动推进做字典用）
   extractStrings: (filePath) => ipcRenderer.invoke('extract-strings', filePath),
   // 解析 PE/ELF 映像范围与节表（IDA 落界校验用）

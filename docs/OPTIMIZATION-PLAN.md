@@ -77,7 +77,7 @@
 之后，`get_process_options()` 会一直带着这组值：
 
 ```
-('...\\CrackMe.exe', '', '...', '192.168.230.129 ', '200512', 23946)
+('...\\CrackMe.exe', '', '...', '<kali-host> ', '<redacted>', 23946)
 ```
 
 此后即使 `load_debugger("win32")` 成功，`start_process` 也返回 **-1** ——
@@ -99,7 +99,7 @@
 
 | 步骤 | 结果 |
 |---|---|
-| 启动前读进程选项 | 确认残留 `192.168.230.129 / 200512 / 23946` |
+| 启动前读进程选项 | 确认残留 `<kali-host> / <redacted> / 23946` |
 | `clear_remote` | `REMOTE_CLEARED` + `LOCAL_LOADED` |
 | `start`（local，PE） | **`START_RC 1`**，返回 `ip=0x77b8123c` |
 | `regs` | `ip=0x77b8123c`，thread=24812，寄存器可读 |
@@ -396,8 +396,8 @@ win32_remote32.exe / win64_remote.exe
 
 ```bash
 # 1. 把 linux_server 传到 Kali（教程第 1 步）
-scp dbgsrv/linux_server ip2867@192.168.230.129:/tmp/
-ssh ip2867@192.168.230.129 'chmod +x /tmp/linux_server'
+scp dbgsrv/linux_server <user>@<kali-host>:/tmp/
+ssh <user>@<kali-host> 'chmod +x /tmp/linux_server'
 
 # 2. 在 Kali 上以 root 运行（教程第 2 步），监听 23946
 setsid /tmp/linux_server -P<password> > /tmp/ls.log 2>&1 < /dev/null &
@@ -412,7 +412,7 @@ setsid /tmp/linux_server -P<password> > /tmp/ls.log 2>&1 < /dev/null &
 ```
 linux_server 日志:
   IDA Linux 64-bit remote debug server(ST) v9.1.31. Hex-Rays (c) 2004-2025
-  2026-10-20 12:26:05 Listening on :::23946 (my ip 192.168.230.129)...
+  2026-10-20 12:26:05 Listening on :::23946 (my ip <kali-host>)...
   2026-10-20 12:26:24 [1] Accepting connection from ::ffff:192.168.230.1...
   Login to PlutoChat
   Username: Password: Could not connect to PlutoChat servers. Try again later!

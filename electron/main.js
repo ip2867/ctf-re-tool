@@ -30,6 +30,13 @@ const { buildDbgCall, normalizeHex, normalizeAddrList, normalizeRegions, normali
 const { classifyIdaDebugTools } = require('./ida-debug-capability');
 // 自修改特征（W+X 节/可写代码段/反调试导入）
 const { detectSmcSignals } = require('./smc-detect');
+// 花指令（junk code / opaque predicate）识别与修补：判据基于控制流而非字节匹配
+const { scanJunk: junkScan, scanJunkRecursive: junkScanRecursive, patchJunk: junkPatch } = require('./junk-code');
+// 指令边界重建（不修改字节，从入口沿控制流建立正确的指令起点集合）
+const { buildBoundaryMap } = require('./boundary-map');
+// 花指令签名式修补（只 nop 跳转本身，字节偏移不变）
+const { scanJunkFeatures, scanJunkFeatures: repairJunk, applyRepair, FEATURES: JUNK_FEATURES } = require('./junk-repair');
+const { decodeInsn } = require('./junk-code');
 // MD5 摘要目标的"存在性"闸门（16B 对齐 + Shannon>=7.5，排除 .rsrc/.reloc）
 const { assessHashTarget, buildMd5Note, extractDigestCallSites } = require('./hash-hint');
 // 指纹表的 xref 闸门（32 位 PE 绝对引用回退；x64/ELF 不降级）
@@ -3254,8 +3261,12 @@ function toolLabel(name, input) {
     case 'scan_crypto': return '扫描算法指纹 ' + short(i.path ? path.basename(i.path) : '', 40);
     case 'extract_payload': return '提取载荷';
     case 'analyze_structure': return '分析密码结构';
+    case 'junk_scan': return '扫描花指令 ' + short(i.path ? path.basename(i.path) : '', 40);
+    case 'junk_patch': return '去除花指令 ' + short(i.path ? path.basename(i.path) : '', 40);
+    case 'junk_repair': return '修复花指令 ' + short(i.path ? path.basename(i.path) : '', 40);
     case 'gen_block_cipher_solver': case 'gen_sm4_solver': return '生成解密脚本';
     case 'ida_decompile': return 'IDA 反编译 ' + short(i.function_name || i.address, 40);
+    case 'ida_open_file': return 'IDA 载入 ' + short(i.path ? path.basename(i.path) : '', 40);
     case 'ida_get_bytes': return 'IDA 读取字节 ' + short(i.address, 30);
     case 'ida_list_functions': return 'IDA 列出函数';
     case 'ida_find_strings': return 'IDA 查找字符串 ' + short(i.keyword || i.pattern || '', 30);
@@ -3352,6 +3363,158 @@ ipcMain.handle('read-file', async (event, filePath) => {
   try {
     if (isSensitivePath(filePath)) return { success: false, error: '拒绝读取受保护文件（含凭据）' };
     return { success: true, content: fs.readFileSync(path.resolve(filePath), 'utf8') };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// ── Java .class 常量池解析（裸 .class 的最后兜底）──
+// 背景（40 题实测「Java逆向解密」）：JEB MCP 拉起失败 → jadx 命令行对单个 .class
+// 无源码输出 → 整条降级链断掉，2 分钟放弃。.class 格式本身极简单（魔数+常量池+
+// 字段/方法表），主进程有 Buffer，解析出"类名/字符串常量/方法签名/字节码 hex"
+// 就足够 AI 还原简单校验逻辑。解析全部 best-effort，任何越界都降级返回已解析部分。
+function parseClassSummary(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 10) return { ok: false, error: '文件过小，不是 .class' };
+  if (buf.readUInt32BE(0) !== 0xCAFEBABE) return { ok: false, error: '魔数不是 CAFEBABE，不是 .class' };
+  let p = 4;
+  const readU2 = () => { const v = buf.readUInt16BE(p); p += 2; return v; };
+  const readU4 = () => { const v = buf.readUInt32BE(p); p += 4; return v; };
+  const minor = readU2(), major = readU2();
+  const cpCount = readU2();
+  const cp = new Array(cpCount).fill(null);
+  for (let i = 1; i < cpCount; i++) {
+    if (p >= buf.length) break;
+    const tag = buf.readUInt8(p); p += 1;
+    try {
+      if (tag === 1) {
+        const len = readU2();
+        cp[i] = { tag, str: buf.toString('utf8', p, Math.min(p + len, buf.length)) };
+        p += len;
+      } else if (tag === 3 || tag === 4) { cp[i] = { tag }; p += 4; }
+      else if (tag === 5 || tag === 6) { cp[i] = { tag }; p += 8; cp[++i] = { tag: 0 }; }  // long/double 占双槽
+      else if (tag === 7 || tag === 8 || tag === 16 || tag === 19 || tag === 20) { cp[i] = { tag, idx: readU2() }; }
+      else if (tag === 9 || tag === 10 || tag === 11 || tag === 12 || tag === 17 || tag === 18) { cp[i] = { tag, a: readU2(), b: readU2() }; }
+      else if (tag === 15) { cp[i] = { tag }; p += 3; }
+      else break;  // 未知 tag：停止解析常量池，用已解析部分
+    } catch (e) { break; }
+  }
+  const utf8 = (i) => (cp[i] && cp[i].tag === 1 && typeof cp[i].str === 'string') ? cp[i].str : '';
+  const className = (i) => {
+    const e = cp[i];
+    if (e && e.tag === 7) return utf8(e.idx).replace(/\//g, '.');
+    return '';
+  };
+  const naType = (e) => (e && utf8(e.a) && utf8(e.b)) ? utf8(e.a) + ':' + utf8(e.b) : '';
+
+  // 头部信息（常量池损坏时 p 已越界，后面全部跳过）
+  let thisClass = '', superClass = '', interfaces = [], fields = [], methods = [];
+  const strings = [];
+  for (let i = 1; i < cpCount; i++) {
+    const s = utf8(i);
+    if (s && s.length >= 3 && /^[\x20-\x7e]+$/.test(s)) strings.push(s);
+  }
+  try {
+    readU2();                    // access_flags
+    thisClass = className(readU2());
+    superClass = className(readU2());
+    const ifc = readU2();
+    for (let k = 0; k < ifc && p + 2 <= buf.length; k++) interfaces.push(className(readU2()));
+    const readMembers = (isMethod) => {
+      const out = [];
+      const n = readU2();
+      for (let k = 0; k < n && p + 8 <= buf.length; k++) {
+        const access = readU2();
+        const name = utf8(readU2());
+        const desc = utf8(readU2());
+        const an = readU2();
+        let codeHex = '';
+        for (let a = 0; a < an && p + 6 <= buf.length; a++) {
+          const aname = utf8(readU2());
+          const alen = readU4();
+          const attrStart = p;                       // 属性内容起点（alen 从这里起算）
+          if (isMethod && aname === 'Code' && p + 8 <= buf.length) {
+            readU2(); readU2();                     // max_stack / max_locals
+            const clen = readU4();
+            const take = Math.min(clen, 512, Math.max(0, buf.length - p));
+            if (take > 0) codeHex = buf.slice(p, p + take).toString('hex');
+            p = attrStart + alen;                   // 跳过整个属性（含异常表/属性内属性）
+            continue;
+          }
+          p = attrStart + alen;
+        }
+        out.push({ name, desc, access: '0x' + access.toString(16), ...(codeHex ? { codeHex } : {}) });
+      }
+      return out;
+    };
+    fields = readMembers(false);
+    methods = readMembers(true);
+  } catch (e) { /* 头部越界：用常量池部分 */ }
+
+  const cap = (arr, n) => arr.slice(0, n);
+  return {
+    ok: true,
+    version: major + '.' + minor,
+    thisClass, superClass,
+    interfaces: cap(interfaces, 8),
+    fields: cap(fields, 24),
+    methods: cap(methods, 40),
+    strings: cap(strings, 160),
+    constantsParsed: cp.filter(Boolean).length,
+  };
+}
+
+// IPC: 花指令主动探测
+// 为什么需要：prefetchKnowledge 的 haystack 是**反编译文本**，里面不会出现
+// "花指令/sp-analysis" 这类 IDA 界面状态词 → 用词匹配永远命中不了。
+// 唯一可靠的办法是从二进制本身量测：跳转目标非对齐数/比例、可疑跳转、不可达字节。
+// 渲染层拿到后：① 命中则把"花指令"加进检索词 ② 提示词里直接告知 AI 该用 junk_repair。
+ipcMain.handle('junk-probe', async (event, filePath) => {
+  try {
+    const p = path.resolve(String(filePath || ''));
+    if (!fs.existsSync(p)) return { success: false, error: '文件不存在: ' + filePath };
+    const buf = fs.readFileSync(p);
+    let start = 0, end = buf.length;
+    try {
+      const map = parseImageMap(buf);
+      const exec = (map && Array.isArray(map.sections) ? map.sections : []).filter(s => s.executable);
+      if (exec.length) {
+        start = Math.min(...exec.map(s => Number(s.rawPtr) || 0));
+        end = Math.max(...exec.map(s => (Number(s.rawPtr) || 0) + (Number(s.rawSize) || 0)));
+      }
+    } catch (e) { /* 用全文件 */ }
+    if (end - start < 64) return { success: true, probed: false, reason: '代码区过小' };
+
+    const r = scanJunkFeatures(buf, { start, end, decodeInsn });
+    if (!r.ok) return { success: false, error: r.error };
+
+    const bad = r.stats.badTargets;
+    const ratio = bad / Math.max(1, r.stats.insnCount);
+    return {
+      success: true, probed: true,
+      start, end, size: end - start,
+      insnCount: r.stats.insnCount,
+      undecodable: r.stats.undecodable,
+      badTargets: bad,
+      badRatio: +(ratio * 100).toFixed(2),
+      features: r.stats.features,
+      patchable: r.stats.patchable,
+      reportOnly: r.stats.reportOnly,
+      suspicious: bad >= 20 || ratio > 0.002,
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// IPC: .class 常量池摘要（JEB/jadx 双失败时的第三条路）
+ipcMain.handle('class-file-summary', async (event, filePath) => {
+  try {
+    if (isSensitivePath(filePath)) return { success: false, error: '拒绝读取受保护文件（含凭据）' };
+    const abs = path.resolve(String(filePath || ''));
+    if (!fs.existsSync(abs)) return { success: false, error: '文件不存在: ' + filePath };
+    const r = parseClassSummary(fs.readFileSync(abs));
+    if (!r.ok) return { success: false, error: r.error };
+    return { success: true, summary: r };
   } catch (err) {
     return { success: false, error: err.message };
   }
@@ -3688,6 +3851,16 @@ ipcMain.handle('autotest-report', async (event, data) => {
   try {
     const file = path.join(app.getPath('userData'), 'autotest-report.json');
     fs.writeFileSync(file, typeof data === 'string' ? data : JSON.stringify(data, null, 2), 'utf8');
+    // 追加式轮次日志（40 题实测的观测缺口：report.json 只留最后一轮快照，
+    // 外部只能靠 UI DOM 扒进度。每轮追加一行，批跑结束后可完整复盘）
+    try {
+      const j = typeof data === 'string' ? JSON.parse(data) : data;
+      const last = j && Array.isArray(j.results) ? j.results[j.results.length - 1] : null;
+      if (last) {
+        fs.appendFileSync(path.join(app.getPath('userData'), 'autotest-rounds.jsonl'),
+          JSON.stringify({ ts: new Date().toISOString(), round: j.results.length, name: last.name, ok: !!last.ok, note: last.note || '', flag: last.flag || '', near_miss: last.near_miss || [], difficulty: last.difficulty || '' }) + '\n', 'utf8');
+      }
+    } catch (e) { /* 追加失败不影响 report */ }
     return { success: true, path: file };
   } catch (e) {
     return { success: false, error: e.message };
@@ -3920,7 +4093,11 @@ async function idaMcpDiscoverTools(sessionId) {
     'xrefs_to': ['get_xrefs_to', 'xrefs_to', 'get_cross_references'],
     'trace_data_flow': ['trace_data_flow', 'trace_flow', 'data_flow'],
     'get_function_by_name': ['get_function_by_name'],
-    'analyze_file': ['analyze_file', 'auto_analyze']
+    'analyze_file': ['analyze_file', 'auto_analyze'],
+    // open_file 属于 ida-pro-mcp 的 discovery 组：拉起新 IDA 实例并把本 MCP 会话
+    // 重定向过去（switch=true）。花指令修复后必须靠它才能在**新 IDB** 上反编译。
+    'open_file': ['open_file'],
+    'list_instances': ['list_instances']
   };
 
   const realNames = tools.map(t => t && (t.name || t.title)).filter(Boolean);
@@ -3997,6 +4174,17 @@ function normalizeIdaArgs(logicalName, args, realName) {
     }
     case 'list_functions':
       return { queries: args.queries || {} };
+    case 'open_file':
+      // 插件签名：open_file(file_path, switch=True, autonomous=False, new_database=False, timeout=30)
+      // autonomous 必须显式置 true：否则新 IDA 起来后弹模态框，MCP 端口注册不上，
+      // 后续所有工具调用都会超时（表现为"IDA 卡住"）。
+      return {
+        file_path: args.file_path || args.path || '',
+        switch: args.switch !== false,
+        autonomous: args.autonomous !== false,
+        new_database: args.new_database === true,
+        timeout: Number(args.timeout) > 0 ? Number(args.timeout) : 90,
+      };
     case 'list_globals': {
       // 插件 api_core.py 的 list_globals 只认 {queries:{filter,offset,count}}，
       // 缺省 count=100 → 全局符号表被截断。把顶层 filter/offset/count 收进 queries，
@@ -5231,8 +5419,12 @@ async function ctf2DownloadAttachment(url, destDir) {
 }
 
 // IPC: CTF² MCP 工具直通调用（仅前端流水线使用；不注册进 AI 工具定义）
+// CTF_NO_SUBMIT=1 时为 dry-run：只允许拉题/下载等只读操作，禁止提交 flag 与平台笔记。
 ipcMain.handle('ctf2-mcp-call', async (event, toolName, args) => {
   try {
+    if (process.env.CTF_NO_SUBMIT === '1' && (toolName === 'ctf2_submit_flag' || toolName === 'ctf2_agent_log_note')) {
+      return { success: false, error: 'blocked: CTF_NO_SUBMIT=1 (' + toolName + ')' };
+    }
     const result = await ctf2McpCallTool(toolName, args);
     return { success: true, result };
   } catch (err) {
@@ -6092,7 +6284,7 @@ function parseTextToolCalls(rawText) {
     'jeb_get_manifest', 'jeb_get_class_decompiled', 'jeb_get_method_decompiled',
     'jeb_get_exported_activities', 'jeb_get_all_classes', 'jeb_get_class_methods',
     'ida_decompile', 'ida_list_functions', 'ida_find_strings', 'ida_get_xrefs', 'ida_get_bytes',
-    'ida_list_globals', 'ida_disasm', 'ida_dbg', 'ida_dbg_mem',
+    'ida_list_globals', 'ida_disasm', 'ida_dbg', 'ida_dbg_mem', 'ida_open_file',
     'remote_exec', 'traffic_extract', 'recipe', 'gui_input', 'crypto',
     'browser_search', 'browser_open', 'run_command', 'run_python', 'adb_command', 'frida_hook',
     'read_skill', 'wiki_search', 'wiki_read', 'burp_get_history', 'burp_get_message', 'burp_call',
@@ -6105,7 +6297,7 @@ function parseTextToolCalls(rawText) {
     browser_open: 'url', browser_search: 'query', ida_decompile: 'function_name', ida_get_xrefs: 'address',
     ida_get_bytes: 'address', ida_find_strings: 'regex', frida_hook: 'script', adb_command: 'command',
     ida_disasm: 'address', ida_dbg: 'action', ida_dbg_mem: 'action', remote_exec: 'command', traffic_extract: 'path',
-    ida_list_globals: 'filter'
+    ida_list_globals: 'filter', ida_open_file: 'path'
   };
   // 标记：<｜｜tool▁calls▁begin｜｜> / <|tool_calls_begin|> / 变体（全角/半角竖线、▁/_ 分隔）
   const MARK = /<\s*[|｜]\s*[|｜]?\s*tool[\u2581_ ]?calls[\u2581_ ]?begin\s*[|｜]?\s*[|｜]\s*>/gi;
@@ -6356,6 +6548,10 @@ function precheckToolCall(name, input) {
   }
   if (name === 'ida_disasm' && !i.address) {
     return '缺少 address 参数。请传入要反汇编的虚拟地址（如 0x402000）。';
+  }
+  if (name === 'ida_open_file' && !i.path && !i.file_path) {
+    return '缺少 path 参数。请传入要载入 IDA 的二进制绝对路径'
+      + '（花指令修复后通常是 junk_repair 输出的 *_repaired 文件）。';
   }
   if (name === 'ida_dbg') {
     if (!i.action) {
@@ -6780,7 +6976,7 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
         continue;
       }
 
-      // ── 分层收尾第二级：已用工具、有明确进展，但仍没有契约（v1.8.0 / P0.1）──
+      // ── 分层收尾第二级：已用工具、有明确进展，但仍没有契约（v1.9.1 / P0.1）──
       // 实测（86 题中 49 道失败）：AI 已经把函数地址、常量、字节偏移都读出来了，
       // 最后只输出一段"程序先做 A 再做 B"的说明就返回——它缺的不是分析，而是
       // 把已知量固化成可执行脚本这一步。对这类收工继续催"去挖更多证据"是错位的：
@@ -7400,6 +7596,24 @@ function getToolDefinitions() {
     },
     // ========== 动态调试（合并 dbg_* 的 20 个工具） ==========
     {
+      name: "ida_open_file",
+      description:
+        "让 IDA 打开一个二进制并在新实例里重新分析，之后所有 ida_* 调用自动路由到新实例。\n" +
+        "**花指令修复后必用**：junk_repair 只改文件字节，IDA 里现存的 IDB 还是按旧的错位边界解析的，" +
+        "不重开就永远拿到错误的伪代码。\n" +
+        "参数 path 传修补后的文件（如 matrix_repaired）；new_database=true 会强制丢弃旧 IDB 重新分析。" +
+        "返回 success=true 时新实例已就绪，可直接 ida_list_functions / ida_decompile。",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "要打开的二进制绝对路径" },
+          new_database: { type: "boolean", description: "true=丢弃已有 .i64/.idb 强制全新分析（默认 false，有旧库就直接开旧库）" },
+          timeout: { type: "number", description: "等待新实例注册的秒数（默认 90；大程序可加长）" }
+        },
+        required: ["path"]
+      }
+    },
+    {
       name: "ida_dbg",
       description:
         "IDA 动态调试控制。action：start（幂等；远程模式会自动 suspend 并返回重定位符号）、" +
@@ -7822,6 +8036,78 @@ function getToolDefinitions() {
         },
         required: ["path"]
       }
+    },
+    {
+      name: "junk_scan",
+      description:
+        "【花指令识别】扫描代码区，报告花指令（junk code / opaque predicate）候选。" +
+        "当出现以下信号时调用：反编译失败、IDA 提示 'sp-analysis failed'、伪代码明显错乱、" +
+        "代码段出现成片 1~2 字节'指令'、函数边界识别错误。" +
+        "默认走**递归下降**（从 entry/函数入口沿控制流展开）——线性扫描一旦偏 1 字节后续全错；" +
+        "推不出更多入口时会报告'不可达区间'，那些就是花指令垃圾块的候选位置。" +
+        "**强烈建议给 entries（函数入口文件偏移）**，范围越全识别越准。" +
+        "判据通用：确定标志位+短跳过（xor/test/cmp 后接 jcc 且跳过 ≤2 字节）、" +
+        "互补跳转对（jz/jnz 成对且一侧落进垃圾）、跳转目标不落在指令边界（边界歧义=解码错位证据）。" +
+        "**只报告不修改文件**。注意：'call $+5; pop reg' 是 PIC 取址，不是花指令，已排除。",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "文件绝对路径" },
+          start: { type: "number", description: "代码区起始**文件偏移**（可选；缺省从节表推断）" },
+          end: { type: "number", description: "代码区结束文件偏移（可选）" },
+          entries: {
+            type: "array", items: { type: "number" },
+            description: "函数入口的**文件偏移**数组（可选但强烈建议）。" +
+              "可由 ida_list_functions 的地址换算（PE: addr-ImageBase-节VA+节rawPtr；ELF: addr-sh_addr+sh_offset）。"
+          },
+          mode: { type: "string", description: "recursive（默认，推荐）/ linear（兜底）" }
+        },
+        required: ["path"]
+      }
+    },
+    {
+      name: "junk_patch",
+      description:
+        "【花指令修补】按 junk_scan 的候选把花指令整段 patch 成 0x90（nop），写出新文件（原文件不动）。" +
+        "默认只处理 high 置信度且带安全 nop 范围的候选；call/ret 跳板类只会报告、不会自动改" +
+        "（盲 nop 会破坏返回地址）。修补后应让 IDA 重新分析新文件（或对原进程 patch 内存）。" +
+        "**前置：必须先调用过 junk_scan 并确认候选合理。**",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "文件绝对路径" },
+          start: { type: "number", description: "代码区起始文件偏移（须与 junk_scan 一致）" },
+          end: { type: "number", description: "代码区结束文件偏移（须与 junk_scan 一致）" },
+          out: { type: "string", description: "输出文件路径（可选，默认 <原名>_patched.<ext>）" },
+          minConfidence: { type: "string", description: "最低置信度：high（默认）/ medium / low" }
+        },
+        required: ["path"]
+      }
+    },
+    {
+      name: "junk_repair",
+      description:
+        "【花指令修补·推荐】按特征库识别花指令并修复：只把假跳转/垃圾序列替换成等长 NOP，其它字节一个不动" +
+        "（字节偏移完全不变、语义不变）。实测 Matr1x：非边界跳转目标 301→70（-76.7%），" +
+        "IDA 识别函数 54→90，可反编译函数 35→50。" +
+        "**为什么不能整段 nop**：把前序 xor/test 一起清掉会让后续指令重新错位（实测不可解码 4→7）。" +
+        "写盘后会自动让 IDA 重新分析修补后的文件，并给出修复前后同口径对比。" +
+        "返回里带每条修补的判定证据与 features 统计。",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "文件绝对路径" },
+          start: { type: "number", description: "代码区起始文件偏移（可选，缺省从节表推断）" },
+          end: { type: "number", description: "代码区结束文件偏移（可选）" },
+          out: { type: "string", description: "输出文件路径（可选，默认 <原名>_repaired.<ext>）" },
+          dryRun: { type: "boolean", description: "true=只报告不写文件" },
+          features: {
+            type: "array", items: { type: "string" },
+            description: "启用的特征（可选）：false_jump / short_skip / junk_after_jcc / dead_push_pop / opaque_pair。缺省=全部安全特征。"
+          }
+        },
+        required: ["path"]
+      }
     }
   ];
 }
@@ -7904,6 +8190,24 @@ async function executeToolCall(toolName, input) {
           offset: input.offset,
           count: input.count,
         });
+
+      case 'ida_open_file': {
+        const p = String(input.path || input.file_path || '').trim();
+        if (!p) return '参数错误：path 为空。请传入要打开的二进制绝对路径。';
+        if (!fs.existsSync(p)) return `文件不存在: ${p}`;
+        // 会话重定向按 MCP transport session 记录，必须复用同一个 sessionId；
+        // idaMcpCallTool 内部会拿 idaMcpState.sessionId，正好是后续工具调用用的那个。
+        const rr = await idaReloadAndWait(p, {
+          newDatabase: input.new_database === true,
+          timeout: input.timeout,
+        });
+        // 失败时首行必须是 FAILURE_PREFIXES 认得的"工具调用失败"，
+        // 否则主循环会把它当成功结果继续（模型随后在旧 IDB 上反编译并误判）。
+        if (!rr.ok) {
+          return '工具调用失败: IDA 未能切换到目标文件\n' + rr.lines.join('\n');
+        }
+        return rr.lines.join('\n');
+      }
 
       case 'ida_disasm': {
         const addr = String(input.address || '').trim();
@@ -8388,9 +8692,314 @@ async function executeToolCall(toolName, input) {
         return lines.join('\n');
       }
 
-      // ========== 多阶段接力（不在主进程执行，只发信号让渲染层切换）==========
-      // 渲染层收到 stageSwitch 后会：kill 旧 IDA/JEB → 保留结论 → analyzeFile(新文件) + autoAnalyze。
-      // 主进程这里只做存在性校验并回一个确认串（该串不会被 AI 看到——循环会立即中断）。
+      case 'junk_scan': {
+        const p = String(input.path || '').trim();
+        if (!p) return '参数错误：path 为空';
+        if (!fs.existsSync(p)) return `文件不存在: ${p}`;
+        const buf = fs.readFileSync(p);
+        let start = Number(input.start), end = Number(input.end);
+        if (!Number.isFinite(start) || !Number.isFinite(end)) {
+          // 未给范围：从映像节表推断可执行段
+          let map = null;
+          try { map = parseImageMap(buf); } catch (e) { map = null; }
+          const exec = (map && Array.isArray(map.sections) ? map.sections : []).filter(s => s.executable);
+          if (exec.length) {
+            start = Math.min(...exec.map(s => Number(s.rawPtr) || 0));
+            end = Math.max(...exec.map(s => (Number(s.rawPtr) || 0) + (Number(s.rawSize) || 0)));
+          } else { start = 0; end = buf.length; }
+        }
+        // 入口：调用方可用 entries（文件偏移数组）显式指定，否则走自动推断
+        const entries = Array.isArray(input.entries) ? input.entries.map(Number).filter(Number.isFinite) : [];
+        const mode = String(input.mode || 'boundary').toLowerCase();
+
+        // ── boundary 模式：重建指令边界图（不改字节，推荐）──
+        if (mode === 'boundary') {
+          const bm = buildBoundaryMap(buf, { start, end, seeds: entries });
+          if (!bm.ok) return '边界重建失败: ' + bm.error;
+          const L = [];
+          L.push(`文件: ${p}  (${buf.length} 字节)`);
+          L.push(`代码区: [0x${start.toString(16)}, 0x${end.toString(16)}) = ${end - start} 字节`);
+          L.push(`模式: boundary-map（**不修改任何字节**，只重建"哪些地址是指令起点"）`);
+          L.push('');
+          L.push('## 结果');
+          L.push(`- 指令: ${bm.stats.insnCount} 条 / 边界 ${bm.stats.boundaryCount} 个`);
+          L.push(`- 覆盖率: ${bm.stats.coverage}%（未被控制流触及 ${bm.stats.unreachableBytes} 字节）`);
+          L.push(`- 种子入口: ${bm.stats.seedCount} 个（含文件头 entry + 函数序言扫描结果）`);
+          L.push(`- 强制对齐: ${bm.stats.forcedAlignCount} 处（跳转目标非边界 → 按"目标必为起点"纠正）`);
+          L.push(`- 冲突: ${bm.stats.conflictCount} 处（已仲裁 ${bm.stats.conflictResolved}，待定 ${bm.stats.conflictUnresolved}）`);
+          L.push('');
+          if (bm.unreached && bm.unreached.length) {
+            L.push('## 不可达区间（按大小降序，前 25）');
+            L.push('**注意两义性**：这些区间从未被控制流触及，既可能是花指令垃圾，也可能是未被静态引用的真实函数。');
+            L.push('判定方法：看区间首字节是否像函数序言（55 89 E5 / 53 56 57 / 83 EC）；若是，多半是真实函数。');
+            const sorted = bm.unreached.slice().sort((a, b) => (b.to - b.from) - (a.to - a.from));
+            for (const r of sorted.slice(0, 25)) {
+              const head = buf.slice(r.from, Math.min(r.from + 4, r.to)).toString('hex');
+              L.push(`- [0x${r.from.toString(16)}, 0x${r.to.toString(16)}) = ${r.to - r.from} 字节，首字节 \`${head}\``);
+            }
+            L.push('');
+          }
+          if (bm.forcedAligns && bm.forcedAligns.length) {
+            L.push('## 强制对齐位置（前 20）—— 花指令制造边界歧义的地方');
+            for (const f of bm.forcedAligns.slice(0, 20)) {
+              L.push(`- 0x${f.from.toString(16)} ${f.kind} → 0x${f.target.toString(16)}（${f.reason}）`);
+            }
+            L.push('');
+          }
+          L.push('## 怎么用这份边界图');
+          L.push('1. **不要**再按字节 patch 花指令（实测越修越乱：nop 掉 `xor;jnz` 会让后面少字节、制造新错位）。');
+          L.push('2. 把上面的"不可达区间"和"强制对齐位置"当成**阅读提示**：');
+          L.push('   - 伪代码出错的位置，通常落在某个不可达区间边界附近');
+          L.push('   - 强制对齐处 = 反汇编器会困惑的位置，AI 应当直接从该目标地址读指令');
+          L.push('3. 若要 IDA 也得到一致结果：对不可达区间按 `U`（undefine）→ 在区间内的真实起点按 `C`（MakeCode），');
+          L.push('   或直接在 IDA 里跳转到强制对齐的目标地址按 `C`。');
+          L.push('4. 静态仍有 400+ 冲突时，说明交叠污染严重 → 转动态（单步 tracing 取真实执行路径）。');
+          L.push('');
+          L.push('## 判据说明');
+          for (const n of bm.notes) L.push('- ' + n);
+          return L.join('\n');
+        }
+
+        const useRecursive = mode !== 'linear';   // recursive（默认）或 linear
+        const r = useRecursive
+          ? junkScanRecursive(buf, { start, end, entries })
+          : junkScan(buf, { start, end });
+        if (!r.ok) return '花指令扫描失败: ' + r.error;
+
+        const lines = [];
+        lines.push(`文件: ${p}  (${buf.length} 字节)`);
+        lines.push(`扫描范围: 文件偏移 [0x${r.codeRange.start.toString(16)}, 0x${r.codeRange.end.toString(16)})  ` +
+          `共 ${r.codeRange.size} 字节` + (r.mode ? `  | 模式: ${r.mode}` : ''));
+        if (r.entries) lines.push(`入口: ${r.entries.map(x => '0x' + x.toString(16)).join(', ')}`);
+        lines.push('');
+        lines.push('## 统计');
+        if (r.stats.blocks !== undefined) {
+          lines.push(`- 展开基本块: ${r.stats.blocks}`);
+          lines.push(`- 强制重对齐（非边界解码）: ${r.stats.realignedCount}`);
+          lines.push(`- 不可达区间: ${r.stats.unreachedRegions} 段 / ${r.stats.unreachedBytes} 字节`);
+        }
+        lines.push(`- 解码指令: ${r.insnCount}（不可解码 ${r.stats.undecodable}）`);
+        lines.push(`- 确定标志位+短跳转: ${r.stats.selfZeroFalseJump}`);
+        if (r.stats.complementaryPair !== undefined) lines.push(`- 互补跳转对: ${r.stats.complementaryPair}`);
+        if (r.stats.boundaryAmbiguity !== undefined) lines.push(`- 边界歧义: ${r.stats.boundaryAmbiguity}`);
+        lines.push(`- call/ret 跳板: ${r.stats.callRetTrampoline || 0}`);
+        lines.push(`- call $+5; pop（PIC 取址，非花指令）: ${r.stats.picCallPop}`);
+        lines.push(`- 候选总数: ${r.stats.total}`);
+        lines.push('');
+
+        if (r.unreachedRegions && r.unreachedRegions.length) {
+          lines.push('## 不可达区间（从未被控制流触及）');
+          lines.push('这些位置最可能是花指令垃圾，**也可能是未被静态引用的真实函数**——');
+          lines.push('nop 前请先确认：该区间内是否有被 data 引用的函数地址、或 IDA 是否识别为函数。');
+          for (const reg of r.unreachedRegions.slice(0, 25)) {
+            lines.push(`- [0x${reg.from.toString(16)}, 0x${reg.to.toString(16)}) = ${reg.to - reg.from} 字节`);
+          }
+          lines.push('');
+        }
+
+        if (!r.candidates.length) {
+          lines.push('## 未发现可自动修补的花指令子结构');
+          lines.push('这不代表没有花指令。下一步（按顺序试）：');
+          lines.push('1. **给出更多入口**：用 `ida_list_functions` 取函数起始地址（或 call 目标），');
+          lines.push('   转成文件偏移后用 `entries: [...]` 重跑 junk_scan —— 递归下降能展开的范围会大很多。');
+          lines.push('2. 看上面的"不可达区间"：若某段刚好是伪代码出错的位置，它大概率就是花指令块。');
+          lines.push('3. 走动态：目标可运行时，在关键函数断点 + instruction tracing 取真实执行路径');
+          lines.push('   （执行路径是地面真值，不受解码错位影响）。');
+        } else {
+          lines.push('## 候选（confidence=high 且带 nopRange 的可交给 junk_patch）');
+          for (const c of r.candidates.slice(0, 40)) {
+            lines.push('');
+            lines.push(`### [${c.confidence}] ${c.type} @ file 0x${c.off.toString(16)}`);
+            lines.push('证据: ' + c.evidence);
+            lines.push('建议动作: ' + c.action + (c.nopRange ? `（nop [0x${c.nopRange.from.toString(16)}, 0x${c.nopRange.to.toString(16)})，${c.nopRange.to - c.nopRange.from} 字节）` : ''));
+          }
+        }
+        lines.push('');
+        lines.push('## 判据说明');
+        for (const n of r.notes) lines.push('- ' + n);
+        return lines.join('\n');
+      }
+
+      case 'junk_patch': {
+        const p = String(input.path || '').trim();
+        if (!p) return '参数错误：path 为空';
+        if (!fs.existsSync(p)) return `文件不存在: ${p}`;
+        const buf = fs.readFileSync(p);
+        let start = Number(input.start), end = Number(input.end);
+        if (!Number.isFinite(start) || !Number.isFinite(end)) {
+          let map = null;
+          try { map = parseImageMap(buf); } catch (e) { map = null; }
+          const exec = (map && Array.isArray(map.sections) ? map.sections : []).filter(s => s.executable);
+          if (exec.length) {
+            start = Math.min(...exec.map(s => Number(s.rawPtr) || 0));
+            end = Math.max(...exec.map(s => (Number(s.rawPtr) || 0) + (Number(s.rawSize) || 0)));
+          } else { start = 0; end = buf.length; }
+        }
+        const scan = junkScan(buf, { start, end });
+        if (!scan.ok) return '花指令扫描失败: ' + scan.error;
+        const minConf = String(input.minConfidence || 'high');
+        const pr = junkPatch(buf, scan.candidates, { minConfidence: minConf });
+        let outPath = String(input.out || '').trim();
+        if (!outPath) {
+          const ext = path.extname(p);
+          outPath = p.slice(0, p.length - ext.length) + '_patched' + ext;
+        }
+        fs.writeFileSync(outPath, pr.buffer);
+        const lines = [];
+        lines.push(`原文件: ${p}`);
+        lines.push(`修补后: ${outPath}  (${pr.buffer.length} 字节)`);
+        lines.push(`最低置信度: ${minConf}`);
+        lines.push('');
+        lines.push(`## 已 patch ${pr.applied.length} 处（每处整段填 0x90）`);
+        for (const a of pr.applied.slice(0, 40)) {
+          lines.push(`- 0x${a.off.toString(16)} ~ 0x${a.to.toString(16)} (${a.len} 字节) ${a.type}`);
+        }
+        if (pr.skipped.length) {
+          lines.push('');
+          lines.push(`## 跳过 ${pr.skipped.length} 处（需人工确认）`);
+          const byWhy = {};
+          for (const s of pr.skipped) byWhy[s.why] = (byWhy[s.why] || 0) + 1;
+          for (const [why, n] of Object.entries(byWhy)) lines.push(`- ${why}: ${n} 处`);
+        }
+        lines.push('');
+        lines.push('## 下一步');
+        lines.push('1. 对修补后的文件重新跑 IDA 分析（或 ida_decompile），确认伪代码可读');
+        lines.push('2. 若仍有 sp-analysis failed：在 IDA 里手动修正栈指针（Alt+K），见 skill ctf-obfuscation');
+        lines.push('3. 若 patch 后程序/反编译更糟：说明候选误判，删掉修补文件、改用手动 nop 或走动态 tracing');
+        return lines.join('\n');
+      }
+
+      case 'junk_repair': {
+        const p = String(input.path || '').trim();
+        if (!p) return '参数错误：path 为空';
+        if (!fs.existsSync(p)) return `文件不存在: ${p}`;
+        const buf = fs.readFileSync(p);
+        let start = Number(input.start), end = Number(input.end);
+        if (!Number.isFinite(start) || !Number.isFinite(end)) {
+          let map = null;
+          try { map = parseImageMap(buf); } catch (e) { map = null; }
+          const exec = (map && Array.isArray(map.sections) ? map.sections : []).filter(s => s.executable);
+          if (exec.length) {
+            start = Math.min(...exec.map(s => Number(s.rawPtr) || 0));
+            end = Math.max(...exec.map(s => (Number(s.rawPtr) || 0) + (Number(s.rawSize) || 0)));
+          } else { start = 0; end = buf.length; }
+        }
+        const enabled = Array.isArray(input.features) && input.features.length ? input.features.map(String) : null;
+        const rp = repairJunk(buf, { start, end, decodeInsn, features: enabled });
+        if (!rp.ok) return '花指令分析失败: ' + rp.error;
+
+        const L = [];
+        L.push(`文件: ${p}  (${buf.length} 字节)`);
+        L.push(`代码区: [0x${start.toString(16)}, 0x${end.toString(16)})`);
+        L.push('');
+        L.push('## 特征命中（11 类）');
+        for (const [k, v] of Object.entries(rp.stats.features || {})) {
+          if (v) L.push(`- ${k}: ${v}  ${(JUNK_FEATURES && JUNK_FEATURES[k]) || ''}`);
+        }
+        L.push('');
+        L.push('## 汇总');
+        L.push(`- 跳转目标非对齐（最硬判据）: ${rp.stats.badTargets}`);
+        L.push(`- 可自动修补: ${rp.stats.patchable} 处`);
+        L.push(`- 仅报告（需人工/动态确认）: ${rp.stats.reportOnly} 处`);
+        L.push('');
+
+        if (!rp.candidates.length) {
+          L.push('## 未发现花指令特征');
+          L.push('这不等于没有。下一步：');
+          L.push('1. `junk_scan mode=boundary` 看指令边界图与不可达区间');
+          L.push('2. 目标可运行时走动态 tracing（执行路径 = 地面真值）');
+        } else {
+          L.push('## 候选明细（前 50）');
+          L.push('每条都标了判据来源，不要只看 XREF 就下结论。');
+          for (const c of rp.candidates.slice(0, 50)) {
+            const tag = c.safe ? '可修补' : '仅报告';
+            L.push('');
+            L.push(`### [${tag}] ${c.feature}${c.off != null ? ' @0x' + c.off.toString(16) : ''}`);
+            L.push(`证据: ${c.evidence}`);
+            L.push(`判定: ${c.reason}`);
+            if (c.nopRange) L.push(`→ ${c.strategy} [0x${c.nopRange.from.toString(16)}, 0x${c.nopRange.to.toString(16)}) = ${c.nopRange.to - c.nopRange.from} 字节`);
+          }
+        }
+
+        if (input.dryRun) {
+          L.push('');
+          L.push('（dryRun=true，未写出文件）');
+          return L.join('\n');
+        }
+
+        const ap = applyRepair(buf, rp.candidates);
+        let outPath = String(input.out || '').trim();
+        if (!outPath) {
+          const ext = path.extname(p);
+          outPath = p.slice(0, p.length - ext.length) + '_repaired' + ext;
+        }
+        fs.writeFileSync(outPath, ap.buffer);
+        L.push('');
+        L.push(`## 已写出: ${outPath}`);
+        L.push(`- 实际修补 ${ap.applied.length} 处，跳过 ${ap.skipped.length} 处`);
+        const sz = {};
+        ap.applied.forEach(a => { sz[a.len + 'B:' + a.strategy] = (sz[a.len + 'B:' + a.strategy] || 0) + 1; });
+        L.push(`- 改动分布: ${JSON.stringify(sz)}`);
+
+        // 修补效果自量测：把"修复前 vs 修复后"的硬指标直接算给 AI 看。
+        // 为什么必须在这里算：原始文件各指标可能看起来更好（函数少 → 分母小 → 成功率高），
+        // 模型据此会误判"修补让情况变糟"，然后退回自己 nop 的错误路线。
+        // 真正该看的是「冲突数」与「可反编译的真函数绝对数」，不是成功率百分比。
+        try {
+          const after = scanJunkFeatures(ap.buffer, { start, end, decodeInsn });
+          L.push('');
+          L.push('## 修补效果（工具自测，同口径对比）');
+          L.push('| 指标 | 修复前 | 修复后 | 说明 |');
+          L.push('|---|---|---|---|');
+          L.push(`| 跳转目标非对齐 | ${rp.stats.badTargets} | ${after.stats.badTargets} | 最硬的边界判据，越少越好 |`);
+          L.push(`| 可修补点 | ${rp.stats.patchable} | ${after.stats.patchable} | 本次修补掉的数量 |`);
+          const dropPct = rp.stats.badTargets > 0
+            ? ((1 - after.stats.badTargets / rp.stats.badTargets) * 100).toFixed(1)
+            : '0.0';
+          L.push('');
+          L.push(`**非对齐跳转下降 ${dropPct}%**（字节长度不变: ${ap.buffer.length === buf.length ? '是' : '否，需复查'}）。`);
+          L.push('跳转指令只被换成等长 NOP，字节偏移与可执行语义都不变。');
+        } catch (e) {
+          L.push('');
+          L.push('（修补后复测失败，不影响修补本身: ' + e.message + '）');
+        }
+
+        // 自动把新 IDA 实例切到修补后的文件。
+        // 为什么放在这里：AI 拿到修补路径后经常直接接着反编译**旧** IDB（旧边界），
+        // 结果读到还是错位伪代码，然后误判"修补没用"。让工具自己完成交接，
+        // 就不再依赖模型记得调 ida_open_file。
+        if (input.reload !== false) {
+          L.push('');
+          L.push('## 正在让 IDA 重新分析修补后的文件…');
+          const rr = await idaReloadAndWait(outPath, {
+            newDatabase: true,
+            timeout: input.reloadTimeout,
+          });
+          L.push(...rr.lines);
+          L.push('');
+          L.push('## 下一步');
+          if (rr.ok) {
+            L.push('1. 直接 ida_list_functions → ida_decompile（已指向修补后的库）');
+          } else {
+            // 交接失败时绝不能说"已指向修补后的库"——那会让模型在旧库上反编译并误判修复无效
+            L.push('1. ⚠ IDA 尚未切到修补后的文件。请先解决上面的重载问题，');
+            L.push('   或手动调用 ida_open_file({ path: "' + outPath + '" })，否则读到的是旧错位伪代码。');
+          }
+          L.push('2. **判读要点**：修补后函数数会变多（花指令切碎的函数被重新连起来）。');
+          L.push('   此时"反编译成功率"这类百分比会下降——因为分母里多了原本没被识别出来的复杂函数。');
+          L.push('   **不要**因此认为修补有害。该看的是"能反编译出可读伪代码的函数绝对数"是否增加。');
+          L.push('3. 若仍有函数反编译失败：用 junk_scan mode=boundary 看不可达区间，或走动态 tracing');
+          return L.join('\n');
+        }
+        L.push('');
+        L.push('## 下一步');
+        L.push('1. 直接 ida_list_functions → ida_decompile（已指向修补后的库）');
+        L.push('2. **判读要点**：修补后函数数会变多（花指令切碎的函数被重新连起来）。');
+        L.push('   此时"反编译成功率"这类百分比会下降——因为分母里多了原本没被识别出来的复杂函数。');
+        L.push('   **不要**因此认为修补有害。该看的是"能反编译出可读伪代码的函数绝对数"是否增加。');
+        L.push('3. 若仍有函数反编译失败：用 junk_scan mode=boundary 看不可达区间，或走动态 tracing');
+        return L.join('\n');
+      }
       case 'switch_to_next_stage': {
         const p = String(input.path || '').trim();
         if (!p) return '阶段接力失败：path 为空';
@@ -8548,6 +9157,118 @@ async function callIdaMcp(method, params) {
   } catch (err) {
     throw new ToolCallError(`IDA MCP调用失败: ${err.message}`);
   }
+}
+
+// 打开文件后等新实例把自动分析与 Hex-Rays 都准备好。
+// 为什么要等：open_file 只保证"实例注册到 MCP"，此时 list_funcs 可能还是空表或几十个
+// 未识别函数；渲染层紧接着采集就会拿到残缺函数表，进而选错主体函数。
+async function idaReloadAndWait(filePath, opts = {}) {
+  const lines = [];
+  // 注意传输层上限：idaMcpCallTool → sendMCPRequest 的超时是固定 60s。
+  // 早先这里默认 180s 并原样传给 open_file，结果插件还没返回、HTTP 就先 destroy，
+  // 大程序上必现"假失败"。现在夹到 55s 以内，剩余等待交给下面的轮询（轮询各自 60s 独立计时）。
+  const waitSec = Math.min(Math.max(Number(opts.timeout) || 180, 30), 600);
+  const openTimeoutSec = Math.min(waitSec, 55);
+  const wantNewDb = opts.newDatabase === true;
+
+  // 旧的 .i64/.idb 只在"要求全新分析"时才删。
+  // 早期这里无条件删除，导致 ida_open_file({new_database:false}) 也会丢失旧库，
+  // 与 schema 文档"默认 false，有旧库就直接开旧库"相反。
+  if (wantNewDb) {
+    // 为什么要删：文件旁存在同名库时 IDA -c 会弹"是否覆盖"，自治模式（-A）下
+    // 该对话框的默认回答不一定是"是"，可能直接放弃打开。
+    const base = filePath.replace(/\.[^./\\]+$/, '');
+    for (const ext of ['.i64', '.idb']) {
+      const cand = base + ext;
+      try {
+        if (fs.existsSync(cand)) { fs.unlinkSync(cand); lines.push(`（已删除旧数据库 ${path.basename(cand)}）`); }
+      } catch (e) {
+        lines.push(`⚠️ 无法删除 ${path.basename(cand)}：${e.message}（IDA 可能正占用它）`);
+      }
+    }
+  }
+
+  let opened;
+  try {
+    opened = await idaMcpCallTool('open_file', {
+      file_path: filePath,
+      switch: true,
+      autonomous: true,
+      new_database: wantNewDb,
+      timeout: openTimeoutSec,
+    });
+  } catch (e) {
+    lines.push('工具调用失败: IDA 自动重载出错（' + e.message + '）');
+    lines.push(`请先启动 IDA（并确认 MCP 端口可达），再调用 ida_open_file({ path: "${filePath}" })。`);
+    return { ok: false, lines };
+  }
+
+  if (!opened || opened.success === false) {
+    lines.push('工具调用失败: IDA 自动重载失败（' + JSON.stringify(opened) + '）');
+    lines.push(`请手动调用 ida_open_file({ path: "${filePath}" })。`);
+    return { ok: false, lines };
+  }
+
+  const who = `${opened.host || '127.0.0.1'}:${opened.port || '?'}`;
+  let switchedPort = opened.port || null;
+
+  if (!opened.port) {
+    // open_file 用"启动前后实例快照差集"判断哪个是新实例。机器上已堆积多个 IDA 时
+    // 常拿不到新端口（实测 4 个实例时静默返回 undefined）。此时不能放弃：
+    // 用 list_instances 按**路径**找到目标实例，再 select_instance 精确切换。
+    lines.push(`⚠️ open_file 未返回实例端口（已有多个 IDA 实例时会这样），改用 list_instances 定位…`);
+    try {
+      const insts = await idaMcpCallTool('list_instances', {});
+      const arr = Array.isArray(insts) ? insts : [];
+      const norm = p => String(p || '').replace(/\\/g, '/').toLowerCase();
+      const want = norm(filePath);
+      const hit = arr.find(x => norm(x.input_path) === want || norm(x.idb_path).replace(/\.(i64|idb)$/, '') === want.replace(/\.[^./\\]+$/, ''))
+        || arr.find(x => norm(x.binary) === norm(path.basename(filePath)));
+      if (hit && hit.port) {
+        await idaMcpCallTool('select_instance', { port: hit.port, host: hit.host || '127.0.0.1' });
+        switchedPort = hit.port;
+        lines.push(`✅ 已通过 list_instances 切到 ${hit.host || '127.0.0.1'}:${hit.port}（${hit.binary}）`);
+      } else {
+        lines.push(`⚠️ list_instances 里找不到 ${path.basename(filePath)} 对应的实例。`);
+        lines.push(`   手动兜底：ida_open_file({ path: "${filePath}" })，或先用 list_instances 看端口。`);
+        return { ok: false, lines, port: null };
+      }
+    } catch (e) {
+      lines.push('⚠️ list_instances 失败: ' + e.message);
+      return { ok: false, lines, port: null };
+    }
+  } else {
+    lines.push(`✅ IDA 已切换: ${who} pid=${opened.pid || '?'}`);
+  }
+  lines.push('等待自动分析/反编译器就绪…');
+
+  const deadline = Date.now() + waitSec * 1000;
+  let last = null, stable = 0, prevCount = -1;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 3000));
+    let h = null;
+    try { h = await idaMcpCallTool('server_health', {}); } catch (e) { h = null; }
+    if (!h) continue;
+    last = h;
+    const ready = h.auto_analysis_ready !== false && h.hexrays_ready !== false;
+    if (!ready) continue;
+    let count = 0;
+    try {
+      const fns = await idaMcpCallPaged('list_functions', {});
+      count = Array.isArray(fns) ? fns.length : 0;
+    } catch (e) { count = 0; }
+    if (count > 0 && count === prevCount) { stable++; } else { stable = 0; }
+    prevCount = count;
+    // 函数数连续两次相同才算收敛（IDA 是增量识别函数，一次取样容易拿到半成品）
+    if (stable >= 1) {
+      lines.push(`✅ 分析就绪：识别到 ${count} 个函数（Hex-Rays 已可用）`);
+      return { ok: true, lines, functions: count, port: switchedPort };
+    }
+  }
+
+  lines.push(`⚠️ ${waitSec}s 内未见分析就绪（最后状态: ${JSON.stringify(last)}）。`);
+  lines.push('可以照常 ida_list_functions；若结果稀少，等几十秒再试。');
+  return { ok: false, lines, port: switchedPort };
 }
 
 // 调用Burp MCP（逻辑名 -> 会话化 + 工具名匹配 + 信封解包）

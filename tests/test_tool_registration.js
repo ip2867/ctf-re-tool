@@ -7,7 +7,7 @@ const mainSrc = fs.readFileSync(path.join(__dirname, '..', 'electron', 'main.js'
 const appSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'js', 'app.js'), 'utf8');
 const preloadSrc = fs.readFileSync(path.join(__dirname, '..', 'electron', 'preload.js'), 'utf8');
 
-const NEW_TOOLS = ['ida_dbg', 'ida_dbg_mem', 'ida_disasm', 'ida_list_globals', 'remote_exec', 'traffic_extract'];
+const NEW_TOOLS = ['ida_dbg', 'ida_dbg_mem', 'ida_disasm', 'ida_list_globals', 'remote_exec', 'traffic_extract', 'ida_open_file'];
 
 let pass = 0, fail = 0;
 const ok = (c, m, extra) => { if (c) { pass++; console.log('  OK   ' + m); } else { fail++; console.log('  FAIL ' + m + (extra ? ' -> ' + extra : '')); } };
@@ -37,7 +37,7 @@ for (const t of NEW_TOOLS) {
   // ③ KNOWN 集合
   ok(KNOWN.includes(`'${t}'`), '③ parseTextToolCalls KNOWN');
   // ④ MAP（有裸参的工具）
-  if (['ida_disasm', 'ida_dbg', 'ida_dbg_mem', 'remote_exec', 'traffic_extract', 'ida_list_globals'].includes(t)) {
+  if (['ida_disasm', 'ida_dbg', 'ida_dbg_mem', 'remote_exec', 'traffic_extract', 'ida_list_globals', 'ida_open_file'].includes(t)) {
     ok(new RegExp(`${t}: '[a-z_]+'`).test(MAP), '④ MAP 裸参映射');
   } else {
     ok(true, '④ MAP 不适用（无裸参）');

@@ -16,7 +16,8 @@ const preloadJs = fs.readFileSync(p.join(__dirname, '..', 'electron', 'preload.j
 console.log('A) 滚动跳动修复：不得再逐 token 强制滚到底');
 {
   // 流式回调里不允许直接写 scrollTop = scrollHeight
-  const streamFn = appJs.slice(appJs.indexOf('window.electronAPI.onClaudeStreamChunk'), appJs.indexOf('window.electronAPI.onClaudeStreamChunk') + 900);
+  // 窗口 1400：流式回调含"大文本降级"分支（800ms 节流 + 尾部纯文本），合法变长
+  const streamFn = appJs.slice(appJs.indexOf('window.electronAPI.onClaudeStreamChunk'), appJs.indexOf('window.electronAPI.onClaudeStreamChunk') + 1400);
   ok(!/scrollTop\s*=\s*\w+\.scrollHeight/.test(streamFn), '流式回调内无强制滚动');
   ok(/followScroll|ScrollFollow\.follow/.test(streamFn), '流式回调改走 followScroll（贴底才跟随）');
   ok(/requestAnimationFrame/.test(streamFn), '流式渲染合并到每帧一次（防卡顿）');

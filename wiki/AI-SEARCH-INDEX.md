@@ -19,6 +19,17 @@
 
 ## 一、按技术标签检索
 
+### 花指令 / 反混淆（反编译失败先看这里）
+
+- **知识**: [reverse/method_junk_code.md](reverse/method_junk_code.md)
+  （花指令 = 构造永恒跳转 + 垃圾数据；识别靠互补跳转对 + 确定标志位 + push/pop 边界；
+  含 IDC 批量去花模板、栈指针修正、动态 Run Trace 兜底）
+- **技能**: `read_skill ctf-obfuscation`（四种经典结构 / 分析流程 / 易错点 / 判定清单）
+- **工具**: `junk_scan`（递归下降识别）/ `junk_patch`（整段 nop 后重新反汇编）
+- **关键词**: `花指令` `junk code` `垃圾代码` `反编译失败` `sp-analysis failed` `指令错位` `解码错位`
+  `永真跳转` `永假跳转` `互补跳转` `opaque predicate` `不透明谓词` `_emit` `代码段 db`
+  `函数边界错误` `栈平衡` `指令长度` `线性扫描` `递归下降` `MakeCode` `PatchByte`
+
 ### 动态调试（进入条件与定向取证）
 
 - **知识**: [reverse/method_static_first_dynamic.md](reverse/method_static_first_dynamic.md)

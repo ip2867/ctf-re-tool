@@ -152,9 +152,8 @@ function setupStreamListener() {
   attachStickScroll(chatMessages, (el) => updateScrollFab(el));
   setupScrollFab();
 
-  // 每帧最多渲染一次：原先每个 token 都重写整个 innerHTML 并强制滚动，
-  // 既卡顿又盖掉了用户的滚动位置。这里把 token 累积到下一帧统一渲染。
-  let pending = false;
+  // 大流（>60000 字符）800ms 节流 + 只渲染尾部纯文本：全量 markdown 重渲染曾致分钟级 CPU 自旋
+  let pending = false, lastHeavy = 0;
   window.electronAPI.onClaudeStreamChunk((delta) => {
     if (!streamBubble || !delta) return;
     streamText += delta;
@@ -163,7 +162,14 @@ function setupStreamListener() {
     requestAnimationFrame(() => {
       pending = false;
       if (!streamBubble) return;
-      streamBubble.innerHTML = formatMessage(streamText) + '<span class="stream-cursor">▌</span>';
+      const big = streamText.length > 60000;
+      if (big && Date.now() - lastHeavy < 800) return;   // 节流：本帧跳过
+      if (big) {
+        lastHeavy = Date.now();
+        streamBubble.textContent = streamText.slice(-20000) + '\n▌';
+      } else {
+        streamBubble.innerHTML = formatMessage(streamText) + '<span class="stream-cursor">▌</span>';
+      }
       followScroll(document.getElementById('chat-messages'));
     });
   });
@@ -205,6 +211,17 @@ function startToolRow(info) {
   row.querySelector('.tool-step-label').textContent = toolLabelOf(info);
   row._startedAt = Date.now();
   container.appendChild(row);
+  // DOM 上限：深度求解一轮 60+ 次工具调用，已完成行长期滞留只增不减（同日志面板问题）。
+  // 只裁已完成/失败行，运行中的永不裁。
+  if (container.children.length > 400) {
+    let removed = 0;
+    while (container.firstChild && removed < 100) {
+      const first = container.firstChild;
+      if (first.classList && first.classList.contains('tool-step-running')) break;
+      container.removeChild(first);
+      removed++;
+    }
+  }
   if (info.id) toolRows.set(info.id, row);
   followScroll(document.getElementById('chat-messages'));
 }
@@ -268,7 +285,12 @@ function beginStreamMessage() {
 
 function endStreamMessage() {
   if (streamBubble) {
-    streamBubble.innerHTML = formatMessage(streamText || '（无输出）');
+    // 超长流的收尾格式化本身是 O(n)：>30 万字符时降级为纯文本，避免结束帧再卡一次
+    if (streamText.length > 300000) {
+      streamBubble.textContent = streamText;
+    } else {
+      streamBubble.innerHTML = formatMessage(streamText || '（无输出）');
+    }
   }
   streamBubble = null;
   streamText = '';
@@ -641,7 +663,18 @@ async function analyzeFile(filePath, opts = {}) {
   try {
     // 检测文件类型
     addLog('info', '步骤1: 检测文件类型...');
-    const typeResult = await window.electronAPI.detectFileType(filePath);
+    let typeResult = await window.electronAPI.detectFileType(filePath);
+    // 杀软短暂持锁重试（实测 CrackMe4：解压刚落盘时 Defender 实时扫描会持锁几秒，
+    // 报"文件存在但无法读取"；等 2.5s 同路径重读一次通常即可通过，避免整轮被
+    // blocked-by-av 吞掉。只重试一次，仍是 AV 拦截才按原分支处理）。
+    if (typeResult && typeResult.success === false && typeResult.blocked && !opts.noAvRetry) {
+      addLog('info', '文件被杀软短暂锁定，2.5 秒后重试读取一次...');
+      await new Promise(r => setTimeout(r, 2500));
+      typeResult = await window.electronAPI.detectFileType(filePath);
+      if (typeResult && typeResult.success) {
+        addLog('success', '重试读取成功（锁定已解除）');
+      }
+    }
     addLog('info', '类型检测结果: ' + JSON.stringify(typeResult));
 
     if (!typeResult.success) {
@@ -1120,12 +1153,27 @@ async function solveOnePlatformRound(opts = {}) {
       addSolveNote('平台提交', `裸答案 ${a.value} → ${wrapped}（模板 ${tpl}）`);
     }
     if (!submitCandidates.length) {
-      addLog('warning', '未产出「已验证」flag，跳过提交（未验证不提交，避免污染正确率）');
-      addSystemMessage(`**${ch.name}**：本地未得到已验证 flag，未提交。\n\n可人工复核后手动提交，或重试。`);
-      // note 区分"环境阻断"与"解题失败"：报告里两者的含义完全不同，
-      // 混成 no-verified-flag 会让"工具能力"统计被 AV 拦截污染。
-      const note = state.lastBlockedReason ? 'blocked-by-av' : 'no-verified-flag';
-      return { ok: false, note, detail: state.lastBlockedReason || '', challenge: { id: cid, name: ch.name, difficulty: ch.difficulty }, verified_flags: [] };
+      // 近失识别（40 题实测）：AI 明确给过答案/flag 但没过验证闸（如 z3 解出却无契约复现）。
+      // 不提交（未验证不提交的原则不变），但 note 必须区分"颗粒无收"与"差一步确认"——
+      // 两者的下一步动作完全不同（前者换题，后者人工复核一眼就能翻盘）。
+      const allAnswers = ((state.findings && state.findings.answers) || []);
+      const allFlags = ((state.findings && state.findings.flags) || []);
+      const nearMiss = []
+        .concat(allAnswers.map(a => ({ kind: 'answer', value: a.value })))
+        .concat(allFlags.filter(f => !f.verified).map(f => ({ kind: 'flag', value: f.flag })))
+        .filter(x => x && x.value && String(x.value).trim().length >= 2)
+        .slice(0, 5);
+      const note = state.lastBlockedReason ? 'blocked-by-av'
+        : (nearMiss.length ? 'near-miss-answer' : 'no-verified-flag');
+      if (nearMiss.length) {
+        addLog('warning', `[平台] 近失：已产出候选但未过验证闸（${nearMiss.map(x => x.value).join('、')}），不提交、留人工复核`);
+        addSystemMessage(`**${ch.name}**：本地拿到候选答案但未通过验证闭环，未提交。\n\n候选：${nearMiss.map(x => '`' + x.value + '`').join('、')}\n\n可人工复核后手动提交。`);
+        addSolveNote('近失候选', nearMiss.map(x => x.value).join('、'));
+      } else {
+        addLog('warning', '未产出「已验证」flag，跳过提交（未验证不提交，避免污染正确率）');
+        addSystemMessage(`**${ch.name}**：本地未得到已验证 flag，未提交。\n\n可人工复核后手动提交，或重试。`);
+      }
+      return { ok: false, note, detail: state.lastBlockedReason || '', near_miss: nearMiss.map(x => String(x.value)), challenge: { id: cid, name: ch.name, difficulty: ch.difficulty }, verified_flags: [] };
     }
     let submitResult = null;
     for (const cand of submitCandidates) {
@@ -1330,6 +1378,11 @@ async function __ctfAutoTest(opts = {}) {
     })();
 
     const name = (r.challenge && r.challenge.name) || '(unknown)';
+    // 进程内去重：无论成败都把本题名加入 exclude，否则下一轮 candidates[0]
+    // 仍是同一道题（实测：limit=10 连跑时 10 轮全是同一道 CrackMe，
+    // 第 2 轮起被 zip 防死循环闸短路成秒级 no-verified-flag）。
+    // 失败题的跨进程重试仍由"不写持久化清单"保证（见下方 noPersistSkip 分支）。
+    if (name && name !== '(unknown)') attempted.add(name);
     // 定向队列：本轮跑过的题从队列里移除，避免下一轮又优先同一道
     if (wantQueue.length && name && name !== '(unknown)') {
       const qi = wantQueue.findIndex(w => w === name || w.toLowerCase() === String(name).toLowerCase());
@@ -1338,6 +1391,7 @@ async function __ctfAutoTest(opts = {}) {
     results.push({
       name, ok: !!r.ok, note: r.note || '',
       flag: (r.submitted && r.submitted.flag) || (r.verified_flags && r.verified_flags[0]) || '',
+      near_miss: Array.isArray(r.near_miss) ? r.near_miss : [],
       difficulty: (r.challenge && r.challenge.difficulty) || '',
     });
     addLog(r.ok ? 'success' : 'warning',
@@ -1480,10 +1534,27 @@ async function analyzeZipHandout(zipPath) {
   // 8 分钟内 analyzeFile 被调用 69 次、解压 3 次，整轮批量卡死在这里）。
   // 判据：同一路径最多解压一次；解压后主文件若仍是同一个 zip（自引用），直接放弃。
   state._zipHandoutSeen = state._zipHandoutSeen || new Set();
+  state._zipHandoutMain = state._zipHandoutMain || new Map();   // normZip → 上次选定的主文件
   const normZip = String(zipPath || '').toLowerCase();
   if (state._zipHandoutSeen.has(normZip)) {
-    addLog('warning', '[zip手包] 同一压缩包已处理过，跳过（防循环）: ' + zipPath);
-    return;
+    // 重复进入 ≠ 死循环（40 题实测：平台批量对同一题重拉同一附件时，旧实现直接 return，
+    // 整轮被短路成秒级 no-verified-flag）。真正的死循环由下方"自引用压缩包"检查兜底。
+    // 这里改为：跳到上次已解压的主文件**继续求解**；主文件已不在（AV 隔离/目录被清）才重新解压。
+    const prevMain = state._zipHandoutMain.get(normZip);
+    if (prevMain) {
+      let alive = false;
+      try { const head = await window.electronAPI.readFile(prevMain); alive = !!(head && head.success !== false); } catch (e) { alive = false; }
+      if (alive) {
+        addLog('info', '[zip手包] 同一压缩包已处理过，直接复用已解压主文件继续求解: ' + String(prevMain).split('\\').pop());
+        const files = (state._platformFiles || []).slice();
+        await analyzeFile(prevMain, { keepPlatformContext: true });
+        restorePlatformContext(state, { challenge: state._platformChallenge, desc: state._platformChallengeDesc, files });
+        await autoAnalyze();
+        return;
+      }
+      addLog('warning', '[zip手包] 上次解压的主文件已不存在（可能被杀软隔离），重新解压');
+    }
+    state._zipHandoutSeen.delete(normZip);
   }
   state._zipHandoutSeen.add(normZip);
 
@@ -1507,6 +1578,7 @@ async function analyzeZipHandout(zipPath) {
     return;
   }
   addLog('success', '[zip手包] 选定主文件: ' + String(main).split('\\').pop());
+  state._zipHandoutMain.set(normZip, String(main));   // 记住主文件：同包重复进入时直接复用
   // 同包其它文件（输入样例/数据/说明）登记到平台上下文，供提示词与 Tool-Use AI 取用
   // 教训（not-baby-parallelism）：flag.out/input.bin 这类伴生文件被无视，AI 明确要"配套输入输出"
   // 却拿不到 → 判成"无法静态还原"。手包里所有文件都是题目证据，必须全部交给 AI。
@@ -4505,6 +4577,37 @@ async function analyzeJavaLike(fileType, fileLabel) {
       }
     } catch (e) { addLog('warning', '[jadx] 降级流程异常: ' + e.message); }
 
+    // ── 第三条路（40 题实测「Java逆向解密」补）：裸 .class 常量池摘要 → AI 求解 ──
+    // JEB 拉不起、jadx 对单 .class 无输出时，主进程直接解析 .class 二进制
+    // （类名/字符串常量/方法签名/字节码 hex），足够 AI 还原简单校验逻辑。
+    if (/\.class$/i.test(String(state.currentFile || '')) && window.electronAPI.classFileSummary) {
+      try {
+        const cr = await window.electronAPI.classFileSummary(state.currentFile);
+        if (cr && cr.success && cr.summary) {
+          const sum = cr.summary;
+          addLog('success', `[.class] 常量池摘要已生成（${sum.constantsParsed} 项常量，${(sum.methods || []).length} 个方法），交 AI 分析`);
+          try { await caseAddEvidence('class_summary', '.class 常量池摘要', JSON.stringify(sum, null, 2), 'json'); } catch (e) { }
+          const prompt = `以下是 Java .class 文件的常量池摘要（JEB/JADX 均不可用，由工具直接解析字节码格式得到）。\n`
+            + `类: ${sum.thisClass || '?'}（继承 ${sum.superClass || '?'}，Java ${sum.version}）\n`
+            + `\n## 字符串常量（重点：输入提示/比较目标/变换表线索）\n${(sum.strings || []).map(s => '- ' + s).join('\n').slice(0, 8000)}\n`
+            + `\n## 字段\n${(sum.fields || []).map(f => `${f.name} : ${f.desc}`).join('\n').slice(0, 2000)}\n`
+            + `\n## 方法（codeHex 为 JVM 字节码，可用 run_python 搭 capstone/手工译码；简单校验也能直接读）\n${(sum.methods || []).map(m => `${m.name}${m.desc}${m.codeHex ? '\n  code: ' + m.codeHex : ''}`).join('\n\n').slice(0, 24000)}\n`
+            + `\n请还原 flag 的生成/校验逻辑并求解。\n输出契约：\n1. 得到 flag 单独一行 \`[FLAG]flag内容[/FLAG]\`\n2. 给出 \`${VERIFY_CONTRACT}\`（工具会本地复现）\n3. 做不出来说明卡在哪一步、已排除哪些路。`;
+          beginStreamMessage();
+          const res = await window.electronAPI.claudeChat([{ role: 'user', content: prompt }], buildSystemPrompt());
+          endStreamMessage();
+          if (res && res.success && res.text) {
+            state.lastAiText = res.text;
+            await finalizeSolve(res.text, { source: 'ai-class-summary' });
+            const vf = ((state.findings && state.findings.flags) || []).filter(f => f.verified);
+            if (vf.length) { addLog('success', `[.class] ✅ 解出已验证 flag: ${vf[0].flag}`); return; }
+            addLog('warning', '[.class] 常量池路线未产出已验证 flag');
+          }
+          return;   // 已尽力（JEB/jadx/常量池三条路都走过），不再弹 GUI
+        }
+      } catch (e) { addLog('warning', '[.class] 常量池兜底异常: ' + e.message); }
+    }
+
     // 最后兜底：打开 jadx GUI 供人工
     addSystemMessage(`**${label} 分析：JEB/JADX 均不可用**
 
@@ -6254,6 +6357,12 @@ async function generateScript() {
 }
 
 // 添加日志（textContent 写入，防 HTML 注入；同时落盘到 CASE timeline）
+// 日志面板 DOM 上限：批量模式一轮可产生数千行，节点无上限增长会让每次 append 的
+// 重排成本线性上升（实测长会话后渲染层显著变卡）。timeline.jsonl 仍是全量记录，
+// 这里只裁 DOM——超出上限时批量移除最旧的 300 行（摊销成本，不逐条删）。
+const LOG_DOM_LIMIT = 1500;
+const LOG_DOM_TRIM_BATCH = 300;
+
 function addLog(type, message) {
   const logOutput = document.getElementById('category-log');
   if (!logOutput) return;
@@ -6266,6 +6375,11 @@ function addLog(type, message) {
   logLine.querySelector('.log-text').textContent = String(message);
 
   logOutput.appendChild(logLine);
+  if (logOutput.children.length > LOG_DOM_LIMIT) {
+    for (let i = 0; i < LOG_DOM_TRIM_BATCH && logOutput.children.length > LOG_DOM_LIMIT - LOG_DOM_TRIM_BATCH; i++) {
+      logOutput.removeChild(logOutput.firstChild);
+    }
+  }
   followScroll(logOutput);
 
   // 时间线持久化（尽力而为，失败静默）
@@ -8444,7 +8558,9 @@ async function autoSolveBinaryFlag(fileType) {
           const want = regions[i] || {};
           const hex = String((r && r.data) || '');
           const raw = hex.replace(/0x/gi, '').replace(/[^0-9a-fA-F]/g, '');
-          const bytes = Buffer.from(raw, 'hex');
+          // 渲染层没有 Node Buffer（实测：Buffer.from 在浏览器上下文 ReferenceError，
+          // 整个全局数据表读取被 catch 吞掉 → 指纹扫描拿不到 S 盒/常量表）。
+          const bytes = hexToUint8Array(raw);
           const stride = want.stride || (bytes.length ? probeStride(bytes, 0, bytes.length) : 0);
           return {
             name: (want.referrers && want.referrers[0]) || (r && r.addr) || 'global',
@@ -8747,15 +8863,101 @@ async function autoSolveBinaryFlag(fileType) {
       mainCodeText = 'main函数代码解析失败';
     }
 
+    // ── 花指令主动探测（关键：不能用词匹配，必须从二进制本身量测）──
+    // 教训（Matr1x 实测）：prefetchKnowledge 的 haystack 是反编译文本，
+    // 其中永远不会出现"花指令 / sp-analysis"这类 IDA 界面状态词，
+    // 所以靠 POOL/FEATURES 词表永远命中不了 → AI 从不知道有 junk_repair 这个工具。
+    // 现在改成：直接扫二进制，量"跳转目标非对齐"数量，命中就强制注入知识库 + 工具指引。
+    let junkProbe = null, junkSection = '';
+    try {
+      if (window.electronAPI && window.electronAPI.junkProbe && state.currentFile) {
+        const jp = await window.electronAPI.junkProbe(state.currentFile);
+        if (jp && jp.success && jp.probed) {
+          junkProbe = jp;
+          const featBits = Object.entries(jp.features || {}).filter(([k, v]) => v && !/^EXCL_/.test(k));
+          addLog(jp.suspicious ? 'warning' : 'info',
+            `[花指令探测] 跳转目标非对齐 ${jp.badTargets}/${jp.insnCount}（${jp.badRatio}%）` +
+            (featBits.length ? ' 特征: ' + featBits.map(([k, v]) => `${k}=${v}`).join(', ') : '') +
+            (jp.suspicious ? '  ⚠ 高度可疑' : ''));
+          if (jp.suspicious) {
+            junkSection = `
+## ⚠ 花指令检测：本题高度可疑（必须处理）
+
+工具已对二进制本身做完静态量测（**不是**靠反编译文本猜）：
+
+| 指标 | 值 |
+|---|---|
+| 代码区 | [0x${jp.start.toString(16)}, 0x${jp.end.toString(16)}) = ${jp.size} 字节 |
+| 解码指令数 | ${jp.insnCount} |
+| **跳转目标不落在指令边界上** | **${jp.badTargets}**（占 ${jp.badRatio}%） |
+| 不可解码字节 | ${jp.undecodable} |
+| 可自动修补 | ${jp.patchable} 处 |
+| 仅报告（需人工） | ${jp.reportOnly} 处 |
+${featBits.length ? '| 命中的花指令特征 | ' + featBits.map(([k, v]) => `${k}×${v}`).join('、') + ' |' : ''}
+
+**这意味着**：IDA 当前的指令边界是错的，你看到的反编译结果（含 push ebp/mov ebp,esp 之后的
+一切）都可能错位。**不要**基于当前反编译结果推算法，那样会得到错乱的表达式。
+
+## 🚫 硬性禁令（违反会得到错误答案）
+
+1. **禁止自己写脚本 nop 花指令**。实测：手工按"看起来像垃圾"的区间 nop
+   会让后续指令重新错位（不可解码 4→7、覆盖率不升反降）。
+   正确做法是只 nop **跳转指令本身**（等长 NOP，字节偏移不变）—— 这正是 junk_repair 做的事。
+2. **禁止在调用 junk_repair 之前下任何算法结论**。当前反编译文本本身是坏的：
+   它会把 \`mov eax, imm32\` 的立即数当成独立指令、把常量表达式拆错，
+   任何基于它的"算法识别"都会得到假结论。
+3. **禁止调用 ida_dbg / 动态调试来"绕过"** —— 动态调试是修完之后用来验证的手段，
+   不是替代静态修复的捷径（目标是 32 位 ELF，本机调试器不兼容）。
+
+## ✅ 必须按此顺序（前两步未完成不得进入分析）
+
+\`\`\`
+步骤 1（必做）：junk_repair({ path: "${state.currentFile}", dryRun: true })
+              → 看特征清单（11 类）、每条的证据、可修补数
+
+步骤 2（必做）：junk_repair({ path: "${state.currentFile}" })
+              → 生成 ${state.currentFile.replace(/\.[^.]*$/, '')}_repaired 文件（只 nop 跳转本身，字节偏移不变）
+
+步骤 3（必做）：ida_open_file({ path: "<步骤2 输出的 _repaired 路径>", new_database: true })
+              → 让 IDA 在新实例里重新分析修复后的二进制。**这一步不能跳**：
+                当前 IDB 是按错位字节流建的，不重开就永远是坏伪代码。
+
+步骤 4：在**新实例**上重新做：ida_list_functions → ida_decompile
+        → 这时再推算法（矩阵/轮函数/常量表都会清晰可读）
+
+⚠ **怎么判读修补效果（重要，别被百分比骗）**：
+修补后**函数数会变多**（原本被花指令切碎的函数被重新连成完整函数）。
+此时"反编译成功率"这类**百分比反而可能下降**，因为分母里多了原本根本识别不出来的复杂函数。
+实测 Matr1x：函数 54→90、可反编译 35→50，但成功率 87.5%→65.8%——**这不是变差**。
+**该看的是"能反编译出可读伪代码的函数绝对数"是否增加，以及 junk_repair 返回的
+「非对齐跳转下降百分比」**。绝不要因为成功率下降就说"修补有害"然后回去自己 nop。
+
+步骤 5（可选）：若仍有函数反编译失败，junk_scan({ path, mode: "boundary" })
+              → 看不可达区间与强制对齐点
+\`\`\`
+
+**为什么步骤 2 必须由 junk_repair 做，而不是你自己写脚本**：
+花指令的判据是"跳转目标落在指令边界之外"，只有重跑解码模型才能定位；
+凭肉眼挑"看起来像垃圾"的字节段去 nop，会把跳转目标本身也清掉，后续指令重新错位。
+junk_repair 只把**跳转指令那 2/5 个字节**换成等长 NOP——跳转消失了、目标处的指令保持原样，
+所以字节偏移和可执行语义都不变（实测修补后程序仍能正常运行、输出不变）。
+`;
+          }
+        }
+      }
+    } catch (e) { addLog('warning', '[花指令探测] 失败（不阻塞）: ' + e.message); }
+
     // 自动预取：本题固定清单禁止调工具，故先按已采集代码/字符串检索知识库并内联攻略
+    // 花指令命中时把"花指令"关键词追加进检索词（否则 haystack 里没有这个词）
+    const prefetchExtra = junkProbe && junkProbe.suspicious ? ['花指令', 'junk code', '反编译失败'] : [];
     const knowledge = await prefetchKnowledge(
       [functionsText, stringsText, mainCodeText, otherFuncsText, globalsText].join('\n'),
-      fileType);
+      fileType, prefetchExtra);
 
     const analysisPrompt = `我正在分析一个CTF ${fileType}题目。
 
 文件路径：${state.currentFile}
-${algHintText}
+${algHintText}${junkSection}
 以下是通过IDA MCP获取的分析数据：
 
 ## 函数列表
@@ -8775,7 +8977,8 @@ ${knowledge}
 2. flag的生成或验证逻辑
 3. 直接给出flag
 
-注意：不要调用任何工具，直接基于上面的代码分析。
+${junkSection ? `**本段允许（且强烈建议）调用工具**：已检测到花指令，先用 junk_repair 修复二进制再分析。
+修复前基于错位反编译推算法，只会得到错乱的表达式。` : '注意：不要调用任何工具，直接基于上面的代码分析。'}
 
 **输出契约（必须遵守）：**
 1. 得到 flag 时：单独一行 \`[FLAG]flag内容[/FLAG]\`
@@ -9253,6 +9456,9 @@ ${sideFilesBlock}
 
 ## 动态调试/流量/远程工具（仅在证据需要时使用）
 
+- \`ida_open_file({path:"<绝对路径>"})\`：让 IDA 在新实例里打开并重新分析该二进制，
+  **之后所有 ida_* 调用自动路由到新实例**。花指令修复（junk_repair）后必须用它重开文件，
+  否则读到的仍是按旧错位边界解析的伪代码。加 \`new_database:true\` 强制丢弃旧 .i64 重建。
 - \`ida_list_globals({filter:"key"})\`：列出全局符号（**自动分页**，每页 500 条直到 next_offset=null）。
   需要更多时用 \`{offset:500, count:500}\` 手动翻页；不要假定第一页就是全部。
 - \`ida_disasm({address:"0x401000", max_instructions:64})\`：反汇编任意地址（含不在函数表里的代码/间接跳转目标）。
@@ -9327,11 +9533,13 @@ ${sideFilesBlock}
         const vfNow = (state.findings ? state.findings.flags : []).filter(f => f.verified);
         const canRetry = retryFin && retryFin.retryPrompt && !vfNow.length
           && ((retryRefuted && retryRefuted.length) || (retryFin.vr && retryFin.vr.failureFeedback)
-            || retryFin.intermediateTyped || retryFin.machineCodeNote);
+            || retryFin.intermediateTyped || retryFin.machineCodeNote || retryFin.enumFeedback);
         if (!canRetry) break;
         const reason = (retryRefuted && retryRefuted.length)
-          ? (round === 1 ? '负面断言已被推翻' : `负面断言已被推翻（第 ${round} 轮）`)
-          : (round === 1 ? '验证失败（附真实解密输出）' : `验证失败（第 ${round} 轮）`);
+          ? (round === 1 ? '负面断言遭推翻' : `负面断言遭推翻（第 ${round} 轮）`)
+          : (retryFin.enumFeedback
+            ? (round === 1 ? '本地枚举候选全部无效（缺密文/空输出）' : `本地枚举候选全部无效（第 ${round} 轮）`)
+            : (round === 1 ? '验证失败（附真实解密输出）' : `验证失败（第 ${round} 轮）`));
         addLog('warning', `[重试] 第 ${round} 轮：追加一轮 AI（${reason}，强制基于证据修正）`);
         const retryMessages = [
           { role: 'user', content: prompt },
@@ -9570,6 +9778,7 @@ function buildSystemPrompt() {
   // 不会想到里面还有方法论页——这是"写了却用不上"的典型。
   const METHOD_PAGES = [
     'reverse/method_static_first_dynamic.md',
+    'reverse/method_junk_code.md',
     'reverse/method_runtime_challenges.md',
     'reverse/method_parallel_scan_inversion.md',
     'reverse/method_excel_formula_verifier.md',
@@ -10918,22 +11127,33 @@ async function verifyAndRecord(aiText, opts = {}) {
   //   ② 存在契约 c 使 String(c.key).trim() === V；
   //   ③ 该契约的本地复现产生了命中（vr.hits.length > 0）。
   // 实测（CrackMe3）：V=771535、c.key=771535、契约复现出 shellcode → 三条全中。
+  //
+  // ── 近失升级（40 题实测新增）──
+  // ④ byHit：V 逐字出现在本地复现命中（vr.hits）里——AI 声明的答案被工具自己跑出来；
+  // ⑤ byOutput：V 出现在复现的原始输出里（len≥6 且不是任何契约的密文本身，
+  //    防"密文回显"假阳性）。equation 类（z3 直接解出 flag 但契约没建）靠这条救回。
   try {
     const hits = (vr && Array.isArray(vr.hits)) ? vr.hits : [];
     const contracts = (vr && Array.isArray(vr.contracts)) ? vr.contracts : [];
+    const rawOut = String((vr && vr.rawOutput) || '');
     if (flags.length) {
       for (const v of flags) {
         const t = String(v || '').trim();
         if (!t) continue;
         const byKey = contracts.some(c => c && String(c.key == null ? '' : c.key).trim() === t);
-        const okVerified = byKey && hits.length > 0;
+        const byHit = hits.some(h => h != null && String(h).trim() === t);
+        const byOutput = t.length >= 6 && rawOut.includes(t)
+          && !rawOut.includes('keyenc=' + t)   // 编码标签（base64/hex…）不算答案证据
+          && !contracts.some(c => c && String(c.ciphertext == null ? '' : c.ciphertext).replace(/\s+/g, '').trim() === t.replace(/\s+/g, ''));
+        const okVerified = (byKey || byHit || byOutput) && (hits.length > 0 || byOutput);
         if (okVerified) {
+          const why = byKey ? '契约 key 匹配' : (byHit ? '答案=本地复现命中值' : '答案出现在本地复现输出');
           recordAnswer(t, {
-            source: 'verify-contract-key',
+            source: byKey ? 'verify-contract-key' : (byHit ? 'verify-hit-match' : 'verify-output-match'),
             verified: true,
-            evidence: `契约 key=${t} 本地复现命中（${hits.length} 条）`,
+            evidence: `${why}（${t}，复现输出 ${rawOut.length} 字符/命中 ${hits.length} 条）`,
           });
-          addLog('success', `[验证闭环] 裸答案 ${t} 经契约复现确认（contract.key 匹配且本地有命中）`);
+          addLog('success', `[验证闭环] 裸答案 ${t} 经本地复现确认（${why}）`);
         } else {
           recordAnswer(t, { source: source, verified: false });
         }
@@ -11100,6 +11320,9 @@ async function failureHintSection(challengeName) {
 }
 
 async function finalizeSolve(aiText, opts = {}) {
+  // 枚举反馈属"本轮 runHypotheses"的产物：入口先清，防止上一题/上一次调用的反馈
+  // 残留到本题（runHypotheses 在下方 verifyAndRecord 里才会重新填充）。
+  state.lastEnumFeedback = '';
   // 三件事（反证 / 验证 / 经验收割）互相独立：任一抛错都不能把 AI 已产出的结果整体吞掉。
   // 实测事故：runNegativeAssertionCheck 里一个 ReferenceError 让 autoSolveBinaryFlag 直接跳到
   // catch，AI 那段正确的"本层是 loader、需提取 stage2"结论被丢弃，还跳过了后续 Tool-Use 深挖。
@@ -11297,7 +11520,14 @@ async function finalizeSolve(aiText, opts = {}) {
     ].join('\n');
     addLog('info', '[验证闭环] 已生成修正提示（' + retry.length + ' 字符），将随结果回传触发重试'
       + (dl.count ? `；检测到解出机器码 ${dl.count} 处 → 重试指令已改为"接力下一层"` : ''));
+    state.lastEnumFeedback = '';   // 已有更强的契约失败证据，枚举反馈不再需要
     return { vr, flags, verifiedFlags, retryPrompt: retry, decodedLayer: dl.count };
+  }
+  // 枚举全灭的定向反馈：没有 vr 失败证据时也值得让 AI 修一轮（缺密文/输出为空是可修的）
+  const enumFb = String(state.lastEnumFeedback || '');
+  if (enumFb && !verifiedFlags.length) {
+    state.lastEnumFeedback = '';
+    return { vr, flags, verifiedFlags, retryPrompt: enumFb, enumFeedback: true };
   }
   return { vr, flags, verifiedFlags };
 }
@@ -11992,6 +12222,7 @@ function rankAttempts(attempts, opts = {}) {
 
 // 本地枚举：解析 [HYPOTHESES] → 并行尝试全部组合 → 命中即记
 async function runHypotheses(aiText, opts = {}) {
+  state.lastEnumFeedback = '';   // 每次枚举重置；仅"全部候选无效"时填充（finalizeSolve 拼进 retryPrompt）
   let attempts = Array.isArray(aiText) ? aiText : parseHypotheses(aiText);
   if (!attempts.length && Array.isArray(opts.synthFrom)) {
     // 无 [HYPOTHESES] 契约 → 工具自行合成候选矩阵（举一反三，避免原地卡死）
@@ -12058,7 +12289,25 @@ async function runHypotheses(aiText, opts = {}) {
     return true;
   });
   if (!attempts.length) {
-    addLog('warning', '[本地枚举] 全部候选均被形态校验判为无效，未执行本地复现');
+    // 定向反馈（40 题实测：17 连"候选无效"后直接放弃，AI 永远不知道缺哪个维度）。
+    // 聚合无效原因，交由 finalizeSolve 拼进 retryPrompt 驱动重试。
+    const cat = { noCt: 0, emptyOut: 0, degenerate: 0 };
+    for (const rec of attemptRecords) {
+      const r = String((rec && rec.reason) || '');
+      if (/需要密文/.test(r)) cat.noCt++;
+      else if (/输出为空/.test(r)) cat.emptyOut++;
+      else if (/退化摘要/.test(r)) cat.degenerate++;
+    }
+    const advice = [];
+    if (cat.noCt) advice.push(`- ${cat.noCt} 组候选缺少真实密文（ciphertext 为空）：请从代码/数据里取出被校验的密文常量（附地址或偏移），再给 [VERIFY] 契约。没有密文的"解密"无法本地复现。`);
+    if (cat.emptyOut) advice.push(`- ${cat.emptyOut} 组候选"输入非空但输出为空"：解密函数没真正执行（多半是 key/密文配错或算法族错），请核对 key 来源与密文的对应关系。`);
+    if (cat.degenerate) advice.push(`- ${cat.degenerate} 组输出是退化摘要（空输入的哈希）：说明输入没取到，请检查密文偏移/长度。`);
+    state.lastEnumFeedback = [
+      `本地枚举的 ${attemptRecords.length} 组候选全部无效，未能复现。失败原因汇总：`,
+      ...advice,
+      '请基于以上修正：给出带真实密文的 [VERIFY]，或明确说明为何拿不到密文（例如目标值是运行时生成）。',
+    ].join('\n');
+    addLog('warning', '[本地枚举] 全部候选均被形态校验判为无效，未执行本地复现（已生成定向修正提示）');
     state.lastAttemptRecords = attemptRecords;
     return null;
   }
@@ -12284,6 +12533,9 @@ async function prefetchKnowledge(haystack, fileType, extra = []) {
       // 不补这些词的话，新方法论页只能靠 AI"主动想起来"去查——实测等于没写。
       '动态调试', '调试', '断点', '单步', 'smc', '自修改', '反调试', 'ptrace', 'isdebuggerpresent',
       'self-modifying', '自解码', '解密后执行', 'virtualprotect', 'mprotect', '运行时解密',
+      // 花指令类：反编译失败时 AI 应当主动想到 junk_scan
+      '花指令', 'junk', 'sp-analysis', '反编译失败', '指令错位', '解码错位', '栈平衡',
+      'opaque predicate', '不透明谓词', '互补跳转', '垃圾代码',
       'gui', 'dialogbox', 'winmain', '消息循环', '窗口', 'crackme',
       'tickcount', 'getsystemtime', '时间相关', '环境检测'];
     const hits = POOL.filter(t => hay.includes(t));
@@ -12325,6 +12577,10 @@ async function prefetchKnowledge(haystack, fileType, extra = []) {
        '动态调试 静态先行 断点 gui 窗口期 32位 改内存'],
       [/gettickcount|getsystemtime|queryperformancecounter|time\(null\)|rand\(\)/i,
        '动态调试 静态先行 断点 窗口期'],
+      // ── 花指令信号（命中即把"去花指令"方法论与 junk_scan/junk_patch 拉进提示词）──
+      // 关注"反编译失败/代码段异常"这一类症状，而不是某个具体助记符。
+      [/sp-analysis|无法反编译|反编译失败|伪代码.{0,6}(错乱|异常|乱)|函数边界|花指令|junk|指令错位|解码错位/i,
+       '花指令 junk code 反编译失败 指令错位 栈平衡 互补跳转 不透明谓词'],
     ];
     // 特征反查词放最前（最高优先），其次算法/工具字面量命中，最后文件类型词
     const feats = [];
@@ -12342,7 +12598,21 @@ async function prefetchKnowledge(haystack, fileType, extra = []) {
     else if (/MACHO/.test(ft)) hits.push('macho');
     else if (/LUAC|LUA/.test(ft)) hits.push('lua');
     else if (/JS|HTML/.test(ft)) hits.push('js 逆向', 'sign');
-    const terms = [...new Set([...extra, ...feats, ...hits].map(s => String(s).trim()).filter(Boolean))].slice(0, 6);
+    // 词级去重：多条特征命中会产出 N 个高度重叠的词串（实测一轮命中 4 条
+    // "动态调试 静态先行 断点 …"），整串去重挡不住 → 检索词膨胀、同一方法论页
+    // 重复占满结果（该轮提示词被灌到 111KB）。按单词去重后取前 12 个词；
+    // 组装顺序 extra → 类型词 → 特征词：短而准的类型词（native/java…）不会被
+    // 长特征词串挤出去重窗口。
+    const rawTerms = [...extra, ...hits, ...feats].map(s => String(s).trim()).filter(Boolean);
+    const seenW = new Set();
+    const words = [];
+    for (const t of rawTerms) {
+      for (const w of t.split(/\s+/)) {
+        const k = w.trim();
+        if (k && !seenW.has(k)) { seenW.add(k); words.push(k); }
+      }
+    }
+    const terms = words.slice(0, 12);
     if (!terms.length) terms.push(ft || 'reverse');
     const r = await api.wikiSearch(terms.join(' '), 4);
     if (!r || !r.success || !r.result || /未找到与/.test(r.result)) return '';
@@ -12491,7 +12761,10 @@ function collectGlobalRegions(decompileTexts, imageMap, opts) {
   const o = opts || {};
   const texts = Array.isArray(decompileTexts) ? decompileTexts : [decompileTexts];
   const resolver = typeof o.resolver === 'function' ? o.resolver : (typeof opts === 'function' ? opts : null);
-  const buf = o.buf && Buffer.isBuffer(o.buf) ? o.buf : null;
+  // 渲染层没有 Buffer：用鸭子类型判断"可按字节索引的缓冲"（Uint8Array/Buffer 均通过）。
+  // probeStride 只用 buf.length 与 buf[i]，两种类型都兼容。
+  const buf = o.buf && typeof o.buf === 'object' && typeof o.buf.length === 'number'
+    && typeof o.buf[0] === 'number' ? o.buf : null;
 
   const hits = new Map();   // addr -> Set(referrer)
   const add = (addr, who) => {
@@ -12550,6 +12823,15 @@ function collectGlobalRegions(decompileTexts, imageMap, opts) {
     stride: buf ? probeStride(buf, r.addr, r.size) : 0,
     referrers: [...r.referrers].filter(Boolean).slice(0, 8),
   }));
+}
+
+// hex 字符串 → Uint8Array（渲染层无 Buffer 时的安全替代；奇数长度截尾）
+function hexToUint8Array(hex) {
+  const clean = String(hex == null ? '' : hex).replace(/0x/gi, '').replace(/[^0-9a-fA-F]/g, '');
+  const n = clean.length >> 1;
+  const out = new Uint8Array(n);
+  for (let i = 0; i < n; i++) out[i] = parseInt(clean.substr(i * 2, 2), 16);
+  return out;
 }
 
 // 表项步长探测：1/2/4 三档，统计"跨步重复率高且高位恒零"的那一档。

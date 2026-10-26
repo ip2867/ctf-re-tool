@@ -33,8 +33,22 @@ apk_x/
 .env
 env.json
 
+# 一次性调试脚本与产物（.tmp_xxx.js/.txt/.bin 等）：
+# 常含本机绝对路径、内网 IP、甚至明文口令，绝不入库
+.tmp_*
+!.tmp_solve_run/
+.tmp_solve_run/*
+!.tmp_solve_run/.gitkeep
+
+# 单测里的 Kali 账号密码一律走环境变量（KALI_HOST/KALI_USER/KALI_PASS），禁止硬编码。
+# 历史版本 tests/manual_dbg_*.js 曾写死真实口令，已清理。
+
 # 会话交接文档（含真实 flag/内网地址/本机路径，不入库）
 HANDOFF.md
+
+# 批跑/解题记录报告（含真实平台 flag 与本机路径，属运行期数据，不入库）
+批量解题记录报告.md
+*实战记录*.md
 
 # 打包产物（electron-builder 输出，体积大，不入库）
 dist/
@@ -76,3 +90,25 @@ autotest-run.log
 # 自动测试：题目清单/尝试记录（运行期数据，不入库）
 _reverse_full.json
 autotest-attempted.json
+
+# 逆向调试过程残留（反汇编输出、内存/常量表 dump、临时二进制切片）
+# 这些是解题时落在仓库根的中间产物，曾被误提交进历史，现已 untrack 并在此拦截。
+dis.txt
+disasm.txt
+dis_prologue.txt
+full_disasm.txt
+dump.txt
+strings.txt
+kanxue_api.py
+kanxue_api.txt
+*.bin
+payload.bin
+classes.dex
+sbox_S.bin
+
+# 运行期汇总（本机数据，不入库）
+autotest-summary.json
+mid-bank-summary.json
+p1-verify-summary.json
+solved-challenges.json
+skipped-challenges.json

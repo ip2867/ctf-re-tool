@@ -1,7 +1,7 @@
 # 逆向题结构化条目库（_INDEX）
 
 > 来源：Des-CTF 知识库的**逆向题** meta（含 attack_chain 解法链 / reasoning_chain 思维链 / failed_attempts 避坑）。
-> 每题一个 .md（YAML meta）；AI 用 `wiki_search` 检索，命中即 `wiki_read`。共 **50** 条（43 题 + 7 篇方法）。
+> 每题一个 .md（YAML meta）；AI 用 `wiki_search` 检索，命中即 `wiki_read`。共 **51** 条（43 题 + 8 篇方法）。
 
 | # | 题名 | 大赛 | 年 | 难度 | 一句话 |
 |---|---|---|---|---|---|
@@ -55,6 +55,7 @@
 | 48 | [method_gm_crypto](method_gm_crypto.md) | CTF² Agent Arena | 2026 | method | 国密三件套分型与打法：SM4(32轮Feistel+0xD6S盒,gmssl直接解)/SM3(哈希:爆破·长度扩展)/SM2(ECC:nonce复用·弱随机) |
 | 49 | [method_pe_loader_vm_obfuscation](method_pe_loader_vm_obfuscation.md) | xmctf Disguise | 2026 | hard | PE三层伪装：decoy假flag+异或提取内嵌PE+VM实为魔改SM4（认FK/CK/S盒→套标准解密框架） |
 | 50 | [method_static_first_dynamic](method_static_first_dynamic.md) | CTF² Agent Arena | 2026 | method | **动态调试纪律**：先静态取数并锁定候选函数、写出"断点处读什么"的假设，再启动调试器；含窗口期/PIE重定位/SMC/反调试/GUI/预算对照 |
+| 51 | [method_junk_code](method_junk_code.md) | 看雪方法论 | 2026 | medium | **花指令去混淆**：互补跳转对+确定标志位+push/pop边界三件套识别，整段nop后重新反汇编；含IDC批量去花模板、栈指针修正、动态Run Trace兜底 |
 
 ## 关键词（tags 汇总）
 

@@ -3267,6 +3267,7 @@ function toolLabel(name, input) {
     case 'gen_block_cipher_solver': case 'gen_sm4_solver': return '生成解密脚本';
     case 'ida_decompile': return 'IDA 反编译 ' + short(i.function_name || i.address, 40);
     case 'ida_open_file': return 'IDA 载入 ' + short(i.path ? path.basename(i.path) : '', 40);
+    case 'angr_solve': return 'angr 求解 ' + short(i.binary ? path.basename(i.binary) : '', 30);
     case 'ida_get_bytes': return 'IDA 读取字节 ' + short(i.address, 30);
     case 'ida_list_functions': return 'IDA 列出函数';
     case 'ida_find_strings': return 'IDA 查找字符串 ' + short(i.keyword || i.pattern || '', 30);
@@ -6284,7 +6285,7 @@ function parseTextToolCalls(rawText) {
     'jeb_get_manifest', 'jeb_get_class_decompiled', 'jeb_get_method_decompiled',
     'jeb_get_exported_activities', 'jeb_get_all_classes', 'jeb_get_class_methods',
     'ida_decompile', 'ida_list_functions', 'ida_find_strings', 'ida_get_xrefs', 'ida_get_bytes',
-    'ida_list_globals', 'ida_disasm', 'ida_dbg', 'ida_dbg_mem', 'ida_open_file',
+    'ida_list_globals', 'ida_disasm', 'ida_dbg', 'ida_dbg_mem', 'ida_open_file', 'angr_solve',
     'remote_exec', 'traffic_extract', 'recipe', 'gui_input', 'crypto',
     'browser_search', 'browser_open', 'run_command', 'run_python', 'adb_command', 'frida_hook',
     'read_skill', 'wiki_search', 'wiki_read', 'burp_get_history', 'burp_get_message', 'burp_call',
@@ -6297,7 +6298,7 @@ function parseTextToolCalls(rawText) {
     browser_open: 'url', browser_search: 'query', ida_decompile: 'function_name', ida_get_xrefs: 'address',
     ida_get_bytes: 'address', ida_find_strings: 'regex', frida_hook: 'script', adb_command: 'command',
     ida_disasm: 'address', ida_dbg: 'action', ida_dbg_mem: 'action', remote_exec: 'command', traffic_extract: 'path',
-    ida_list_globals: 'filter', ida_open_file: 'path'
+    ida_list_globals: 'filter', ida_open_file: 'path', angr_solve: 'binary'
   };
   // 标记：<｜｜tool▁calls▁begin｜｜> / <|tool_calls_begin|> / 变体（全角/半角竖线、▁/_ 分隔）
   const MARK = /<\s*[|｜]\s*[|｜]?\s*tool[\u2581_ ]?calls[\u2581_ ]?begin\s*[|｜]?\s*[|｜]\s*>/gi;
@@ -6552,6 +6553,27 @@ function precheckToolCall(name, input) {
   if (name === 'ida_open_file' && !i.path && !i.file_path) {
     return '缺少 path 参数。请传入要载入 IDA 的二进制绝对路径'
       + '（花指令修复后通常是 junk_repair 输出的 *_repaired 文件）。';
+  }
+  if (name === 'angr_solve') {
+    if (!i.binary || !String(i.binary).trim()) {
+      return '缺少 binary 参数（目标文件路径）。';
+    }
+    if (i.find === undefined || i.find === null || (Array.isArray(i.find) && !i.find.length)) {
+      return '缺少 find 参数。angr 需要一个"成功分支地址"作为搜索目标'
+        + '（通常是打印 flag 的那个分支 0x...；不确定时先用 ida_find_strings 找 "flag" 再 ida_get_xrefs）。';
+    }
+  }
+  if (name === 'ida_dbg') {
+    const act = String(i.action || '').toLowerCase();
+    if (act === 'snapshot_diff' && !i.regions && !i.addr && !i.address) {
+      return 'action=snapshot_diff 需要 regions（[{addr,size}]）或 addr+size，指明要快照哪块内存。';
+    }
+    if (act === 'force_continue' && !i.set) {
+      return 'action=force_continue 需要 set（[{reg:"eax", value:1}]），说明要改哪个寄存器。';
+    }
+    if (act === 'global_reads' && !i.func) {
+      return 'action=global_reads 需要 func（函数名或地址）。';
+    }
   }
   if (name === 'ida_dbg') {
     if (!i.action) {
@@ -6976,7 +6998,7 @@ async function claudeChatWithTools(messages, systemPrompt, onDelta, opts = {}) {
         continue;
       }
 
-      // ── 分层收尾第二级：已用工具、有明确进展，但仍没有契约（v1.9.1 / P0.1）──
+      // ── 分层收尾第二级：已用工具、有明确进展，但仍没有契约（v1.9.2 / P0.1）──
       // 实测（86 题中 49 道失败）：AI 已经把函数地址、常量、字节偏移都读出来了，
       // 最后只输出一段"程序先做 A 再做 B"的说明就返回——它缺的不是分析，而是
       // 把已知量固化成可执行脚本这一步。对这类收工继续催"去挖更多证据"是错位的：
@@ -7620,6 +7642,14 @@ function getToolDefinitions() {
         "status（查 ON/STATE/IP）、suspend（把运行中的进程拉回暂停态）、exit、continue、run_to（需 addr）、" +
         "step_into、step_over、bp_list、bp_add（addrs，走 idaapi.add_bpt，本地/远程都可用）、" +
         "bp_del（addrs）、bp_toggle（items: [{addr,enabled}]）、regs、regs_named（regs: 'RAX,RBX'）、stack。\n" +
+        "**运行期探测（混淆题首选，比读伪代码可靠）**：\n" +
+        "· snapshot_diff —— 对指定内存区拍前后快照并**就地差分**，直接看出「这段代码把数据改成了什么」。\n" +
+        "  mode=until_return（跑到当前函数返回，最适合整个 handler）/ single_step（单条指令效果）/\n" +
+        "  until_addr（需 target）/ manual（只拍 before，之后用 once 出差分）。\n" +
+        "· force_continue —— 在某点强制写寄存器再继续（set:[{reg,value}]，then=continue/step_into/step_over，\n" +
+        "  repeat=N 让被混淆提前打断的循环跑满）。可配 bp_addr。\n" +
+        "· global_reads —— 统计某函数引用了哪些**全局元素**及步长。若元素数 < 一行宽度，\n" +
+        "  说明该函数只校验一行/一块，调用方在循环里喂多次（据此去找漏掉的常量）。\n" +
         "STATE：-1=已暂停（可单步/run_to/写内存）、0=无进程、1=运行中（单步与写内存会失败）、2=已退出。\n" +
         "continue/run_to 已自动轮询到真正停下：返回 stopped:true 才能继续单步；state:1 表示仍在跑，需 suspend。\n" +
         "本地 PE：start 后停在入口。远程 ELF：start 后不停，工具自动 suspend；断点要用重定位地址（见 start 返回的 symbols）。",
@@ -7631,13 +7661,31 @@ function getToolDefinitions() {
             enum: ["start", "exit", "continue", "run_to", "step_into", "step_over",
                    "status", "suspend",
                    "bp_list", "bp_add", "bp_del", "bp_toggle", "regs", "regs_named", "stack",
-                   "clear_remote"],
-            description: "调试动作。status=查状态；suspend=把运行中的进程停下（GUI 程序必须）；clear_remote=清残留远程配置"
+                   "clear_remote",
+                   "snapshot_diff", "force_continue", "global_reads"],
+            description: "调试动作。status=查状态；suspend=把运行中的进程停下（GUI 程序必须）；" +
+              "clear_remote=清残留远程配置；snapshot_diff/force_continue/global_reads=运行期探测（见工具说明）"
           },
           addr: { type: "string", description: "run_to 的目标地址 / bp_add 的单地址" },
           addrs: { description: "断点地址：字符串或字符串数组（如 '0x401000,0x401010'）" },
           items: { description: "bp_toggle 的条目：[{addr, enabled}]（也接受地址数组）" },
           regs: { type: "string", description: "regs_named 的寄存器名，逗号分隔（如 'RAX,RBX'）" },
+          regions: {
+            description: "snapshot_diff 要快照的内存区：[{addr,size}] 或 ['0x13200']。size 缺省 256"
+          },
+          size: { type: "number", description: "snapshot_diff 单区字节数（配 addr 使用，默认 256）" },
+          target: { type: "string", description: "snapshot_diff mode=until_addr 的目标地址" },
+          set: {
+            description: "force_continue 要写的寄存器：[{reg:'eax', value:1}]"
+          },
+          then: {
+            type: "string", enum: ["continue", "step_into", "step_over", "none"],
+            description: "force_continue 改完寄存器后的动作（默认 continue）"
+          },
+          repeat: { type: "number", description: "force_continue 重复次数（默认 1，上限 200）" },
+          bp_addr: { type: "string", description: "force_continue 先在该地址下断点" },
+          func: { type: "string", description: "global_reads 的函数名或地址" },
+          limit: { type: "number", description: "global_reads 最多列出的引用数（默认 512）" },
           mode: {
             type: "string",
             enum: ["local", "remote"],
@@ -8108,6 +8156,47 @@ function getToolDefinitions() {
         },
         required: ["path"]
       }
+    },
+    {
+      name: "angr_solve",
+      description:
+        "生成一份 angr 符号执行求解脚本（不直接执行；用 run_python 跑它）。\n" +
+        "**什么时候用**：混淆太重、静态读不出算法，但知道\"成功分支在哪\"——让符号执行直接反求输入。\n" +
+        "**关键设计（避开两个实测坑）**：\n" +
+        "1) 用 call_state 从主函数进入，**不用 entry_state**：entry 会先进 __libc_start_main，\n" +
+        "   该调用不返回，simulation manager 直接耗尽（Matr1x 实测 0 个 state）。\n" +
+        "2) 支持 hook 间接跳转点：被混淆的函数常有\"经全局函数指针的间接跳转\"，angr 会顺指针\n" +
+        "   把常量表的字节当代码解码，报 IR decoding error。用 hooks 指定这些点后，脚本只按真实目标走。\n" +
+        "参数：binary（目标路径）、find（成功分支地址，必填）、avoid（失败分支地址）、\n" +
+        "main（主函数地址，缺省用 ELF entry）、hooks（[{addr,kind:'opaque_jump'|'nop',length}]）、\n" +
+        "base（PIE 基址）、stdin_len（符号输入长度）、timeout（秒）。\n" +
+        "返回里带 script 与 notes；脚本自带到点复核（VERIFY_FOUND）。",
+      input_schema: {
+        type: "object",
+        properties: {
+          binary: { type: "string", description: "目标文件路径（远端求解时用远端路径）" },
+          find: { description: "成功路径地址（字符串/数字，或数组）——通常是打印 flag 的分支" },
+          avoid: { description: "失败路径地址（字符串/数字，或数组）" },
+          main: { type: "string", description: "主函数地址（call_state 入口）。缺省用 ELF entry" },
+          base: { type: "string", description: "PIE 基址（如 0x400000）。缺省用 angr 推断" },
+          hooks: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                addr: { type: "string", description: "间接跳转点地址" },
+                kind: { type: "string", enum: ["opaque_jump", "nop"], description: "opaque_jump=按真实目标直跳；nop=当作空操作" },
+                length: { type: "number", description: "该点指令长度（用于 hook 覆盖范围）" }
+              },
+              required: ["addr"]
+            },
+            description: "要显式处理的间接跳转点（避免 angr 把数据当代码）"
+          },
+          stdin_len: { type: "number", description: "符号化输入长度（默认 64）" },
+          timeout: { type: "number", description: "求解秒数（默认 300）" }
+        },
+        required: ["binary", "find"]
+      }
     }
   ];
 }
@@ -8423,6 +8512,27 @@ async function executeToolCall(toolName, input) {
           // 上游失败必须如实报错（ToolCallError 会被主循环标 is_error）
           throw new ToolCallError(`IDA 调试调用失败: ${translateDbgError(err.message)}`);
         }
+      }
+
+      case 'angr_solve': {
+        const { buildAngrScript } = require('./angr-gen');
+        const r = buildAngrScript(input);
+        if (r.error) return `参数错误：${r.error}`;
+        const L = [];
+        L.push('## angr 求解脚本已生成（未执行）');
+        L.push('');
+        L.push('```python');
+        L.push(r.script);
+        L.push('```');
+        L.push('');
+        L.push('## 用法');
+        L.push('1. 把上面的脚本存成 `solve_angr.py`（用 write_file），或用 run_python 直接跑脚本内容');
+        L.push('2. 目标在本机 → run_python；在 Kali → remote_exec');
+        L.push('3. 看输出：`INPUT_HEX=` 就是能走到 find 的输入');
+        L.push('');
+        L.push('## 设计要点');
+        for (const n of r.notes) L.push('- ' + n);
+        return L.join('\n');
       }
 
       case 'ida_dbg_mem': {

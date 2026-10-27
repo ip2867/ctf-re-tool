@@ -12,7 +12,15 @@ const { Client } = require('ssh2');
 
 const IDA = 'E:\\ctf\\tools\\1-Reverse\\IDA9.1\\ida.exe';
 const PORT = 13337;
-const HOST = '192.168.230.129', SSH_PORT = 22, USER = 'ip2867', PASS = '200512';
+// 凭据一律从环境变量读，绝不写进仓库（历史版本曾硬编码，已清理）。
+const HOST = process.env.KALI_HOST || '127.0.0.1';
+const SSH_PORT = Number(process.env.KALI_PORT) || 22;
+const USER = process.env.KALI_USER || '';
+const PASS = process.env.KALI_PASS || '';
+if (!USER || !PASS) {
+  console.error('缺少凭据：请先设置 KALI_HOST / KALI_USER / KALI_PASS 环境变量');
+  process.exit(2);
+}
 const log = [];
 const say = (s) => { log.push(s); console.log(s); };
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -122,7 +130,7 @@ async function ensureServer() {
 
     say('\n=== 2. linux_server（等 LISTEN）===');
     await ssh("pkill -f linux_server 2>/dev/null; sleep 1; echo ok", 15000);
-    await ssh("setsid /tmp/linux_server -P200512 -v > /tmp/ls6.log 2>&1 < /dev/null & echo SPAWNED", 20000);
+    await ssh(`setsid /tmp/linux_server -P${PASS} -v > /tmp/ls6.log 2>&1 < /dev/null & echo SPAWNED`, 20000);
     const listenOk = await ensureServer();
     mark('linux_server 就绪', listenOk);
 

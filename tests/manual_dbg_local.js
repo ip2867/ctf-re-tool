@@ -73,7 +73,11 @@ async function ip() {
 }
 async function prod(action, input) {
   const call = buildDbgCall(action, Object.assign({ action }, input || {}), {
-    targetKind: 'PE', remoteAvailable: true, remoteHost: '192.168.230.129', remotePort: 23946, remotePass: '200512',
+    targetKind: 'PE',
+    remoteAvailable: true,
+    remoteHost: process.env.KALI_HOST || '127.0.0.1',
+    remotePort: Number(process.env.KALI_DBG_PORT) || 23946,
+    remotePass: process.env.KALI_PASS || '',
   });
   if (call.error) return { __paramError: call.error };
   const r = await raw(call.tool, call.args);

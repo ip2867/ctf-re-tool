@@ -277,16 +277,74 @@ E8 05 00 00 00 E8 01 00 00 00 36 8B 44    call+pop+jmp 跳板
 ## 5. 静态搞不定时：动态优先
 
 花指令交叠污染严重（几百处短跳转互相影响）时，静态方法会陷入死循环
-（实测：IDA 建 1054 条被拆 1054 条）。此时：
+（实测：IDA 建 1054 条被拆 1054 条）。**执行路径是地面真值**：
+程序真的跑过的地址必然是指令起点，不受任何静态解码错位影响。
+
+### 5.1 先用工具的三个运行期原语（别手工单步）
+
+```js
+// ① 反推"这段代码把数据改成了什么"——混淆 handler 的首选
+ida_dbg({ action:"snapshot_diff",
+          regions:[{addr:"0x13200", size:216}],   // 要观察的数据块
+          mode:"until_return" })                  // 跑到当前函数返回
+// → 返回逐字节变化清单（offset / before / after），置换表直接就出来了
+// 之后接着调：ida_dbg({action:"snapshot_diff", mode:"once"})
+
+// mode 选择：
+//   until_return  整个 handler 做了什么（最常用）
+//   single_step   单条指令的效果（看某一条具体改了什么）
+//   until_addr    跑到指定地址（需 target，适合"跨函数看一段"）
+//   manual / once 先拍 before，人工做点别的，再差分
+
+// ② 让被混淆提前打断的循环跑满
+ida_dbg({ action:"force_continue",
+          set:[{reg:"eax", value:1}],   // 强制把退出条件改成"继续"
+          then:"continue",
+          repeat:6,                      // 跑 6 次（对应 6 行校验）
+          bp_addr:"0x46bd" })            // 在循环判断处反复命中
+// → 每个 ITER 都打印 IP 和 SET 结果
+
+// ③ 判断"这个函数只校验了一行还是一整块"
+ida_dbg({ action:"global_reads", func:"sub_4638" })
+// → GLOBAL_REFS / STRIDES / ELEMENT_WIDTH
+//   若引用元素数 < 一行宽度 ⇒ 该函数只处理一行，调用方在循环里喂多次
+//   ⇒ 说明还有 N 组常量没抓到，回头找调用方
+```
+
+### 5.2 静态读不动算法时：符号执行（angr）
+
+被混淆的函数"做了什么"读不出来，但**知道成功分支在哪**时，让 angr 反求输入：
+
+```js
+angr_solve({
+  binary: "/tmp/chall",
+  find:  ["0x5B90"],        // 打印 flag 的分支
+  avoid: ["0x5BB9"],        // 失败分支
+  main:  "0x4EDF",          // 主函数（call_state 入口）
+  stdin_len: 32,
+  hooks: [{addr:"0x39E3", kind:"opaque_jump"}]   // 间接跳转点
+})
+// → 生成脚本；用 run_python（本机）或 remote_exec（Kali）跑
+// → 看 INPUT_HEX= 即所求输入
+```
+
+**两个必须知道的前提**（都是实测踩出来的）：
+
+1. **绝不要用 `entry_state`**。它先进 `__libc_start_main`，该调用不返回，
+   simulation manager 直接耗尽（实测 0 个 state）。必须 `call_state(主函数)`。
+2. **间接跳转必须 hook**。混淆函数常经全局函数指针跳转，angr 会顺指针
+   把常量表字节当代码解码，报 `IR decoding error`。把那些点写进 `hooks`。
+
+若返回 `NO_SOLUTION` 且 `ERRORED>0`，看 `ERR0=` 的地址——那通常是**又一个**
+未 hook 的间接跳转点，加进 hooks 重跑。
+
+### 5.3 手工路线（工具不可用时）
 
 ```bash
 # x64dbg: 调试 → 跟踪 → 步入（记录每条指令 + 寄存器）
 # IDA:    Debugger → Trace → Instruction tracing
-# gdb:    record / 单步脚本
+# gdb:    record / 单步脚本（commands + set 那套等价于 force_continue）
 ```
-
-**执行路径是地面真值**：程序真的跑过的地址必然是指令起点，
-不受任何静态解码错位影响。用执行证据去覆盖 IDA 的启发式，是唯一可靠的路。
 
 ---
 
@@ -299,3 +357,7 @@ E8 05 00 00 00 E8 01 00 00 00 36 8B 44    call+pop+jmp 跳板
 5. 被调函数内有 `add [esp],N` + retn → F03 跳板（动态确认）
 6. 孤立 `db 0E8h` → F06 操作码污染（按 D → C → P）
 7. 以上都没有但反编译仍坏 → 走 `junk_scan mode=boundary` 看不可达区间，再不行上动态
+8. 混淆 handler 读不懂 → **别读代码**，`snapshot_diff` 量它的效果（见 §5.1）
+9. 循环被提前退出、常量抓不全 → `force_continue` 让它跑满（见 §5.1）
+10. 只抓到一行的常量 → `global_reads` 确认是否单行校验，再找调用方（见 §5.1）
+11. 知道成功分支但算法读不出 → `angr_solve` 反求输入（见 §5.2）

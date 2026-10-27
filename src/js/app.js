@@ -9465,6 +9465,26 @@ ${sideFilesBlock}
 - \`ida_dbg({action:"start"})\` → \`ida_dbg({action:"bp_add", addrs:["0x401000"]})\` → \`ida_dbg({action:"continue"})\`
   → \`ida_dbg({action:"regs"})\` / \`ida_dbg({action:"regs_named", regs:"RAX,RBX"})\`；
   退出用 \`ida_dbg({action:"exit"})\`，断点列表 \`{action:"bp_list"}\`。
+
+### ⭐ 运行期探测（混淆题首选，比读伪代码可靠）
+
+**当反编译出来的代码读不懂、或怀疑静态结论不可信时，不要硬读——直接量运行期行为。**
+
+- \`ida_dbg({action:"snapshot_diff", regions:[{addr:"0x13200",size:216}], mode:"until_return"})\`
+  **反推"这段代码把数据改成了什么"**。跑完当前函数，前后各拍一次内存快照并**就地差分**，
+  返回逐字节变化清单（offset / before / after）。混淆 handler 的置换/变换语义直接可见。
+  mode：\`until_return\`（整个函数，最常用）/ \`single_step\`（单条指令）/ \`until_addr\`（需 target）/
+  \`manual\`+\`once\`（先拍 before，中途做别的事，再出差分）。
+- \`ida_dbg({action:"force_continue", set:[{reg:"eax",value:1}], then:"continue", repeat:6, bp_addr:"0x46bd"})\`
+  **让被混淆提前打断的循环跑满**。在断点处强制改寄存器再继续，repeat 控制次数。
+  典型场景：校验函数本该循环 N 次，但被 \`test eax,eax; je exit\` 提前退出，只抓到第一组常量。
+- \`ida_dbg({action:"global_reads", func:"sub_4638"})\`
+  **判断函数只校验一行还是一整块**。统计它引用了哪些全局元素、步长多少。
+  若元素数 < 一行宽度 ⇒ 该函数只处理一行，调用方在循环里喂多次 ⇒ 还有 N 组常量没抓，回头找调用方。
+- \`angr_solve({binary:"/tmp/chall", find:["0x5B90"], avoid:["0x5BB9"], main:"0x4EDF", hooks:[{addr:"0x39E3"}]})\`
+  **算法读不出但知道成功分支时，让符号执行反求输入**。生成脚本后用 run_python / remote_exec 跑。
+  两个硬前提：① 必须 \`call_state\` 从主函数起（\`entry_state\` 会卡在 \`__libc_start_main\` 耗尽 state）；
+  ② 间接跳转点必须写进 \`hooks\`（否则 angr 顺函数指针把常量表当代码解码，报 IR decoding error）。
   带参数启动：\`ida_dbg({action:"start", path:"", args:"-d", cwd:"..."})\`（path 空串 = 调试 IDA 当前已加载的库）。
 - \`ida_dbg_mem({action:"read", regions:[{addr:"0x401000", size:32}]})\`：读内存（返回带空格的 hex）；
   \`ida_dbg_mem({action:"write", regions:[{addr:"0x401000", data:"9090"}]})\`：写内存。

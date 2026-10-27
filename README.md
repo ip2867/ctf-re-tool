@@ -1,4 +1,4 @@
-# CTF-RE-TOOL v1.9.1
+# CTF-RE-TOOL v1.9.2
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -12,11 +12,12 @@
 - **AI 工具循环（Tool-Use）**：AI 自主调用 JEB/IDA/Frida/Python 等工具反复推进，而不是一次性问答；分阶段提示词（①收集 → ②定位算法 → ③写脚本本地验证 → ④结论）。
 - **动态调试闭环**：IDA 调试器可直接下断点、单步、读写内存，覆盖本地 PE 与 Kali 远程 ELF；先静态取数锁定函数，再定向取证。
 - **花指令自动修复**：11 类花指令特征识别 + 只 nop 跳转本身的等长修补（字节偏移与语义都不变），修复后自动让 IDA 重新分析并等到就绪；实测把非对齐跳转降 78%、边界冲突点降 98%，让原本反编译失败的关键函数变得可读。
+- **运行期探测**：`snapshot_diff` 前后快照就地差分，直接量出混淆代码对数据做了什么；`force_continue` 强制改寄存器让被提前打断的循环跑满；`global_reads` 统计全局引用识别单行校验；`angr_solve` 生成绕开 libc 启动并 hook 间接跳转的符号执行脚本。
 - **本地验证闭环**：AI 给出的每个 flag 都附 `[VERIFY]` 契约，工具自动生成 Python 复现脚本本地跑一遍，标注 ✅已验证 / ⚠️未验证——**不靠"AI 说解出来了"就当解出来了**。
 - **结构化知识库**：50 条可检索条目（43 篇历年题 + 7 篇方法论），每条带 `attack_chain` 解法链 / `failed_attempts` 避坑；按题目特征自动预取，命中即注入 AI 上下文。
 - **经验自进化**：每次解题沉淀的多步攻击链写入经验库，下次同类题自动速查复用。
 
-**下载**：[v1.9.1 便携版 CTF-RE-TOOL.exe](https://github.com/ip2867/ctf-re-tool/releases/download/v1.9.1/CTF-RE-TOOL.exe)（74.11 MB，单文件双击即用，无需安装 / 无需 Node.js）
+**下载**：[v1.9.2 便携版 CTF-RE-TOOL.exe](https://github.com/ip2867/ctf-re-tool/releases/download/v1.9.2/CTF-RE-TOOL.exe)（74.11 MB，单文件双击即用，无需安装 / 无需 Node.js）
 
 > 校验：`SHA256 = 0b81078183312a1e8acb31ab1c4f784ad430284c7423ed64b8d3d29ed32ee167`
 >
@@ -367,6 +368,28 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 | [CHANGELOG-ARCHIVE.md](docs/CHANGELOG-ARCHIVE.md) | v1.4.0 及更早的更新日志 |
 
 ## 更新日志
+
+### v1.9.2 (2026-10-26) — 运行期探测原语：让工具能量"代码做了什么"
+
+上一轮卡在"混淆 handler 的置换语义读不动"。这一版不解决某道题，而是补**四个运行期原语**，
+把"只能停下人工看"变成"能跑起来自动量"。
+
+| 原语 | 用途 |
+|---|---|
+| `ida_dbg(snapshot_diff)` | 跑一段 → 前后各拍内存快照 → **就地逐字节 diff**，直接看出代码把数据改成了什么 |
+| `ida_dbg(force_continue)` | 断点处强制改寄存器再继续，`repeat=N` 让被混淆提前打断的循环跑满 |
+| `ida_dbg(global_reads)` | 统计函数引用的全局元素与步长，识别"只校验一行/一块" |
+| `angr_solve` | 生成 `call_state` 起跑 + 间接跳转 hook 的符号执行脚本 |
+
+**angr 路线的两个坑已固化进生成器**：① 绝不用 `entry_state`（会卡在 `__libc_start_main` 耗尽 state，
+实测 0 个 state）；② 间接跳转点必须 hook（否则 angr 顺函数指针把常量表当代码解码，报 IR decoding error）。
+
+**实测当天就推翻了自己两个错误判断**：在真实 IDA 上跑 `global_reads(sub_4638)` 发现
+`off_13200` 只被引用 1 次（取基址），并非此前以为的"读 9 个元素"；而一直找不到的预计算值表
+就在 `unk_131D0`——连续 32 字节，首 dword 正是之前抓到的比较常量。详见
+[`docs/JUNK-CODE-AUDIT.md`](docs/JUNK-CODE-AUDIT.md) 第十一节。
+
+回归 **89/89**（新增 `test_dbg_probe.js` 82 条断言，含"生成的 Python 必须过 `ast.parse`"）。
 
 ### v1.9.1 (2026-10-26) — 花指令（junk code）识别与修复闭环 + 安全性审查
 

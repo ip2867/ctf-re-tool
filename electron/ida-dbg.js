@@ -92,6 +92,11 @@ const DBG_ACTIONS = [
   'bp_list', 'bp_add', 'bp_del', 'bp_toggle', 'regs', 'regs_named', 'stack',
   'mem_read', 'mem_write',
   'mode', 'clear_remote',
+  // 运行期探测（dbg-probe.js）：
+  //   snapshot_diff 跑一段并在前后各拍内存快照、就地差分（反推"对数据做了什么变换"）
+  //   force_continue 在断点处强制改寄存器再继续（让被混淆打断的循环跑满）
+  //   global_reads   统计函数引用了哪些全局元素（识别单行/单块校验）
+  'snapshot_diff', 'force_continue', 'global_reads',
 ];
 
 // idaapi.get_process_state() 的实测取值（2026-10-20，IDA 9.1 + WOW64 目标）：
@@ -334,6 +339,23 @@ function buildDbgCall(action, input, ctx) {
       if (!regions.length) return { error: 'ida_dbg_mem(action="write") 需要 regions（[{addr,data}]）或 addr+data' };
       return { tool: 'dbg_write', args: { regions } };
     }
+
+    // ══════ 运行期探测原语（dbg-probe.js）══════
+    // 这三个都走 py_eval：需要"执行一段 → 前后取数 → 就地 diff"的复合操作，
+    // 上游 MCP 只提供单点读写，组不成闭环。
+    case 'snapshot_diff': {
+      const { buildSnapshotDiff } = require('./dbg-probe');
+      return buildSnapshotDiff(i);
+    }
+    case 'force_continue': {
+      const { buildForceContinue } = require('./dbg-probe');
+      return buildForceContinue(i);
+    }
+    case 'global_reads': {
+      const { buildGlobalReads } = require('./dbg-probe');
+      return buildGlobalReads(i);
+    }
+
     default:
       return { error: `未知的调试动作: ${action}（可用: ${DBG_ACTIONS.join(', ')}）` };
   }

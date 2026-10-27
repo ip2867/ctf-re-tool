@@ -74,7 +74,7 @@ console.log('\n[2] buildDbgCall 对每个 action 逐一断言上游工具名与�
     ok(r.tool === tool, `${action} → ${tool}（实际 ${r.tool || r.error}）`);
     if (args) ok(JSON.stringify(r.args) === JSON.stringify(args), `${action} 参数 ${JSON.stringify(args)}（实际 ${JSON.stringify(r.args)}）`);
   }
-  ok(DBG_ACTIONS.length === 19, `DBG_ACTIONS 共 19 项（新增 status/suspend 后）实际 ${DBG_ACTIONS.length}`);
+  ok(DBG_ACTIONS.length === 22, `DBG_ACTIONS 共 22 项（19 + 运行期探测 3 个）实际 ${DBG_ACTIONS.length}`);
 
   // bp_add 的生成代码必须用 idaapi.add_bpt 并覆盖每个地址
   const bpa = buildDbgCall('bp_add', { addrs: '0x401000,0x401010' });

@@ -1,8 +1,8 @@
 @echo off
-title CTF-RE-TOOL v1.9.4
+title CTF-RE-TOOL v1.9.5
 
 echo ========================================
-echo   CTF-RE-TOOL v1.9.4
+echo   CTF-RE-TOOL v1.9.5
 echo   CTF Reverse Engineering AI Workbench
 echo ========================================
 echo.

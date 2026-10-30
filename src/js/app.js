@@ -8020,7 +8020,29 @@ async function autoSolveFlag() {
       // 识别关键类（应用自身包优先 + 加解密/编解码/校验语义加权，避免只靠硬编码关键词漏掉 Encoder）
       if (Array.isArray(classesResult.result)) {
         const keyClasses = selectKeyClasses(classesResult.result, analysisData.packageName, null, 10);
-        addLog('info', `发现 ${keyClasses.length} 个关键类: ${keyClasses.map(c => String(c).split('/').pop()).join(', ')}`);
+        // ⚠️ 日志里只打最后一段会把不同包的类混成同一个名字：
+        //    实测（NaughtyBoy）`发现 10 个关键类: SignTools$a;, SignTools;, a;, b;, e;, b;, c;, a;, b;, c;`
+        //    b/a/c 各重复 2~3 次（分别来自 b.c.a.* 与其他混淆包）。这类日志既看不出重复，
+        //    也会诱导后续 jeb_get_class_decompiled 拿歧义短名去查 → "Class not found"。
+        //    改为：短名 + 括号内补全路径（仅在短名冲突时补，避免过长）。
+        const shortOf = c => String(c).replace(/^L/, '').replace(/;$/, '').split('/').pop();
+        const counts = {};
+        for (const c of keyClasses) counts[shortOf(c)] = (counts[shortOf(c)] || 0) + 1;
+        const label = keyClasses.map(c => {
+          const s = shortOf(c);
+          if (counts[s] > 1) {
+            const full = String(c).replace(/^L/, '').replace(/;$/, '');
+            return `${s}(${full})`;
+          }
+          return s;
+        }).join(', ');
+        addLog('info', `发现 ${keyClasses.length} 个关键类: ${label}`);
+        if (Object.values(counts).some(n => n > 1)) {
+          addLog('warning', `[关键类] 有重名短类（${Object.keys(counts).filter(k => counts[k] > 1).join(', ')}）；`
+            + '后续按类名取反编译时必须用上面括号里的完整路径，否则 JEB 会报 Class not found');
+        }
+        // 供后续步骤使用：完整类名列表（不含歧义短名）
+        state._keyClassFullNames = keyClasses.map(c => String(c).replace(/^L/, '').replace(/;$/, ''));
       }
     }
   } catch (e) {
@@ -10565,10 +10587,50 @@ function parseHypotheses(text) {
   const re = /\[HYPOTHESES\]\s*([\s\S]*?)\s*\[\/HYPOTHESES\]/gi;
   let m;
   while ((m = re.exec(String(text || ''))) !== null) {
-    try {
-      const arr = JSON.parse(m[1]);
-      if (Array.isArray(arr)) out.push(...arr);
-    } catch (e) { /* 坏 JSON 跳过 */ }
+    for (const cand of jsonCandidates(m[1])) {
+      try {
+        const arr = JSON.parse(cand);
+        if (Array.isArray(arr)) { out.push(...arr); break; }
+        if (arr && typeof arr === 'object') { out.push(arr); break; }
+      } catch (e) { /* 试下一个候选 */ }
+    }
+  }
+  return out;
+}
+
+// 从"夹了围栏/说明文字"的块里提取出可 JSON.parse 的片段。
+//
+// 实测（NaughtyBoy）：AI 输出的是
+//     [HYPOTHESES]
+//     json
+//     [
+//       {...}
+//     ]
+//     [/HYPOTHESES]
+// 中间那行 `json` 是 markdown 语言标记（AI 习惯性加的），旧实现直接
+// JSON.parse 整段 → 失败 → 记成"AI 未给 [HYPOTHESES]" → 本地枚举被判"
+// 无可枚举候选"，把 AI 已经给出的 2 条假设整批丢掉。
+//
+// 顺序：原文 → 去掉 ```围栏``` → 从第一个 [ / { 截到最后一个 ] / } 。
+function jsonCandidates(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return [];
+  const out = [s];
+  // 去掉 markdown 代码围栏（```json ... ``` 或只留语言标记行）
+  const noFence = s.replace(/^```[a-zA-Z]*\s*/gm, '').replace(/```\s*$/gm, '').trim();
+  if (noFence && noFence !== s) out.push(noFence);
+  // 去掉开头的裸语言标记行（json / JSON / javascript ...）
+  const noLang = noFence.replace(/^(?:json|JSON|javascript|js)\s*\r?\n/, '').trim();
+  if (noLang && noLang !== noFence) out.push(noLang);
+  // 按括号配对截取：从第一个 [ 或 { 到最后一个 ] 或 }
+  for (const base of [noLang, noFence, s]) {
+    const iArr = base.indexOf('[');
+    const iObj = base.indexOf('{');
+    const starts = [iArr, iObj].filter(i => i >= 0);
+    if (!starts.length) continue;
+    const start = Math.min(...starts);
+    const end = Math.max(base.lastIndexOf(']'), base.lastIndexOf('}'));
+    if (end > start) out.push(base.slice(start, end + 1));
   }
   return out;
 }

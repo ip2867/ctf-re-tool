@@ -10290,8 +10290,32 @@ ipcMain.handle('validate-frida-script', async (event, src) => {
     const vm = require('vm');
     const code = String(src || '');
     const tryParse = (s) => { try { new vm.Script(s); return null; } catch (e) { return e.message; } };
+
+    // 结构 lint 先跑：语法合法但注释写坏（`/ ==== /`）的情况 vm.Script 抓不到，
+    // 脚本能注入却整段失效（NaughtyBoy 实测：0 条 [DATA]、白白注入一轮）。
+    let structural = null;
+    try {
+      const { lintAndRepair } = require('./frida-lint');
+      structural = lintAndRepair(code);
+    } catch (e) { structural = null; }
+
     let err = tryParse(code);
-    if (!err) return { ok: true, script: code, repaired: false };
+    if (!err) {
+      if (structural && !structural.ok && structural.remaining.length) {
+        // 修复后仍有结构问题 → 当作失败，让上层带错误重新生成
+        return {
+          ok: false, script: null, repaired: false,
+          error: '结构检查未通过: '
+            + structural.remaining.slice(0, 3).map(x => (x.line ? `L${x.line} ` : '') + x.hint).join('; '),
+          structuralIssues: structural.remaining,
+        };
+      }
+      const out = (structural && structural.repairs.length) ? structural.script : code;
+      return {
+        ok: true, script: out, repaired: !!(structural && structural.repairs.length),
+        structuralIssues: structural ? structural.remaining : undefined,
+      };
+    }
 
     // 修复：转义正则字面量内部未转义的 '/'（如 /data/dalvik、res/x.xml）
     const repaired = code.split('\n').map(line => {
@@ -10332,7 +10356,23 @@ ipcMain.handle('validate-frida-script', async (event, src) => {
     }).join('\n');
 
     const err2 = tryParse(repaired);
-    if (!err2) return { ok: true, script: repaired, repaired: true };
+    if (!err2) {
+      // 正则修复成功后再过一遍结构 lint（坏注释可能同时存在）
+      let s2 = null;
+      try {
+        const { lintAndRepair } = require('./frida-lint');
+        s2 = lintAndRepair(repaired);
+      } catch (e) { s2 = null; }
+      if (s2 && !s2.ok && s2.remaining.length) {
+        return {
+          ok: false, script: null, repaired: false,
+          error: '结构检查未通过: '
+            + s2.remaining.slice(0, 3).map(x => (x.line ? `L${x.line} ` : '') + x.hint).join('; '),
+          structuralIssues: s2.remaining,
+        };
+      }
+      return { ok: true, script: s2 ? s2.script : repaired, repaired: true };
+    }
 
     // 修复：输出被截断（"Unexpected end of input"，max_tokens 不足的 Hook 脚本常见）
     // → 从尾部逐步回退到最近的完整语句边界，按括号栈补齐未闭合的 { ( [ ，

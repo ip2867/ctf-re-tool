@@ -7953,6 +7953,8 @@ function getToolDefinitions() {
       name: "ida_open_file",
       description:
         "让 IDA 打开一个二进制并在新实例里重新分析，之后所有 ida_* 调用自动路由到新实例。\n" +
+        "**IDA 没在运行时会自动帮你拉起**（按设置里的 tools.ida，-A 自主模式 + 带上目标文件），" +
+        "并等到 MCP 端口就绪才调用 open_file——所以不需要先手动开 IDA，也不要因为一次失败就判断\"本机没有 IDA\"。\n" +
         "**花指令修复后必用**：junk_repair 只改文件字节，IDA 里现存的 IDB 还是按旧的错位边界解析的，" +
         "不重开就永远拿到错误的伪代码。\n" +
         "参数 path 传修补后的文件（如 matrix_repaired）；new_database=true 会强制丢弃旧 IDB 重新分析。" +
@@ -9968,6 +9970,81 @@ async function callIdaMcp(method, params) {
   }
 }
 
+// 探测本地 TCP 端口是否在监听（IDA MCP 就绪的前提）。
+// 与渲染层 check-port 同义，但主进程内部要用，不能跨 IPC。
+function probeTcpPort(host, port, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    const net = require('net');
+    let done = false;
+    let sock = null;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      try { if (sock) sock.destroy(); } catch (e) { /* 已关闭 */ }
+      resolve(v);
+    };
+    try {
+      sock = net.connect({ host: host || '127.0.0.1', port: Number(port) || 0 });
+    } catch (e) {
+      return resolve(false);
+    }
+    sock.setTimeout(timeoutMs, () => finish(false));
+    sock.on('connect', () => finish(true));
+    sock.on('error', () => finish(false));
+  });
+}
+
+// 工具循环不经过界面的"启动 IDA"按钮（launchTool('ida')），所以 ida_* 工具必须自己保证
+// IDA 进程在跑。实测代价（DancingKeys.sys 一轮，用户是直接在对话里下的指令）：
+//   ida_open_file → open_file 直接失败 → 前端渲染成"IDA 未能切换到目标文件"，
+//   模型据此判定"本机没有 IDA"，转去手工静态分析，整轮白跑。
+// 这里在调用 open_file 之前补上"探测端口 → 没在跑就拉起 → 等端口就绪"。
+async function ensureIdaProcessForTool(targetPath, waitMs = 120000) {
+  const lines = [];
+  let host = '127.0.0.1';
+  let port = 13337;
+  try {
+    const u = new URL(config.mcp.ida || 'http://127.0.0.1:13337/mcp');
+    host = u.hostname || host;
+    port = Number(u.port) || port;
+  } catch (e) { /* 配置异常时用默认端口 */ }
+
+  if (await probeTcpPort(host, port, 1200)) {
+    return { ok: true, already: true, lines, host, port };
+  }
+
+  const idaPath = (config.tools && (config.tools.ida || config.tools.ida64)) || '';
+  if (!idaPath || !fs.existsSync(idaPath)) {
+    lines.push(`IDA 未运行（${host}:${port} 未监听），且设置里没有可用的 IDA 路径（tools.ida = ${JSON.stringify(idaPath || '')}）。`);
+    lines.push('请在应用「设置」页填写 IDA 可执行文件路径（ida64.exe），或手动启动 IDA 并确认 MCP 插件已开启，然后重试。');
+    return { ok: false, lines, host, port };
+  }
+
+  try { hardenEditorConfigs(); } catch (e) { /* 配置固化失败不阻塞启动 */ }
+  const argv = [idaPath, '-A'];
+  if (targetPath) argv.push(targetPath);
+  lines.push(`IDA 未运行（${host}:${port} 未监听），已自动启动：${path.basename(idaPath)}`
+    + (targetPath ? ` ${path.basename(targetPath)}` : '') + '（-A 自主模式）');
+  const r = await spawnArgv(argv, { gui: true });
+  if (!r || r.success === false) {
+    lines.push('IDA 启动失败: ' + ((r && (r.error || r.stderr)) || '未知原因'));
+    return { ok: false, lines, host, port };
+  }
+
+  const waitSec = Math.round(Math.min(Math.max(Number(waitMs) || 120000, 15000), 300000) / 1000);
+  const deadline = Date.now() + waitSec * 1000;
+  while (Date.now() < deadline) {
+    await new Promise(res => setTimeout(res, 2000));
+    if (await probeTcpPort(host, port, 1200)) {
+      lines.push(`✅ IDA 已启动，MCP 端口 ${host}:${port} 就绪`);
+      return { ok: true, launched: true, lines, host, port };
+    }
+  }
+  lines.push(`IDA 已拉起，但 ${waitSec}s 内 ${host}:${port} 仍未监听。`);
+  lines.push('常见原因：IDA 里 MCP 插件未启用/未加载、或冷启动弹出了模态对话框挡住了插件自启。');
+  return { ok: false, lines, host, port };
+}
+
 // 打开文件后等新实例把自动分析与 Hex-Rays 都准备好。
 // 为什么要等：open_file 只保证"实例注册到 MCP"，此时 list_funcs 可能还是空表或几十个
 // 未识别函数；渲染层紧接着采集就会拿到残缺函数表，进而选错主体函数。
@@ -9998,7 +10075,18 @@ async function idaReloadAndWait(filePath, opts = {}) {
   }
 
   let opened;
+  let launchNote = [];
   try {
+    // 先保证 IDA 进程在跑。工具循环不经过界面的"启动 IDA"按钮，
+    // 少了这一步，用户直接在对话里让 AI 载入文件时必然拿不到实例。
+    const ensured = await ensureIdaProcessForTool(filePath, Math.min(waitSec * 1000, 120000));
+    launchNote = ensured.lines || [];
+    if (!ensured.ok) {
+      lines.push(...launchNote);
+      lines.push('工具调用失败: IDA 未能切换到目标文件（IDA 进程不可用）');
+      return { ok: false, lines };
+    }
+    lines.push(...launchNote);
     opened = await idaMcpCallTool('open_file', {
       file_path: filePath,
       switch: true,
@@ -10007,10 +10095,12 @@ async function idaReloadAndWait(filePath, opts = {}) {
       timeout: openTimeoutSec,
     });
   } catch (e) {
+    lines.push(...launchNote);
     lines.push('工具调用失败: IDA 自动重载出错（' + e.message + '）');
     lines.push(`请先启动 IDA（并确认 MCP 端口可达），再调用 ida_open_file({ path: "${filePath}" })。`);
     return { ok: false, lines };
   }
+  lines.push(...launchNote);
 
   if (!opened || opened.success === false) {
     lines.push('工具调用失败: IDA 自动重载失败（' + JSON.stringify(opened) + '）');

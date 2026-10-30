@@ -144,6 +144,9 @@ junk_repair({ path: "chall.exe" })
 // 3) 直接在新库上反编译（不需要再手动 open）
 //    ida_list_functions → ida_decompile
 //    若需要手动重开：ida_open_file({ path: "chall_repaired.exe" })
+//    ⚠ ida_open_file 会**自动拉起 IDA**（若没在跑），并等 MCP 端口就绪。
+//      所以它失败时不要推断"本机没装 IDA"——先看返回里"未监听/设置里没有路径"那几行说明，
+//      按提示修环境（设置页填 ida64.exe 路径 / 确认 IDA 里 MCP 插件已启用）。
 ```
 
 工具返回里每条候选都标了：

@@ -420,15 +420,123 @@ function rewriteMultilinePython(command) {
 
 // bash 的可注入 case 体：exec/tempDir/cwd 注入后可在纯 Node 下真实跑命令。
 // 空 stdout 必须仍带 exit 码与 stderr——"无输出"不等于"命令成功"。
+//
+// ⚠ Windows 常见坑（实测 Obfuscating Macros II 一轮里 run_command 失败 7 次）：
+// 模型习惯写 `wsl --status 2>&1 | head -5` 这类 POSIX 管道，但 exec 走 cmd.exe，
+// `head`/`tail`/`grep`/`wc` 都不存在 → 整条命令失败，AI 误判环境缺失而绕圈。
+// 这里在 Windows 上把常见 POSIX 片段换成等价的纯 Node 处理：截断/过滤自己做，
+// 命令只保留真正的执行部分。
+const POSIX_TOOLS = /\b(head|tail|wc|grep|egrep|fgrep|cut|sort|uniq|tr|sed|awk)\b/;
+
+function adaptPosixPipeline(cmd) {
+  if (process.platform !== 'win32') return { cmd, note: '' };
+  const s = String(cmd);
+  if (!POSIX_TOOLS.test(s)) return { cmd: s, note: '' };
+
+  // 只处理"单管道 + 单个简单 POSIX 工具"的情况；复杂管道原样放行（避免改错语义）
+  // 形如: base | head -N  /  base 2>&1 | tail -N  /  base | grep -i X  /  base | wc -l
+  // 注意 cmd.exe 下 `2>&1` 位置在管道前，且可能带空格，正则要宽松。
+  const m = s.match(/^([\s\S]+?)\s*(?:2\s*>&\s*1)?\s*\|\s*(head|tail|wc|grep|egrep|fgrep)\b([^|]*)$/i);
+  if (!m) return { cmd: s, note: '' };
+
+  const base = m[1].trim();
+  const tool = m[2].toLowerCase();
+  const args = (m[3] || '').trim();
+
+  if (tool === 'head' || tool === 'tail') {
+    const n = Number((args.match(/-n?\s*(\d+)/) || [])[1]) || Number((args.match(/^-(\d+)/) || [])[1]) || 10;
+    return {
+      cmd: base,
+      note: `[已适配] Windows 无 ${tool}，改为执行原命令后在结果里${tool === 'head' ? '截取前' : '截取后'} ${n} 行`,
+      post: { kind: tool, n },
+    };
+  }
+  if (tool === 'grep' || tool === 'egrep' || tool === 'fgrep') {
+    const pat = (args.match(/^-[a-zA-Z]*\s+(.+)$/) || args.match(/^(.+)$/) || [])[1] || '';
+    return {
+      cmd: base,
+      note: `[已适配] Windows 无 ${tool}，改为执行原命令后用 JS 过滤含 ${JSON.stringify(pat)} 的行`,
+      post: { kind: 'grep', pattern: pat.replace(/^['"]|['"]$/g, '') },
+    };
+  }
+  if (tool === 'wc') {
+    return {
+      cmd: base,
+      note: '[已适配] Windows 无 wc，改为执行原命令后用 JS 统计',
+      post: { kind: 'wc', lines: /-\w*l/.test(args) },
+    };
+  }
+  return { cmd: s, note: '' };
+}
+
+function applyPostFilter(text, post) {
+  if (!post) return text;
+  // 先剥掉尾部换行再分行：exec 的 stdout 通常以 \n 结尾，
+  // 直接 split 会多出一个空元素，导致 `tail -1` 拿到空串。
+  const raw = String(text).replace(/(\r?\n)+$/, '');
+  const lines = raw.split(/\r?\n/);
+  if (post.kind === 'head') return lines.slice(0, post.n).join('\n');
+  if (post.kind === 'tail') return lines.slice(-post.n).join('\n');
+  if (post.kind === 'grep') {
+    if (!post.pattern) return text;
+    let re;
+    try { re = new RegExp(post.pattern, 'i'); } catch (e) { re = null; }
+    const hit = re ? lines.filter(l => re.test(l)) : lines.filter(l => l.includes(post.pattern));
+    return hit.length ? hit.join('\n') : '（过滤后无匹配行）';
+  }
+  if (post.kind === 'wc') {
+    return post.lines ? String(lines.filter(l => l.length).length) : String(text.length);
+  }
+  return text;
+}
+
+// ── 探测式多命令（cmd 的 `&` 串联）──────────────────────────────
+// 实测（驱动逆向）：AI 写
+//   where idat64.exe idat.exe 2>nul & dir /b "C:\Program Files\IDA*" 2>nul
+// 期望是"哪个能找到就报哪个"（探测式用法）。但 cmd 里 `&` 串联时，
+// **整体退出码取最后一条**；只要有一条（这里是 where）失败、且没有输出，
+// exec 就带着非零码回来 → 被判定为"命令执行失败"，
+// 即使后面的 dir 其实成功了。AI 于是误判"本机没有 IDA"，转去手工静态分析。
+//
+// 处理：把 `A 2>nul & B 2>nul & C` 拆成逐条独立执行，
+// 任一条有输出即视为整体成功（并标注哪几条失败）。只在 Windows 生效，
+// 且要求**每条都带 2>nul**（这是"我不关心这条失败"的明确信号），
+// 避免把真正的 `&&` 逻辑链（有依赖关系）也拆开。
+function splitProbeChain(cmd) {
+  if (process.platform !== 'win32') return null;
+  const s = String(cmd);
+  // 只处理 & 分隔（不是 &&），且段数 2~6，每段都含 2>nul / 2>&1
+  if (/\&\&/.test(s)) return null;
+  const parts = s.split(/\s+\&\s+/).map(x => x.trim()).filter(Boolean);
+  if (parts.length < 2 || parts.length > 6) return null;
+  if (!parts.every(p => /2\s*>\s*nul|2\s*>&\s*1/i.test(p))) return null;
+  return parts;
+}
+
 function runBash(deps, command) {
   const { exec, tempDir, cwd } = deps || {};
   const cmd = String(command == null ? '' : command);
   const rw = rewriteMultilinePython(cmd);
-  const opts = { timeout: 120000, maxBuffer: 32 * 1024 * 1024 };
+  // 超时可注入：Unicorn 模拟 / 大规模枚举常需 5-10 分钟，
+  // 固定 120s 会把正在收敛的正确解法误杀（同一轮里 AI 因此换路重试、烧光预算）。
+  const timeoutMs = Math.min(Math.max(Number(deps && deps.timeoutMs) || Number(process.env.CTF_BASH_TIMEOUT_MS) || 300000, 1000), 1800000);
+  const opts = { timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, windowsHide: true };
   if (cwd) opts.cwd = cwd;
 
   let tmpFile = null;
   let finalCmd = cmd;
+  let post = null;
+  let adaptNote = '';
+
+  // 探测式多命令：先尝试拆分（多行 Python 已改写为脚本文件，走 file 模式，不在这里处理）
+  let probeParts = null;
+  if (rw.mode !== 'file') {
+    probeParts = splitProbeChain(cmd);
+    if (probeParts) {
+      return runProbeChain(exec, probeParts, opts, timeoutMs);
+    }
+  }
+
   if (rw.mode === 'file') {
     tmpFile = path.join(tempDir || os.tmpdir(), `ctf_bash_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.py`);
     try {
@@ -437,25 +545,56 @@ function runBash(deps, command) {
       return Promise.resolve(`命令执行失败: 无法写入临时脚本 ${tmpFile}（${e.message}）`);
     }
     finalCmd = rw.cwdPrefix + '"' + (rw.interpreter || 'python') + '" "' + tmpFile + '"' + (rw.tail || '');
+  } else {
+    const ad = adaptPosixPipeline(cmd);
+    finalCmd = ad.cmd;
+    post = ad.post || null;
+    adaptNote = ad.note || '';
   }
 
   return new Promise((resolve) => {
     exec(finalCmd, opts, (error, stdout, stderr) => {
       if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch (e) { /* 清理失败不影响结果 */ } }
+      const pre = adaptNote ? adaptNote + '\n' : '';
       if (error) {
         const timedOut = error.killed || /timed out|ETIMEDOUT/i.test(error.message || '');
-        resolve(timedOut
-          ? `命令执行超时（120s 上限，已终止）。请改用更省时的命令或拆分执行。\n${truncateOutput(stderr)}`
-          : `命令执行失败: ${error.message}\n${truncateOutput(stderr)}`);
+        resolve(pre + (timedOut
+          ? `命令执行超时（${Math.round(timeoutMs / 1000)}s 上限，已终止）。请改用更省时的命令或拆分执行。\n${truncateOutput(stderr)}`
+          : `命令执行失败: ${error.message}\n${truncateOutput(stderr)}`));
         return;
       }
       if (stdout && stdout.trim()) {
-        resolve(truncateOutput(stdout));
+        resolve(pre + truncateOutput(applyPostFilter(stdout, post)));
         return;
       }
-      resolve(`命令执行结束（exit=0，无输出；stderr=${stderr && stderr.trim() ? truncateOutput(stderr) : '(空)'}；mode=${rw.mode}）`);
+      resolve(pre + `命令执行结束（exit=0，无输出；stderr=${stderr && stderr.trim() ? truncateOutput(stderr) : '(空)'}；mode=${rw.mode}）`);
     });
   });
+}
+
+// 逐条执行探测链：任一条有输出即成功。
+function runProbeChain(exec, parts, opts, timeoutMs) {
+  const runOne = (c) => new Promise((res) => {
+    exec(c, opts, (err, stdout, stderr) => {
+      res({ cmd: c, err, out: String(stdout || ''), errOut: String(stderr || '') });
+    });
+  });
+  return (async () => {
+    const results = [];
+    for (const c of parts) results.push(await runOne(c));
+    const hit = results.filter(r => r.out.trim());
+    const head = `[已适配] ${parts.length} 条探测命令已逐条执行（任一条有输出即视为成功；` +
+      `原写法用 cmd 的 & 串联，会因某条失败而整体被判失败）`;
+    if (hit.length) {
+      const body = hit.map(r => r.out.trimEnd()).join('\n');
+      const failedN = results.filter(r => r.err && !r.out.trim()).length;
+      return head + (failedN ? `（另有 ${failedN} 条无结果）` : '') + '\n' + truncateOutput(body);
+    }
+    // 全都没有输出：如实说"都没找到"，而不是笼统的"命令执行失败"
+    const detail = results.map(r => `- \`${r.cmd}\` → ` +
+      (r.err ? '无结果/失败' : '无输出')).join('\n');
+    return head + '\n没有一条命令产生输出（这本身是有效结论：所查的东西都不存在）\n' + detail;
+  })();
 }
 
 module.exports = {
@@ -472,4 +611,5 @@ module.exports = {
   idaGetBytes,
   scanCryptoCase,
   runBash,
+  splitProbeChain,
 };

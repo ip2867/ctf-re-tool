@@ -300,10 +300,10 @@ loc_401108:  mov [rbp+var_D0], 2      ← 把"段号 2"压进栈
 
 ```js
 // ① 真跑一遍，记录每次间接跳转实际去了哪里
-emu_trace({ binary:"/tmp/chall", start:"0x401006", mode:"function" })
+emu_trace({ binary:"/tmp/chall", start:"<要调用的函数地址>", mode:"function" })
 // → 返回脚本 + 摘要。摘要里的这行就是跳转表：
-//   IND 0x401138 -> 2 targets: v=0x2 0x4011BF(x1)  v=0x4 0x40120A(x1)
-//   ↑ 段号 2 → 段地址 0x4011BF；段号 4 → 0x40120A
+//   IND <跳转点> -> N targets: v=<段号> <段地址>(x1)  v=<段号> <段地址>(x1)
+//   ↑ 左边是"段号"，右边是该段号对应的真实段地址
 // → 轨迹 JSON 默认落在 cwd/emu_trace.json（含 indirect_sites / edges / exec_ranges）
 
 // ② 把轨迹回填进 IDA，让各段连成一片
@@ -337,7 +337,7 @@ ida_apply_trace({ trace: "<上一步的轨迹对象或 JSON 路径>" })
 | `x += y` | `x -= y` |
 
 那就**不需要**符号执行：从目标值出发，把每轮操作**逆序**执行一遍就还原出输入。
-这是最省时、最可靠的路（实测：Obfuscating Macros II 的 1024 轮循环体全部可逆）。
+这是最省时、最可靠的路（实测：这类 1024 轮循环体往往全部可逆，倒推只需几毫秒）。
 
 做法：
 1. 把还原出的伪代码写成 `def f(X, Y)`（正向），再用真值核对：

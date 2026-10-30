@@ -19,7 +19,7 @@
 
 **下载**：[v1.10.0 便携版 CTF-RE-TOOL.exe](https://github.com/ip2867/ctf-re-tool/releases/download/v1.10.0/CTF-RE-TOOL.exe)（74.22 MB，单文件双击即用，无需安装 / 无需 Node.js）
 
-> 校验：`SHA256 = 9ecb738615799a26f3b355d6d1f39765b7e688baa59b3fcb0f7901eb0d1a57be`（也可直接下载 [.sha256](https://github.com/ip2867/ctf-re-tool/releases/download/v1.10.0/CTF-RE-TOOL.exe.sha256)）
+> 校验：`SHA256 = 0ce81a10ce0c0a25c925cd0e5ba45206e0f4eefcd1685952d741c61719f23baf`（也可直接下载 [.sha256](https://github.com/ip2867/ctf-re-tool/releases/download/v1.10.0/CTF-RE-TOOL.exe.sha256)）
 >
 > 首次运行请在「设置」页填写 IDA / JEB / jadx 等外部工具路径（本工具是调度框架，不含这些工具）。
 

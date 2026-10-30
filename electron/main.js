@@ -3268,6 +3268,8 @@ function toolLabel(name, input) {
     case 'ida_decompile': return 'IDA 反编译 ' + short(i.function_name || i.address, 40);
     case 'ida_open_file': return 'IDA 载入 ' + short(i.path ? path.basename(i.path) : '', 40);
     case 'angr_solve': return 'angr 求解 ' + short(i.binary ? path.basename(i.binary) : '', 30);
+    case 'emu_trace': return '执行轨迹 ' + short(i.binary ? path.basename(i.binary) : '', 28) + (i.start ? ' @' + short(i.start, 12) : '');
+    case 'ida_apply_trace': return '回填轨迹到 IDA';
     case 'ida_get_bytes': return 'IDA 读取字节 ' + short(i.address, 30);
     case 'ida_list_functions': return 'IDA 列出函数';
     case 'ida_find_strings': return 'IDA 查找字符串 ' + short(i.keyword || i.pattern || '', 30);
@@ -6286,6 +6288,7 @@ function parseTextToolCalls(rawText) {
     'jeb_get_exported_activities', 'jeb_get_all_classes', 'jeb_get_class_methods',
     'ida_decompile', 'ida_list_functions', 'ida_find_strings', 'ida_get_xrefs', 'ida_get_bytes',
     'ida_list_globals', 'ida_disasm', 'ida_dbg', 'ida_dbg_mem', 'ida_open_file', 'angr_solve',
+    'emu_trace', 'ida_apply_trace',
     'remote_exec', 'traffic_extract', 'recipe', 'gui_input', 'crypto',
     'browser_search', 'browser_open', 'run_command', 'run_python', 'adb_command', 'frida_hook',
     'read_skill', 'wiki_search', 'wiki_read', 'burp_get_history', 'burp_get_message', 'burp_call',
@@ -6298,7 +6301,8 @@ function parseTextToolCalls(rawText) {
     browser_open: 'url', browser_search: 'query', ida_decompile: 'function_name', ida_get_xrefs: 'address',
     ida_get_bytes: 'address', ida_find_strings: 'regex', frida_hook: 'script', adb_command: 'command',
     ida_disasm: 'address', ida_dbg: 'action', ida_dbg_mem: 'action', remote_exec: 'command', traffic_extract: 'path',
-    ida_list_globals: 'filter', ida_open_file: 'path', angr_solve: 'binary'
+    ida_list_globals: 'filter', ida_open_file: 'path', angr_solve: 'binary',
+    emu_trace: 'binary', ida_apply_trace: 'trace'
   };
   // 标记：<｜｜tool▁calls▁begin｜｜> / <|tool_calls_begin|> / 变体（全角/半角竖线、▁/_ 分隔）
   const MARK = /<\s*[|｜]\s*[|｜]?\s*tool[\u2581_ ]?calls[\u2581_ ]?begin\s*[|｜]?\s*[|｜]\s*>/gi;
@@ -6561,6 +6565,22 @@ function precheckToolCall(name, input) {
     if (i.find === undefined || i.find === null || (Array.isArray(i.find) && !i.find.length)) {
       return '缺少 find 参数。angr 需要一个"成功分支地址"作为搜索目标'
         + '（通常是打印 flag 的那个分支 0x...；不确定时先用 ida_find_strings 找 "flag" 再 ida_get_xrefs）。';
+    }
+  }
+  if (name === 'emu_trace') {
+    if (!i.binary || !String(i.binary).trim()) {
+      return '缺少 binary 参数（目标 ELF 路径）。';
+    }
+    const md = String(i.mode || 'function').toLowerCase();
+    if (md === 'function' && !i.start) {
+      return 'mode=function 需要 start（要调用的函数地址，如 0x401006）。'
+        + '不确定就用 ida_list_functions 找一个"参数是输入、返回值像结果"的函数；'
+        + '或改用 mode="entry" 从入口跑（仅静态链接目标可靠）。';
+    }
+  }
+  if (name === 'ida_apply_trace') {
+    if (i.trace === undefined || i.trace === null || i.trace === '') {
+      return '缺少 trace 参数。先跑 emu_trace 得到轨迹（对象或 JSON 文件路径），再传进来。';
     }
   }
   if (name === 'ida_dbg') {
@@ -7636,6 +7656,52 @@ function getToolDefinitions() {
       }
     },
     {
+      name: "emu_trace",
+      description:
+        "用 Unicorn 真跑目标，记录**运行期地面真值**：每个间接跳转点实际去了哪里、全部控制流边、执行过的区间。\n" +
+        "**这是分段 dispatch / VM 混淆题的关键一步**：当程序把代码切成很多段、跳转目标在运行期用栈算出来时，" +
+        "静态 CFG 是碎的、反编译读不懂。人类解法的第一步就是 \"record a execution trace and set those jump targets\"。\n" +
+        "返回 JSON（默认写到 cwd/emu_trace.json）+ 摘要。摘要里 `IND 0x401138 -> N targets: v=0x2 0x4011BF(x1)` 就是" +
+        "「段号 2 → 段地址 0x4011BF」这类映射，拿到后配合 ida_apply_trace 回填给 IDA，各段就会连成一片。\n" +
+        "mode=function（默认）直接调用 start 处的函数，参数走 rdi/rsi/…；mode=entry 从 ELF 入口跑（需能仿真 libc 启动）。\n" +
+        "动态链接目标（有 PT_INTERP）不要用 mode=entry——入口是 ld.so，仿真不出来。\n" +
+        "与 angr_solve 分工：emu_trace 只求「跑通 + 看清结构」，快几百倍；结构仍读不懂再上 angr 求解。",
+      input_schema: {
+        type: "object",
+        properties: {
+          binary: { type: "string", description: "目标 ELF 绝对路径" },
+          start: { type: "string", description: "起始地址。mode=function 时是要调用的函数（如 0x401006）" },
+          mode: { type: "string", enum: ["function", "entry"], description: "function=直接调函数（默认，推荐）；entry=从入口跑" },
+          args: { description: "mode=function 的参数（数组，按 rdi/rsi/rdx/rcx/r8/r9 写入）" },
+          stop_at: { description: "额外停机地址（数组）" },
+          max_insns: { type: "number", description: "指令上限（默认 2000000）" },
+          stdin: { type: "string", description: "喂给 stdin 的字节（hex 串或普通文本）" },
+          out: { type: "string", description: "轨迹 JSON 输出路径（默认 emu_trace.json）" },
+          heap_size: { type: "number", description: "堆大小字节（默认 16MB）" }
+        },
+        required: ["binary"]
+      }
+    },
+    {
+      name: "ida_apply_trace",
+      description:
+        "把 emu_trace 的轨迹**回填进 IDA**：对每个跳转目标 create_insn、对每条控制流边 add_cref、可选 add_func。\n" +
+        "这是「运行期记录 → 静态可读」的闭环第二步。回填后反编译器能顺着 xref 找到各段，" +
+        "原来碎成一堆的 dispatch 会连成可读的循环/状态机；每段也能单独 ida_decompile。\n" +
+        "用法：先 emu_trace 得到轨迹（对象/JSON 文本），再 ida_apply_trace({trace: <轨迹>})。\n" +
+        "仍缺段时用 code_ranges=true（把执行过的整个区间都 MakeCode）；需要 IDA 重分析更稳时 auto_wait=true。",
+      input_schema: {
+        type: "object",
+        properties: {
+          trace: { description: "emu_trace 的结果对象，或轨迹 JSON 文本（键：edges / indirect_sites / exec_ranges）" },
+          make_funcs: { type: "boolean", description: "在跳转目标处建函数（默认 true，便于逐段反编译）" },
+          code_ranges: { type: "boolean", description: "把执行过的区间也 MakeCode（默认 false；有冲突时再开）" },
+          auto_wait: { type: "boolean", description: "回填后等待 IDA 重新分析（默认 false；慢但更稳）" }
+        },
+        required: ["trace"]
+      }
+    },
+    {
       name: "ida_dbg",
       description:
         "IDA 动态调试控制。action：start（幂等；远程模式会自动 suspend 并返回重定位符号）、" +
@@ -8640,10 +8706,81 @@ async function executeToolCall(toolName, input) {
         }
       }
 
+      // ══════ 执行轨迹（分段 dispatch / VM 混淆的核心链路）══════
+      // 生成脚本交给 run_python 跑（本机）或 remote_exec 跑（Kali）；
+      // 这里不直接执行，因为目标可能是远程 ELF，且脚本可能跑几分钟。
+      case 'emu_trace': {
+        const { buildEmuTraceScript } = require('./emu-trace');
+        const r = buildEmuTraceScript(input);
+        if (r.error) return `参数错误：${r.error}`;
+        // 顺手落盘到题目目录，AI 下一步可以直接 ida_apply_trace 读到
+        let saved = '';
+        try {
+          const dir = currentCaseDir || currentWorkDir;
+          if (dir) {
+            fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
+            const p = path.join(dir, 'scripts', 'emu_trace.py');
+            fs.writeFileSync(p, r.script, 'utf8');
+            saved = p;
+          }
+        } catch (e) { /* 落盘失败不影响返回脚本 */ }
+        const L = [];
+        L.push('## emu_trace 脚本已生成（未执行）');
+        L.push('');
+        L.push('```python');
+        L.push(r.script);
+        L.push('```');
+        L.push('');
+        L.push('## 用法');
+        L.push('1. 目标在本机 → `run_python({script:<上面的内容>})`；在 Kali → `remote_exec({command:"python3 emu_trace.py"})`');
+        L.push('2. 看输出：`TRACE_JSON=<path>` 是轨迹文件，`IND <src> -> N targets` 就是运行期算出的跳转表');
+        L.push('3. 把轨迹交给 `ida_apply_trace({trace:<轨迹>})`，各段会连成可读的 CFG');
+        if (saved) L.push(`（脚本已落盘：${saved}）`);
+        L.push('');
+        L.push('## 设计要点');
+        for (const n of r.notes) L.push('- ' + n);
+        return L.join('\n');
+      }
+
+      case 'ida_apply_trace': {
+        const { buildApplyTraceScript, summarizeTrace } = require('./emu-trace');
+        let tr = input.trace;
+        // 允许 trace 传文件路径：主进程读盘，省得 AI 把大 JSON 塞回上下文
+        if (typeof tr === 'string' && tr.trim() && !tr.trim().startsWith('{')) {
+          try {
+            tr = JSON.parse(fs.readFileSync(tr.trim(), 'utf8'));
+          } catch (e) {
+            throw new ToolCallError(`读取轨迹文件失败: ${tr}（${e.message}）`);
+          }
+        }
+        const r = buildApplyTraceScript({ ...input, trace: tr });
+        if (r.error) return `参数错误：${r.error}`;
+        let out = '';
+        try {
+          out = await callIdaMcp('py_eval', r.args);
+        } catch (err) {
+          throw new ToolCallError(`回填轨迹失败: ${translateDbgError(err.message)}`);
+        }
+        const text = typeof out === 'string' ? out : JSON.stringify(out);
+        const L = [];
+        L.push('## 轨迹已回填到 IDA');
+        L.push(text);
+        L.push('');
+        L.push(`统计：跳转目标 ${r.stats.indTargets} 个 / 控制流边 ${r.stats.edges} 条 / 执行区间 ${r.stats.ranges} 段`);
+        if (r.stats.truncated.length) L.push(`⚠ 已截断：${r.stats.truncated.join(', ')}（轨迹过大；先用 stop_at 缩小范围再分段回填）`);
+        L.push('');
+        L.push('## 轨迹摘要（回填依据）');
+        L.push(summarizeTrace(tr));
+        L.push('');
+        L.push('## 下一步');
+        L.push('`ida_decompile` 原先读不懂的那个函数——各段现在应该已连成一片；');
+        L.push('若仍有断段，用 `ida_apply_trace({trace, code_ranges:true})` 再补一轮。');
+        return L.join('\n');
+      }
+
       // ========== 命令执行工具 ==========
       case 'run_command':
         return await execCommandAsync(input.command);
-
       case 'run_python':
         return await runPythonScript(input.script, input.cwd);
 

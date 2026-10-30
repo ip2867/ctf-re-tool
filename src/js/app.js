@@ -9470,6 +9470,15 @@ ${sideFilesBlock}
 
 **当反编译出来的代码读不懂、或怀疑静态结论不可信时，不要硬读——直接量运行期行为。**
 
+- **代码被切成很多段、中间是 \`jmp rax\`（分段 dispatch / VM 保护）时，先走这两步**：
+  \`emu_trace({binary:"/tmp/chall", start:"0x401006", mode:"function"})\`
+  → Unicorn 真跑目标，记录**每个间接跳转实际去了哪里**。摘要里
+  \`IND 0x401138 -> 2 targets: v=0x2 0x4011BF(x1)\` 就是「段号 2 → 段地址 0x4011BF」。
+  轨迹 JSON 同时含全部控制流边与执行区间；动态链接目标别用 mode=entry（入口是 ld.so）。
+  \`ida_apply_trace({trace:"<轨迹对象或 JSON 路径>"})\`
+  → 把轨迹回填成 create_insn + add_cref + add_func，各段立刻连成一片，反编译器就能读了。
+  回填后每段还能单独 \`ida_decompile\`，逐段还原语义比读一整坨 switch 快。
+  仍断段就再来一次并加 \`code_ranges:true\`。
 - \`ida_dbg({action:"snapshot_diff", regions:[{addr:"0x13200",size:216}], mode:"until_return"})\`
   **反推"这段代码把数据改成了什么"**。跑完当前函数，前后各拍一次内存快照并**就地差分**，
   返回逐字节变化清单（offset / before / after）。混淆 handler 的置换/变换语义直接可见。
@@ -9486,6 +9495,31 @@ ${sideFilesBlock}
   两个硬前提：① 必须 \`call_state\` 从主函数起（\`entry_state\` 会卡在 \`__libc_start_main\` 耗尽 state）；
   ② 间接跳转点必须写进 \`hooks\`（否则 angr 顺函数指针把常量表当代码解码，报 IR decoding error）。
   带参数启动：\`ida_dbg({action:"start", path:"", args:"-d", cwd:"..."})\`（path 空串 = 调试 IDA 当前已加载的库）。
+
+### ⭐ 算法已读出时：先判断"可逆"，别急着上符号执行
+
+把校验循环的伪代码拿到手后，**先看循环体只用了哪些运算**：
+
+| 循环体里的操作 | 是否可以倒着算 |
+|---|---|
+| \`x ^= y\` | 可以（自己就是逆运算） |
+| \`x = ~x\` | 可以（自逆） |
+| \`x = rol(x,1)\` / \`(x<<1)\\|\` 最高位 | 可以（改 ror / 最低位回填） |
+| \`x += y\` / \`x -= y\` | 可以（反过来减 / 加） |
+| 双变量交换 \`t=x; x=y; y+=t\` | 可以（**逆序**把每条语句倒着撤） |
+| \`x &= mask\` / \`x \\|= y\` / \`x *= k\` / 查表 / S-box | **不可以**（信息丢失或非线性） |
+
+**只要全是前四行那类操作，就不要上 Z3/angr**：从目标值出发，把每轮操作**逆序**执行一遍，
+几千轮也只是几毫秒。这是最省时也最可靠的路。
+
+做法（三步，务必都做）：
+1. 把读出的语义写成正向函数 \`f(X, Y)\`；
+2. 用 \`emu_trace\` 的 \`regs.rax/regs.rdx\`（就是函数返回值）与 \`f(...)\` 对拍，
+   **确认模型与真实程序一致**——这一步能挡住绝大多数"抄错常量/看错方向"的错误；
+3. 写逆函数 \`g(目标)\` 逐轮回退，得到输入后打包成字节再跑一次真实程序验证。
+
+只有在出现 \`& | *\`、查表、S-box 这类**不可逆**操作时，才转去 \`angr_solve\`。
+先问一句"这个循环能不能倒着走"，往往能省掉几百秒的符号执行。
 - \`ida_dbg_mem({action:"read", regions:[{addr:"0x401000", size:32}]})\`：读内存（返回带空格的 hex）；
   \`ida_dbg_mem({action:"write", regions:[{addr:"0x401000", data:"9090"}]})\`：写内存。
 - \`remote_exec({host:"kali", command:"binwalk -e fw.bin"})\`：远程执行（local 也可）。

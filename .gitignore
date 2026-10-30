@@ -71,6 +71,12 @@ __pycache__/
 # 单测运行期产物（tests/test_scan_disguise.js 会释放出 stage2 中间文件）
 tests/_stage2.bin
 
+# emu_trace 端到端测试现场生成物（fixture 由 make_dispatch_fixture.py 重建，不入库）
+tests/fixtures/dispatch_fixture
+tests/fixtures/trace.json
+tests/fixtures/run_trace.py
+tests/fixtures/run_apply.py
+
 # 解题过程留下的临时产物（AI 写出的中间文件）
 payload.bin
 rks.txt

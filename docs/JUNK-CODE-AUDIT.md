@@ -522,3 +522,192 @@ row5 M1even=0x7ddb8603 CALC.lo=0x7ddb8603  EQ
 
 **结论：结构已挖到底，但"T 的语义"仍未确定。** 这不是工具能力问题，是这道题
 在最后一层语义上还需要更多轮次推演。
+
+---
+
+## 十三、Obfuscating Macros II：用 Unicorn 完整解码 VM（2026-10-30）`[已验证]`
+
+这道题比 Matr1x 更纯粹地展示了"工具能力缺口"：AI 在 496 秒里做了 67 次 run_python、
+21 次 IDA 反编译，把结构猜了个七七八八，但**始终没跑起来**，最后卡在
+"1024 次循环左移等于恒等"这个错误结论上。真实原因有两个：
+
+1. 它把 `sub_4045F2` 当成了 pop，实际那是 **push**（内部调 `sub_404BF2`）；
+2. 它不知道 C++ 容器可以打桩，于是被 `operator new` 挡在门外。
+
+### 13.1 程序结构（静态即可确认）
+
+```
+main (0x403DC4):
+  cin >> s           ; 读字符串
+  if (len(s) != 16) -> Failed
+  v11 = *(u64*)s       ; 前 8 字节
+  v12 = *(u64*)(s+8)   ; 后 8 字节
+  (v13, v14) = sub_401006(v11, v12)
+  cout << v13 << " " << v14
+  if (v13 == 0xA1E8895EB916B732 && v14 == 0x50A2DCC51ED6C4A2) -> "Congratulations!"
+```
+
+注意：**程序会先把变换结果打印出来再判断**，所以它同时是个 oracle。
+
+### 13.2 VM 结构（Unicorn 实测）
+
+`sub_401006` 是一台**栈式 VM**，有三套容器：
+
+| 容器 | 用途 | 关键 API |
+|---|---|---|
+| `[rbp-0x80]` | 标签字典 map，91 个条目 | `0x40456A(map, &idx)` 取 slot 地址 |
+| `[rbp-0xD0]` | 标签栈 | `0x40459A` 弹出 |
+| `[rbp-0x120]` | 数据栈（`std::vector<u64>`）| push `0x404BF2` / pop `0x404CC0`（经 `0x404634`）|
+
+标签号是**混淆过的**：`demux(x) = (x ^ 0x78ABDA5F) - 0x57419F8E`（函数 `0x4040A2`）。
+注册模式固定为 `mov [slot], 0xXXXXXX` —— 所以只要让同一 label 拿到同一 slot，
+整个 map 就可以用 Python dict 替代。
+
+### 13.3 跑通 VM 的三个关键打桩
+
+```python
+# 1) map：同一 label 必须拿到同一 slot 地址
+def hook_map(uc, ...):
+    real = demux(rdq(uc, rsi))
+    if real not in LABELS: LABELS[real] = new_slot()
+    ret_to(uc, rsp, LABELS[real])
+
+# 2) TLS：fs:[0x28] 栈保护 canary，否则第一步就 UC_ERR
+uc.reg_write(UC_X86_REG_FS_BASE, TLS)
+uc.mem_write(TLS + 0x28, struct.pack("<Q", 0x1122334455667788))
+
+# 3) operator new：bump allocator，否则 0x407113 跳进 PLT 后 RIP=0
+if nm == "_Znwm":
+    p = heap_ptr[0]; heap_ptr[0] = (p + sz + 15) & ~15
+    ret_to(uc, rsp, p)
+```
+
+**其余栈操作一律不 hook** —— 给足堆内存后 `std::vector` 自己就能跑对。
+（我第一次 hook 了 push/pop，结果得到"恒等变换"的假结论，因为把 push 当成了 pop。）
+
+### 13.4 真实算法（1024 轮 × 8 条指令）
+
+跑通后统计执行频次，核心算术只有 8 条、各 1024 次：
+
+```
+1024x  0x402487  not  rax              ; v8 = ~v7
+1024x  0x402337  xor  rax, rdx         ; v8 = v8 ^ v6
+1024x  0x4025FA  movabs rax, 0x8000000000000000   ; MSB 掩码
+1024x  0x402604  and  rax, rdx         ; v8 = v7 & MSB
+1024x  0x4026FA  add  rax, rax         ; v7 <<= 1
+1024x  0x402715  and  rax, rdx         ; v8 = v6 & MSB
+1024x  0x402A2E  add  rax, rax         ; v6 <<= 1
+1024x  0x402113  add  rax, rdx         ; v8 = v8 + X
+```
+
+也就是每轮：**128 位整体左移 1 位，最高位回填到最低位（循环移位）**，
+再按条件做 `+` / `^` / `~`。1024 轮 = 8 × 128，纯循环移位部分恰好是恒等，
+真正提供混合的是 `+`（带进位）那一条。
+
+### 13.5 实测性质（测的是"能否代数求逆"，不是"能否反解"）
+
+用 Unicorn 当 oracle 做黑盒测量：
+
+| 检验 | 结果 |
+|---|---|
+| GF(2) 仿射性（f(a^b) ?= f(a)^f(b)^f(0)） | **否** |
+| 可加性（f(a,b) ?= f(a,0)+f(0,b)-f(0,0)） | **否** |
+| 单比特翻转的平均影响位数 | **31.6 / 64**（完全雪崩） |
+| 对合性 f(f(x)) ?= x | 否 |
+
+这四个检验否定的只是"用一条代数公式一步求逆"。它们**不能**否定整体可逆——
+我在 13.6 就犯了这个推理错误。见下。
+
+### 13.6 结论修正：我判断错了，循环体是可逆的 `[已验证]`
+
+上一轮我写"雪崩 31.6/64、非仿射、非可加 ⇒ 无法反解"。**这个结论是错的。**
+
+题目作者给出的最终伪代码如下（把 92 段合并之后）：
+
+```
+def func(X, Y):
+    for _ in range(0x400):
+        if X & 1 == 0:  Y ^= ~X
+        else:           Y ^=  X
+        X = ~X
+
+        XX = X & 0x8000000000000000
+        YY = Y & 0x8000000000000000
+        X <<= 1
+        Y <<= 1
+        if YY: X |= 1
+        if XX: Y |= 1
+
+        tmp = Y
+        Y = (Y + X) & MASK
+        X = tmp
+
+        XX = X & 0x8000000000000000
+        YY = Y & 0x8000000000000000
+        X <<= 1
+        Y <<= 1
+        if YY: X |= 1
+        if XX: Y |= 1
+    return X, Y
+```
+
+**每一条都是可逆的**：
+
+| 操作 | 逆操作 |
+|---|---|
+| `Y ^= ~X` / `Y ^= X` | 再异或一次同一个值（XOR 自逆） |
+| `X = ~X` | 再取反（自逆） |
+| `X <<= 1; if YY: X \|= 1` | `X = (X >> 1) \| (XX_bit << 63)`，其中 `XX_bit = X & 1` |
+| `tmp = Y; Y = Y + X; X = tmp` | `t = X; X = Y; Y = (Y - t)` —— **注意顺序** |
+
+所以从 `(0xA1E8895EB916B732, 0x50A2DCC51ED6C4A2)` 出发，把 1024 轮**逆序**跑一遍，
+就能得到 `(X0, Y0)`，拼成 16 字节即输入。几毫秒的事。
+
+**为什么我的"雪崩/非仿射"测量没否定可逆性**：
+可逆 ≠ 线性。`+`（带进位）会让它雪崩、破坏仿射性，
+但只要每一步都是**双射**，整体就仍然是双射，就能逐轮倒推。
+我当时的四个检验（仿射性/可加性/对合性/雪崩）测的都是"能不能用代数公式一步求逆"，
+而逐轮倒推不需要任何代数公式——**这才是正确的第一反应**。
+
+这是本轮最重要的一条通用教训，已写进 `skills/ctf-obfuscation/SKILL.md` §5.4 与工具提示词：
+> 算法读出来后，先问"这个循环能不能倒着走"，能就别上 Z3/angr。
+
+### 13.7 通用的解题链路（这次的真正产出，不是特解）
+
+题目作者的原话是：*"One possible solution is to record a execution trace and set those jump target."*
+这句话把人类的手工流程说得很清楚，而工具此前**完全缺这两个能力**。现已补上：
+
+| 环节 | 工具 | 产出 |
+|---|---|---|
+| ① 记录执行轨迹 | `emu_trace` | 每个间接跳转点 `src → 实际 dst` 及当时操作数值；全部控制流边；执行过的区间 |
+| ② 回填给 IDA | `ida_apply_trace` | 对目标 `create_insn`、对边 `add_cref`、可选 `add_func` |
+| ③ 正向模型对拍 | `emu_trace` 的 `regs.rax/rdx` | 用真值校验读出的伪代码 |
+| ④ 逆序反解 | 纯 Python | 逐轮倒推得到输入 |
+
+`emu_trace` 在结构同型的测试 ELF（92 段、`jmp rax` 分发）上实测：
+
+```
+STOP=finished
+INSNS=832  EXEC_RANGES=92  EDGES=182  IND_SITES=1
+RAX=0x9dfc266ecbc6d314 RDX=0x665544332210eecb
+IND 0x40180e -> 90 targets: v=0x402080 0x402080(x1) v=0x4020c0 0x4020c0(x1) ...
+```
+
+一个 `jmp rax` 点自动量出 90 个目标、且段地址等距 0x40；
+正向模型与仿真返回值**逐位一致**（见 `tests/fixtures/verify_model.py`）。
+
+### 13.8 三个必须知道的打桩要点（都是踩出来的）
+
+1. **TLS canary**：`fs:[0x28]` 不设 `UC_X86_REG_FS_BASE` 会第一步就 `UC_ERR_READ_UNMAPPED`。
+2. **`operator new`**：C++ 题必挂。GOT 槽与 `.plt` 桩都要重定向到同一组 mini-libc，
+   否则 `RIP=0`。这一步不做，任何 `std::map`/`std::vector` 题都跑不起来。
+3. **不要 hook `std::vector` 的 push/pop 去简化语义**。
+   我第一次就是这么做，结果把 push 当成了 pop，得出"恒等变换"的假结论。
+   **给足堆内存，让真实代码自己跑**——这是唯一不会自欺的做法。
+
+### 13.9 顺带修掉的两个工具缺陷
+
+这轮日志暴露的直接问题（已修复，见 §14）：
+
+- `run_command` 失败 7 次：全是 `| head -5` / `| grep x` / `| wc -l` 这类 cmd.exe 不认的 POSIX 管道；
+- `run_python` 超时 1 次 + 失败 5 次：超时固定 120s，长计算被误杀。

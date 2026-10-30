@@ -2293,9 +2293,37 @@ async function startNoxEmulator() {
     } catch (e) { /* 路径探测失败不阻塞，交给启动结果判定 */ }
 
     // 启动安卓9实例（参数数组分离启动；替代 `start "" "path" -clone:x` 拼接）
-    const result = await window.electronAPI.runToolArgs([noxPath, `-clone:${noxInstance}`], { gui: true });
+    //
+    // ⚠️ 实测（2026-10-30）：`-clone:Nox_1` 在只装了默认实例的机器上会报
+    //   `player is not exist!` 并**直接退出**（进程都不起），而 NoxConsole 报同样的话。
+    //   三档回落，任一成功即用：
+    //     ① 带 -clone:<配置实例>
+    //     ② 不带 -clone（启动默认实例 nox）
+    //     ③ 同目录的 Nox.exe（NoxConsole 有 bug 时最可靠）
+    //   三档都失败才报错，并在错误里点明"实例名可能不存在"。
+    const noxDir = noxPath.replace(/[\\/][^\\/]+$/, '');
+    const attempts = [
+      { label: `-clone:${noxInstance}`, argv: [noxPath, `-clone:${noxInstance}`] },
+      { label: '默认实例（不带 -clone）', argv: [noxPath] },
+      { label: '同目录 Nox.exe', argv: [path.join(noxDir, 'Nox.exe')] },
+    ];
 
-    if (result.success) {
+    let launched = false;
+    let lastErr = '';
+    for (const att of attempts) {
+      try {
+        addLog('info', `启动模拟器尝试: ${att.label}`);
+        const result = await window.electronAPI.runToolArgs(att.argv, { gui: true });
+        if (result.success) { launched = true; break; }
+        lastErr = result.error || '启动器返回失败';
+        addLog('warning', `${att.label} 启动失败: ${lastErr}`);
+      } catch (e) {
+        lastErr = e.message;
+        addLog('warning', `${att.label} 启动异常: ${e.message}`);
+      }
+    }
+
+    if (launched) {
       addLog('info', '安卓9模拟器启动中，等待设备就绪（最长90秒）...');
 
       // 轮询：connect + devices，替代固定60秒等待
@@ -2330,7 +2358,11 @@ async function startNoxEmulator() {
       setMcpStatus('emulator', false);
       return false;
     } else {
-      addLog('error', '模拟器启动失败: ' + result.error);
+      addLog('error', `模拟器启动失败（三档回落均失败）：${lastErr}`);
+      addLog('warning', `排查：①配置的实例名 "${noxInstance}" 可能不存在`
+        + `（用 "${path.join(noxDir, 'NoxConsole.exe')}" list 查真实实例）；`
+        + `②或先用 install -r 手动装好模拟器；③NoxConsole 有 bug 时直接双击 Nox.exe 最可靠`);
+      setMcpStatus('emulator', false);
       return false;
     }
   } catch (err) {
@@ -4173,6 +4205,9 @@ async function startFridaServer() {
       if (ok) {
         addLog('success', `Frida 服务已在运行，复用（端口: ${fridaPort}）`);
         setMcpStatus('frida', true);
+        // 端口通不代表版本兼容：客户端与服务端版本不一致时，连接会立刻被关（"connection closed"），
+        // 而现象与"服务没起来"完全一样。这里顺手把两边版本读出来对比。
+        await checkFridaVersionMatch();
         return true;
       }
       addLog('info', 'frida-server 进程在但端口不可达，重新启动...');
@@ -4214,6 +4249,7 @@ async function startFridaServer() {
     if (procAlive && reachable) {
       addLog('success', `✅ Frida服务已启动 (端口: ${fridaPort})`);
       setMcpStatus('frida', true);
+      await checkFridaVersionMatch();
       return true;
     } else if (procAlive && !reachable) {
       addLog('warning', `frida-server 进程在运行，但 ${fridaPort} 端口不可达（端口转发可能失效）`);
@@ -4228,6 +4264,35 @@ async function startFridaServer() {
     addLog('warning', 'Frida启动失败: ' + err.message);
     setMcpStatus('frida', false);
     return false;
+  }
+}
+
+// 客户端与服务端 frida 版本必须**完全一致**（大版本相近也可能不兼容）。
+// 不匹配时现象极具误导性：端口通、进程在，但每次 RPC 都 "connection closed"，
+// 看起来跟"服务没起来"一模一样。实测（NaughtyBoy，2026-10-30）：
+//   设备 frida-server 17.9.8 / 主机客户端 16.7.19 → spawn/enumerate 全部 connection closed，
+//   升级客户端到 17.9.8 后立刻正常。
+// 这里只做**检测与提示**，不自动安装（换版本涉及下载，交给用户决定）。
+async function checkFridaVersionMatch() {
+  try {
+    const dev = await window.electronAPI.adbCommand('shell "/data/local/tmp/frida-server --version"');
+    const serverVer = dev && dev.success ? String(dev.stdout || '').trim() : '';
+    const cli = await window.electronAPI.runToolArgs(['frida', '--version'], {});
+    const cliVer = cli && cli.success ? String(cli.stdout || '').trim() : '';
+    if (!serverVer || !cliVer) return { checked: false, serverVer, cliVer };
+
+    if (serverVer === cliVer) {
+      addLog('info', `Frida 版本一致（${cliVer}）`);
+      return { checked: true, ok: true, serverVer, cliVer };
+    }
+    addLog('warning', `⚠ Frida 版本不匹配：设备 frida-server=${serverVer}，本机客户端=${cliVer}`);
+    addLog('warning', '症状：端口能连上、进程也在，但每次 attach/spawn 都报 "connection closed"（极易被误判成服务没起来）。');
+    addLog('warning', `修复：把本机客户端升到同版本 —— pip install -U "frida==${serverVer}"`
+      + `（或用 frida-tools 对应版本）；反过来降 frida-server 也行。`);
+    state._fridaVersionMismatch = { serverVer, cliVer };
+    return { checked: true, ok: false, serverVer, cliVer };
+  } catch (e) {
+    return { checked: false, error: e.message };
   }
 }
 
@@ -9846,6 +9911,13 @@ rotl_cross / rotr_cross / add / sub / swap / swap_add / mul_const（仅奇数）
   失败返回 \`REMOTE_TIMEOUT/REMOTE_AUTH/REMOTE_REFUSED/REMOTE_UNCONFIGURED\` 前缀，**都是错误**，不要当成成功空输出。
 - \`traffic_extract({path:"x.pcap", protocol:"auto"})\`：解析抓包（每流端口/包数/字节数/熵/hex 预览）。
   http=0 表示二进制协议，不要当 Web 流量处理。
+- **\`recover_string({func:"Java_..._check"})\` —— 凡是从反汇编里"抄"字符串，一律用它还原。**
+  校验代码常写成逐字节比较（\`cmp byte ptr [rbx+1], 0x79\` ...），伪代码里折叠成 \`"bytectf{"\`，
+  但**人抄一遍极易少一个字符**。实测：\`bytectf{\` 被抄成 \`bytecf{\`，所有输入第一步就被拒，
+  而日志只报"校验失败"，完全看不出是前缀错了，会让人往算法方向白挖几小时。
+  工具按偏移把立即数拼回原文，是确定性的；它还会提示"你提取的 X 与已知前缀 Y 只差 N 个字符"。
+  **以工具输出为准**，不要相信笔记/伪代码里的拼写。
+  同理适用于固定密钥、magic 常量、比较表名。
 
 ⏱ **预算纪律（必读）**：本轮你共有约 **60 次工具调用**（充足，但别挥霍）。
 - 收集阶段（反编译/读伴生文件/常量）：目标 **15 次内**完成。

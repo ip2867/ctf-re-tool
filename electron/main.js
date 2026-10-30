@@ -3298,6 +3298,7 @@ function toolLabel(name, input) {
     case 'emu_trace': return '执行轨迹 ' + short(i.binary ? path.basename(i.binary) : '', 28) + (i.start ? ' @' + short(i.start, 12) : '');
     case 'ida_apply_trace': return '回填轨迹到 IDA';
     case 'rev_solve': return '可逆逆推' + (Array.isArray(i.ops) ? `（${i.ops.length} 条算子）` : '');
+    case 'recover_string': return '还原比较字符串 ' + short(i.func || '（文本）', 24);
     case 'ida_get_bytes': return 'IDA 读取字节 ' + short(i.address, 30);
     case 'ida_list_functions': return 'IDA 列出函数';
     case 'ida_find_strings': return 'IDA 查找字符串 ' + short(i.keyword || i.pattern || '', 30);
@@ -6316,7 +6317,7 @@ function parseTextToolCalls(rawText) {
     'jeb_get_exported_activities', 'jeb_get_all_classes', 'jeb_get_class_methods',
     'ida_decompile', 'ida_list_functions', 'ida_find_strings', 'ida_get_xrefs', 'ida_get_bytes',
     'ida_list_globals', 'ida_disasm', 'ida_dbg', 'ida_dbg_mem', 'ida_open_file', 'angr_solve',
-    'emu_trace', 'ida_apply_trace', 'rev_solve',
+    'emu_trace', 'ida_apply_trace', 'rev_solve', 'recover_string',
     'remote_exec', 'traffic_extract', 'recipe', 'gui_input', 'crypto',
     'browser_search', 'browser_open', 'run_command', 'run_python', 'adb_command', 'frida_hook',
     'read_skill', 'wiki_search', 'wiki_read', 'burp_get_history', 'burp_get_message', 'burp_call',
@@ -6330,7 +6331,7 @@ function parseTextToolCalls(rawText) {
     ida_get_bytes: 'address', ida_find_strings: 'regex', frida_hook: 'script', adb_command: 'command',
     ida_disasm: 'address', ida_dbg: 'action', ida_dbg_mem: 'action', remote_exec: 'command', traffic_extract: 'path',
     ida_list_globals: 'filter', ida_open_file: 'path', angr_solve: 'binary',
-    emu_trace: 'binary', ida_apply_trace: 'trace', rev_solve: 'ops'
+    emu_trace: 'binary', ida_apply_trace: 'trace', rev_solve: 'ops', recover_string: 'func'
   };
   // 标记：<｜｜tool▁calls▁begin｜｜> / <|tool_calls_begin|> / 变体（全角/半角竖线、▁/_ 分隔）
   const MARK = /<\s*[|｜]\s*[|｜]?\s*tool[\u2581_ ]?calls[\u2581_ ]?begin\s*[|｜]?\s*[|｜]\s*>/gi;
@@ -6593,6 +6594,12 @@ function precheckToolCall(name, input) {
     if (i.find === undefined || i.find === null || (Array.isArray(i.find) && !i.find.length)) {
       return '缺少 find 参数。angr 需要一个"成功分支地址"作为搜索目标'
         + '（通常是打印 flag 的那个分支 0x...；不确定时先用 ida_find_strings 找 "flag" 再 ida_get_xrefs）。';
+    }
+  }
+  if (name === 'recover_string') {
+    if (!i.disasm && !i.func) {
+      return 'recover_string 需要 disasm（反汇编文本）或 func（函数名/地址）之一。'
+        + '最省事的方式是传 func，让工具自己去 IDA 取反汇编。';
     }
   }
   if (name === 'emu_trace') {
@@ -7653,6 +7660,29 @@ function getToolDefinitions() {
       }
     },
     {
+      name: "recover_string",
+      description:
+        "从「逐字节立即数比较」还原字符串。这类校验在反汇编里长这样：\n" +
+        "  cmp byte ptr [rbx+0], 0x62   ; 'b'\n" +
+        "  cmp byte ptr [rbx+1], 0x79   ; 'y'\n" +
+        "  ...\n" +
+        "伪代码里会折叠成字符串常量，但**读伪代码时极易抄错一个字符**" +
+        "（实测：`bytectf{` 被抄成 `bytecf{`，所有输入在第一步就被拒，日志只报「校验失败」，根本看不出是前缀错）。\n" +
+        "本工具按偏移把立即数拼回原文，是**确定性**的，不依赖模型记忆。\n" +
+        "参数二选一：\n" +
+        "  · disasm：一段反汇编文本（ida_disasm 的输出直接贴进来）\n" +
+        "  · func：函数名/地址，由工具自己去 IDA 取反汇编（推荐）\n" +
+        "返回提取到的 text、bytes，并给出「与已知前缀只差 1-2 字符」的警告。",
+      input_schema: {
+        type: "object",
+        properties: {
+          disasm: { type: "string", description: "反汇编文本（含 cmp/mov byte ptr [reg+disp], imm 行）" },
+          func: { type: "string", description: "函数名或地址（让工具自己去取反汇编）" },
+          max_instructions: { type: "number", description: "func 模式下取的指令条数（默认 400）" }
+        }
+      }
+    },
+    {
       name: "ida_list_globals",
       description: "列出 IDA 中的全局符号（自动分页，默认每页 500 条直到 next_offset=null）。可按 filter 过滤名字，用 offset/count 手动翻页。",
       input_schema: {
@@ -8440,6 +8470,62 @@ async function executeToolCall(toolName, input) {
           max_instructions: maxInsn,
           offset: Number(input.offset) || 0,
         });
+      }
+
+      case 'recover_string': {
+        const { recoverComparedString } = require('./string-recover');
+        let text = String(input.disasm || '');
+        // func 模式：自己从 IDA 取反汇编，避免让模型把长文本搬来搬去（也避免它手动摘抄出错）
+        if (!text.trim() && input.func) {
+          const maxInsn = Math.min(Math.max(Number(input.max_instructions) || 400, 8), 2000);
+          try {
+            const r = await callIdaMcp('disasm', {
+              addr: String(input.func).trim(),
+              max_instructions: maxInsn,
+              offset: 0,
+            });
+            text = typeof r === 'string' ? r : JSON.stringify(r);
+          } catch (err) {
+            throw new ToolCallError(`取反汇编失败: ${translateDbgError(err.message)}`);
+          }
+        }
+        if (!text.trim()) {
+          return 'recover_string 需要 disasm（反汇编文本）或 func（函数名/地址）之一。';
+        }
+        const res = recoverComparedString(text);
+        const L = [];
+        if (!res.ok) {
+          L.push(`未提取到字符串：${res.reason}`);
+          L.push(`（找到 ${res.pairs || 0} 条 byte ptr 比较/写入行）`);
+          if (!res.pairs) {
+            L.push('');
+            L.push('可能的原因：');
+            L.push('1. 这段代码不是"逐字节比较"（可能用 memcmp/strcmp，此时直接看字符串表）；');
+            L.push('2. 反汇编语法不匹配（本工具识别 Intel 的 `cmp byte ptr [reg+disp], imm` 与 AT&T 的 `cmpb $imm,disp(%reg)`）；');
+            L.push('3. 地址范围不够（增大 max_instructions）。');
+          }
+          return L.join('\n');
+        }
+        L.push('## 提取结果（逐字节比较还原）');
+        L.push('');
+        L.push('```');
+        L.push(res.text);
+        L.push('```');
+        L.push('');
+        L.push(`- 长度：${res.bytes.length} 字节`);
+        L.push(`- 十六进制：${res.bytes.map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+        L.push(`- 参与比较的指令：${res.pairs} 条`);
+        if (res.gaps && res.gaps.length) {
+          L.push(`- ⚠ 偏移不连续 ${res.gaps.length} 处（中间有跳过的字节，已按 0 占位）`);
+        }
+        if (res.warnings && res.warnings.length) {
+          L.push('');
+          L.push('## ⚠ 前缀提醒');
+          for (const w of res.warnings) L.push('- ' + w.hint);
+        }
+        L.push('');
+        L.push('**这是程序真正比较的字节**，以它为准；如果你在伪代码/笔记里写的是别的拼写，那是抄错了。');
+        return L.join('\n');
       }
 
       case 'ida_dbg': {
@@ -10208,6 +10294,17 @@ function runFridaOnce(args, tempFile, opts) {
       // frida 的致命错误（attach/spawn 失败）走 stderr，需据此提前结束并如实返回
       if (/Failed to spawn|unable to find process|unable to attach|Failed to connect|not found/i.test(stderr)) {
         finish((stdout + '\n' + stderr).trim());
+      }
+      // `connection closed` 单独识别：它九成是**客户端与服务端版本不匹配**，
+      // 而不是"服务没起来"。不点破的话会让人反复重启 frida-server 白耗时间。
+      if (/connection closed|Connection closed/i.test(stderr)) {
+        finish((stdout + '\n' + stderr).trim()
+          + '\n\n⚠ `connection closed` 最常见的原因是 **frida 客户端与 frida-server 版本不一致**'
+          + '（服务端进程在、端口也通，但握手即断）。'
+          + '\n排查：`adb shell /data/local/tmp/frida-server --version` 与 `frida --version` 对比，'
+          + '用 `pip install -U "frida==<服务端版本>"` 对齐后重试。'
+          + '\n注意：Frida 17 起**移除了内置 Java bridge**，脚本里的 `Java.perform` 会报 "Java is not defined"，'
+          + '此时改用纯 Native hook（Interceptor.attach + Module.enumerateExports），或降级到 frida 16.x。');
       }
     });
 

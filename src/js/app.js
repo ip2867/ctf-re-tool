@@ -184,6 +184,45 @@ function setupScrollFab() {
   });
 }
 
+// ---------- 长流程入口的统一护栏：重入锁 + 异常兜底 ----------
+// 只包"用户可连点、且内部有多步 IPC"的入口（分析/Hook/生成脚本）。
+//
+// 为什么不能只用一把普通的锁：autoAnalyze 会被阶段接力**有意重入**
+// （runStageHandoff → analyzeFile → autoAnalyze）。用布尔锁会把合法的接力挡掉。
+// 所以区分两种重入：
+//   · 接力重入：state._inStageHandoff === true 且由同一调用链触发 → 放行
+//   · 并发误触：用户连点按钮 → 拦截并提示，不启动第二条流程
+//
+// 异常兜底：任何未捕获异常都必须落到日志里，否则 UI 上只是"点了没反应"，
+// 用户和 AI 都拿不到任何线索。
+const safeEntryRunning = Object.create(null);
+
+async function safeEntry(name, fn, opts = {}) {
+  const allowReentry = opts.allowReentry === true || state._inStageHandoff === true;
+  if (safeEntryRunning[name] && !allowReentry) {
+    addLog('warning', `[${name}] 上一次还没结束，已忽略这次点击（避免两条流程同时改同一份状态）`);
+    return;
+  }
+  safeEntryRunning[name] = true;
+  const t0 = Date.now();
+  try {
+    return await fn();
+  } catch (err) {
+    addLog('error', `[${name}] 执行失败: ${err && err.message ? err.message : String(err)}`);
+    // 把栈也记下来（截断）：这类错误多半是某个 IPC 返回了非预期结构，
+    // 只有栈能定位到是哪一步。
+    if (err && err.stack) addLog('error', String(err.stack).split('\n').slice(0, 6).join(' | '));
+    try { addSystemMessage(`⚠️ **${name} 执行失败**\n\n\`${err && err.message ? err.message : String(err)}\`\n\n详情见下方日志。`); } catch (e) { /* 提示失败不掩盖原始错误 */ }
+    return null;
+  } finally {
+    safeEntryRunning[name] = false;
+    // ⚠️ 不碰 state.aiBusy：各条流程内部已经各自成对地 set/reset（40+ 处），
+    // 这里再改会把"流程尚未结束但已提前 reset"的状态覆盖回 busy，导致发送按钮永久卡在"停止"。
+    const dt = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(`[safeEntry] ${name} 结束（${dt}s）`);
+  }
+}
+
 // ---------- 工具执行步骤（AI 调用工具时可见的进度）----------
 // 为什么需要：长任务里 AI 可能连续跑 20+ 个工具、几分钟不出文字，
 // 旧 UI 只有一句"分析中"，用户无法判断是卡死还是在工作。
@@ -452,10 +491,16 @@ function setupEventListeners() {
   });
 
   // 快速操作按钮
-  document.getElementById('btn-auto-analyze').addEventListener('click', autoAnalyze);
+  // ⚠️ 用 safeEntry 包一层：这些是长流程（autoAnalyze 100+ 行、runHook 会等 45s 界面驱动）。
+  // 直接 addEventListener('click', autoAnalyze) 有两个实测问题：
+  //   ① 没有重入锁：按钮连点两次会并行跑两条完整求解流程，同时写 findings/mcpCache/lastAiText，
+  //      后写的覆盖先写的，findings.json 会回退；
+  //   ② 没有 catch：流程中途抛错（某个 IPC 失败、state 未初始化）就变成
+  //      unhandled promise rejection，UI 上只表现成"点了没反应"，日志里一个字都没有。
+  document.getElementById('btn-auto-analyze').addEventListener('click', () => safeEntry('autoAnalyze', autoAnalyze));
   document.getElementById('btn-deploy-frida').addEventListener('click', deployFrida);
-  document.getElementById('btn-run-hook').addEventListener('click', runHook);
-  document.getElementById('btn-generate-script').addEventListener('click', generateScript);
+  document.getElementById('btn-run-hook').addEventListener('click', () => safeEntry('runHook', runHook));
+  document.getElementById('btn-generate-script').addEventListener('click', () => safeEntry('generateScript', generateScript));
   document.getElementById('btn-generate-wp').addEventListener('click', generateWriteup);
   // （v1.5.0：平台拉题按钮已移除——CTF² 自动解题流水线为内部测试功能，不随版本发布；
   //   solveOneFromPlatform/solveOnePlatformRound 保留在代码中，可经控制台调用）
@@ -821,6 +866,21 @@ async function analyzeFile(filePath, opts = {}) {
     }
     // 扫描结果按题缓存：换题必须清空，否则上一题的反证证据会串到本题
     state.lastAlgScan = null;
+    // 上一题解析出的 [VERIFY] 契约。**不清会直接污染 flag 判定**：
+    // runVerification 在 AI 没给契约时会回落到 state.lastVerifyContracts 去跑本地复现
+    // （见 runHypotheses({synthFrom: ...})），拿上一题的 key/iv/密文解得上一题的明文，
+    // 再被 recordFlag 标成"本题已验证"。pickCryptoParams 也会用它给 Hook 传错参数。
+    state.lastVerifyContracts = null;
+    // 上一题 SM4 骨架脚本的尝试记录：会被注入本题提示词，明确告诉 AI
+    // "这条路线已经试过了，别重复"——等于让 AI 跳过本题的真实路线。
+    state._autoSm4Tried = null;
+    // 上一题的 AI 生成 Hook 脚本：runHook 在用户没重新生成时会直接跑它。
+    state.currentScript = null;
+    // 上一题的枚举反馈/尝试记录：会被拼进本题的 retryPrompt 重试提示。
+    state.lastAttemptRecords = null;
+    state.lastEnumFeedback = null;
+    // 能力探测结果随文件类型变化（APK/ELF/PE 支持的工具集不同）
+    state._capabilities = null;
     // 多阶段接力：接力来的新阶段保留上一阶段摘要；非接力（拖入/选择/平台新题）则清空接力态。
     if (opts.isHandoff) {
       state.stageContext = String(opts.stageContext || state.stageContext || '');
@@ -1987,6 +2047,21 @@ function clearFile() {
   disableActionButtons();
   // 清除旧题的解题记录，避免 WP 混入上一题内容
   try { state.solveNotes = []; } catch (e) {}
+  // 与 analyzeFile 的换题清理保持同一套字段：analyzeFile 是"打开新题"，
+  // clearFile 是"关掉旧题"，两条路径都必须把上一题的决策依据清干净，
+  // 否则先清空再分析时，这些字段仍然会带着上一题的值进入本题流程。
+  try {
+    state.lastVerifyContracts = null;
+    state._autoSm4Tried = null;
+    state.currentScript = null;
+    state.lastAttemptRecords = null;
+    state.lastEnumFeedback = null;
+    state._capabilities = null;
+    state.lastAiText = '';
+    state.lastAlgScan = null;
+    state.pendingExperience = [];
+  } catch (e) { /* 状态清理失败不阻塞界面重置 */ }
+  try { clearMcpCache(); } catch (e) { /* 同上 */ }
 
   addLog('info', '已清除文件');
 }
@@ -6909,12 +6984,38 @@ function addSystemMessage(message) {
 }
 
 // 格式化消息（支持简单Markdown；先做 HTML 转义再替换标记，防止 AI/工具输出注入）
+//
+// ⚠️ 两个不能犯的错，都是实测踩过的：
+//   ① 单 `*` 直接全局替换 → `2*3*4` 变成 `2<em>3</em>4`，`int *p` 变斜体，
+//      而 CTF 场景里 AI 几乎每段代码讲解都含 `*`（指针解引用/乘法/*args），
+//      等于每次讲解都渲染错乱。现在要求 `*` 标记紧贴非空白（`*text*` 才是斜体），
+//      且同一段内不跨行匹配。
+//   ② 不认 ``` 代码围栏 → 整块代码被按行拆成零散的 <code>，缩进全丢。
+//      现在先把围栏代码块整体抽出、转成 <pre><code>，再处理其余标记。
 function formatMessage(message) {
-  return escapeHtml(String(message))
-    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*(.*?)\*/g, '<em>$1</em>')
-    .replace(/`([^`]*?)`/g, '<code>$1</code>')
+  const raw = String(message);
+  // 1) 先抠出 ``` 围栏代码块（整体保留换行与缩进），用占位符替换，
+  //    避免后续的行内标记替换破坏代码内容。
+  const codeBlocks = [];
+  const withHoles = raw.replace(/```([a-zA-Z0-9_+-]*)\r?\n([\s\S]*?)```/g, (m, lang, code) => {
+    const idx = codeBlocks.length;
+    // 代码内容单独转义；这里不能走 escapeHtml 之外的路径
+    codeBlocks.push('<pre class="code-block"><code>' + escapeHtml(code.replace(/\r?\n$/, '')) + '</code></pre>');
+    return '\u0000CODEBLOCK' + idx + '\u0000';
+  });
+
+  let out = escapeHtml(withHoles)
+    .replace(/\*\*([^\s*][^*]*?)\*\*/g, '<strong>$1</strong>')   // **粗体**（不跨行、不吞空格）
+    // *斜体*：两侧都不能紧贴标识符/星号，且内容里不能有星号。
+    // 这样 `*args`、`**kw`、`a*b*c`、`int *p` 都不会被误当斜体，
+    // 而中文语境里的 `这是 *斜体* 文本` 仍然生效（两侧是空格/标点）。
+    .replace(/(^|[\s(（[【"'，。：；、])\*([^\s*][^*\n]*?)\*(?=$|[\s)）\]】"'，。：；、.,!?])/g, '$1<em>$2</em>')
+    .replace(/`([^`\n]+?)`/g, '<code>$1</code>')                 // 行内代码（不跨行）
     .replace(/\n/g, '<br>');
+
+  // 2) 把代码块放回去（占位符在转义后仍是纯文本，可安全替换）
+  out = out.replace(/\u0000CODEBLOCK(\d+)\u0000/g, (m, n) => codeBlocks[Number(n)] || '');
+  return out;
 }
 
 // HTML转义
@@ -8248,6 +8349,10 @@ function clearMcpCache() {
   mcpCache.mainCode = null;
   mcpCache.otherClasses = {};
   mcpCache.strings = null;
+  // SO 原生层情报（IDA 反编译的函数体 + 全局表全量 hex，体积可达数百 KB）。
+  // 不清会同时造成两件事：①跨文件泄漏——上一题的 native 代码被拼进本题提示词，
+  // 等于教 AI 用错的解法；②内存只增不减。
+  mcpCache.nativeIntel = null;
   // 内容命中筛查结果（APK 路径填充，selectKeyClasses 读取）——不清会跨文件泄漏，
   // 把上一题的"高价值类"强行置顶到本题的类选择里。
   state._keyClassesByContent = null;

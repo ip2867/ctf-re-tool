@@ -3477,6 +3477,8 @@ function toolLabel(name, input) {
     case 'jeb_get_class_methods': return 'JEB 列出方法';
     case 'browser_search': return '联网搜索 ' + short(i.query, 36);
     case 'browser_open': return '打开网页 ' + short(i.url, 40);
+    case 'browser_js': return '浏览器执行JS ' + short(i.url, 36);
+    case 'run_command': return '执行命令 ' + short(i.command, 40);
     case 'adb_command': return 'ADB ' + short(i.command || i.args, 40);
     case 'frida_hook': return 'Frida Hook ' + short(i.script ? '脚本' : (i.target || ''), 30);
     case 'read_skill': return '读取技能 ' + short(i.name, 30);
@@ -6507,6 +6509,11 @@ function parseClaudeResult(resp) {
 // 规则：标记是分隔符；紧随其后的标识符若是已知工具名 → 该名字本身即"调用开始"，
 // 其后到下一个标记/段末的内容是参数（形如 name(args) 或裸命令行）。
 function parseTextToolCalls(rawText) {
+  // ⚠️ 这份清单必须覆盖 schema 里的**全部**工具，否则文本形态的调用会被整条丢弃。
+  // 历史教训：此前漏了 scan_crypto / extract_payload / gen_block_cipher_solver /
+  // gen_sm4_solver / analyze_structure / junk_scan / junk_patch / junk_repair 这 8 个，
+  // 模型一旦用文本格式调用它们，调用直接消失，AI 只看到"没有结果"。
+  // 由 tests/test_tool_manifests.js 与 schema 自动比对锁定。
   const KNOWN = new Set([
     'read_file', 'write_file', 'bash', 'glob', 'grep', 'file_digest', 'list_dir',
     'jeb_get_manifest', 'jeb_get_class_decompiled', 'jeb_get_method_decompiled',
@@ -6515,19 +6522,39 @@ function parseTextToolCalls(rawText) {
     'ida_list_globals', 'ida_disasm', 'ida_dbg', 'ida_dbg_mem', 'ida_open_file', 'angr_solve',
     'emu_trace', 'ida_apply_trace', 'rev_solve', 'recover_string',
     'remote_exec', 'traffic_extract', 'recipe', 'gui_input', 'crypto',
-    'browser_search', 'browser_open', 'run_command', 'run_python', 'adb_command', 'frida_hook',
+    'browser_search', 'browser_open', 'browser_js', 'run_command', 'run_python', 'adb_command', 'frida_hook',
     'read_skill', 'wiki_search', 'wiki_read', 'burp_get_history', 'burp_get_message', 'burp_call',
-    'switch_to_next_stage'
+    'switch_to_next_stage',
+    'scan_crypto', 'extract_payload', 'gen_block_cipher_solver', 'gen_sm4_solver',
+    'analyze_structure', 'junk_scan', 'junk_patch', 'junk_repair'
   ]);
   // 工具名 → 参数名映射（模型给裸参数时也能用；无参工具不在此表）
+  //
+  // ⚠️ 参数名必须与 schema 的 properties 完全一致，不能凭印象写。
+  // 踩过的坑：wiki_read 写成 'name'（schema 是 path）→ 裸参数形式拿到 {name:...}，
+  // dispatch 读 input.path 得到 undefined；list_dir 写成 'dir'、jeb_* 写成
+  // 'path'/'class_name'（真实是 path/filepath/class_signature）同理。
+  // 这里的键必须都能在 schema 里找到同名属性，由 tests/test_tool_manifests.js 锁定。
   const MAP = {
     bash: 'command', run_command: 'command', run_python: 'script', glob: 'pattern', grep: 'pattern',
-    read_file: 'path', write_file: 'path', read_skill: 'name', wiki_read: 'name', wiki_search: 'query',
-    browser_open: 'url', browser_search: 'query', ida_decompile: 'function_name', ida_get_xrefs: 'address',
+    read_file: 'path', write_file: 'path', read_skill: 'name', wiki_read: 'path', wiki_search: 'query',
+    browser_open: 'url', browser_search: 'query', browser_js: 'url',
+    ida_decompile: 'function_name', ida_get_xrefs: 'address',
     ida_get_bytes: 'address', ida_find_strings: 'regex', frida_hook: 'script', adb_command: 'command',
     ida_disasm: 'address', ida_dbg: 'action', ida_dbg_mem: 'action', remote_exec: 'command', traffic_extract: 'path',
     ida_list_globals: 'filter', ida_open_file: 'path', angr_solve: 'binary',
-    emu_trace: 'binary', ida_apply_trace: 'trace', rev_solve: 'ops', recover_string: 'func'
+    emu_trace: 'binary', ida_apply_trace: 'trace', rev_solve: 'ops', recover_string: 'func',
+    file_digest: 'paths', list_dir: 'path', scan_crypto: 'path',
+    extract_payload: 'path', junk_scan: 'path', junk_patch: 'path', junk_repair: 'path',
+    analyze_structure: 'path', gen_block_cipher_solver: 'path', gen_sm4_solver: 'path',
+    jeb_get_manifest: 'filepath', jeb_get_all_classes: 'filepath', jeb_get_exported_activities: 'filepath',
+    jeb_get_class_decompiled: 'filepath', jeb_get_method_decompiled: 'filepath',
+    jeb_get_class_methods: 'filepath',
+    recipe: 'recipe', gui_input: 'text',
+    // crypto / burp_* 不在此表：它们的必填参数不止一个（crypto 要 op+algo+data，
+    // burp_get_message 要 id、burp_call 要 tool+args），裸单参数形式本来就表达不了，
+    // 强行映射只会把参数塞到错误字段上。
+    burp_get_history: 'filter'
   };
   // 标记：<｜｜tool▁calls▁begin｜｜> / <|tool_calls_begin|> / 变体（全角/半角竖线、▁/_ 分隔）
   const MARK = /<\s*[|｜]\s*[|｜]?\s*tool[\u2581_ ]?calls[\u2581_ ]?begin\s*[|｜]?\s*[|｜]\s*>/gi;
@@ -6836,7 +6863,23 @@ function precheckToolCall(name, input) {
     }
   }
   if (name === 'ida_dbg') {
-    const act = String(i.action || '').toLowerCase();
+    // ⚠️ 这个动作清单必须与 schema 的 enum 完全一致。
+    // 历史教训：这里曾经有两段 `if (name === 'ida_dbg')`，前一段加了
+    // status/suspend/clear_remote/snapshot_diff 的参数校验，后一段的 allowed
+    // 白名单却没同步 → 四个动作在 schema 里写着、工具描述还重点推荐，
+    // 但 precheck 直接判"未知的调试 action"，AI 永远调不到。
+    // 现在只保留一处定义，并且与 schema 的 enum 由测试锁定（见 test_tool_manifests.js）。
+    const DBG_ACTIONS = ['start', 'exit', 'continue', 'run_to', 'step_into', 'step_over',
+      'status', 'suspend', 'clear_remote', 'regs', 'regs_named', 'stack',
+      'bp_list', 'bp_add', 'bp_del', 'bp_toggle',
+      'snapshot_diff', 'force_continue', 'global_reads'];
+    if (!i.action) {
+      return '缺少 action 参数。可选：' + DBG_ACTIONS.join('/') + '。';
+    }
+    const act = String(i.action).toLowerCase();
+    if (!DBG_ACTIONS.includes(act)) {
+      return `未知的调试 action: ${i.action}。可选：${DBG_ACTIONS.join('/')}。`;
+    }
     if (act === 'snapshot_diff' && !i.regions && !i.addr && !i.address) {
       return 'action=snapshot_diff 需要 regions（[{addr,size}]）或 addr+size，指明要快照哪块内存。';
     }
@@ -6845,19 +6888,6 @@ function precheckToolCall(name, input) {
     }
     if (act === 'global_reads' && !i.func) {
       return 'action=global_reads 需要 func（函数名或地址）。';
-    }
-  }
-  if (name === 'ida_dbg') {
-    if (!i.action) {
-      return '缺少 action 参数。可选：start/exit/continue/run_to/step_into/step_over/'
-        + 'bp_list/bp_add/bp_del/bp_toggle/regs/regs_named/stack。'
-        + (i.addr || i.addrs ? '' : '');
-    }
-    const act = String(i.action).toLowerCase();
-    const allowed = ['start', 'exit', 'continue', 'run_to', 'step_into', 'step_over',
-      'bp_list', 'bp_add', 'bp_del', 'bp_toggle', 'regs', 'regs_named', 'stack'];
-    if (!allowed.includes(act)) {
-      return `未知的调试 action: ${i.action}。可选：${allowed.join('/')}。`;
     }
     if (act === 'run_to' && !i.addr) {
       return 'action=run_to 需要 addr 参数（目标地址，如 0x401000）。';
@@ -8271,6 +8301,27 @@ function getToolDefinitions() {
         type: "object",
         properties: {
           url: { type: "string", description: "网页URL" }
+        },
+        required: ["url"]
+      }
+    },
+    {
+      // ⚠️ 这个工具此前只在 dispatch 里有 case，schema 里没有声明 → tools/list 看不到，
+      // AI 永远调不到；而 skills/ctf-jsreverse 的文档已经在教模型用它。
+      // 声明后与实现（cdpRunJs）的参数保持一致。
+      name: "browser_js",
+      description:
+        "在受控浏览器里打开页面并执行 JS，取回结果。用于 Web/JS 逆向：先注入 hookScript 拦截" +
+        "加密函数入参与返回值，再用 resultExpr 把关键变量取出来。\n" +
+        "与 browser_open 的区别：browser_open 只取页面文本；browser_js 能拿到运行期值" +
+        "（函数的入参/返回、全局变量、加解密前后的数据）。",
+      input_schema: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "要打开的页面 URL" },
+          hookScript: { type: "string", description: "在页面加载前注入的 JS（可覆盖/包裹目标函数，把入参与返回值存到全局变量备用）" },
+          resultExpr: { type: "string", description: "页面就绪后求值的 JS 表达式，结果作为返回值（如 JSON.stringify(window.__captured)）" },
+          waitMs: { type: "number", description: "等待页面与 hook 生效的毫秒数（默认 3000）" }
         },
         required: ["url"]
       }
@@ -10185,9 +10236,17 @@ async function callBurpMcp(method, params) {
   }
 }
 
-// 读取文件
+// 读取文件（AI 工具 read_file 的落点）
+//
+// ⚠️ 必须自己挡敏感文件：渲染层走的 IPC `read-file` 有 isSensitivePath 检查，
+// 但 AI 工具调用走的是这个裸函数，此前**完全没有校验**——等于模型（可能被题目附件里的
+// 文本诱导）可以直接读 config.json，拿到 apiKey / ctf2Token / kali 口令。
+// 读的路径范围本身不设限（题目文件可能放在任意盘符），只挡"工具自身凭据"这一类。
 function readFile(filePath) {
   try {
+    if (isSensitivePath(filePath)) {
+      return '读取文件失败: 拒绝读取工具自身的配置文件（含 API Key / 口令），请改用其他路径';
+    }
     const content = fs.readFileSync(filePath, 'utf8');
     return content;
   } catch (err) {
@@ -10195,11 +10254,26 @@ function readFile(filePath) {
   }
 }
 
-// 写入文件
+// 写入文件（AI 工具 write_file 的落点）
+//
+// ⚠️ 与 readFile 同理：IPC `write-file` 有 isPathAllowedForWrite 边界，
+// 工具路径此前没有。不设边界的后果是模型可以往启动目录、系统目录、应用源码目录写文件，
+// 构成写入型持久化。这里复用同一套 allowedWriteRoots（userData / 应用目录 / 临时目录 /
+// 当前题目目录 / 脚本输出目录）。
 function writeFile(filePath, content) {
   try {
-    fs.writeFileSync(filePath, content, 'utf8');
-    return `文件已写入: ${filePath}`;
+    if (isSensitivePath(filePath)) {
+      return '写入文件失败: 拒绝写入工具自身的配置文件（含 API Key / 口令）';
+    }
+    if (!isPathAllowedForWrite(filePath)) {
+      return '写入文件失败: 写入路径超出允许范围: ' + filePath
+        + '\n允许的根：userData / 应用目录 / 临时目录 / 当前题目目录 / 脚本输出目录。'
+        + '题目目录内的输出请用绝对路径；需要写到别处时先用 bash 或让用户确认。';
+    }
+    const resolved = path.resolve(String(filePath));
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    fs.writeFileSync(resolved, content, 'utf8');
+    return `文件已写入: ${resolved}`;
   } catch (err) {
     return `写入文件失败: ${err.message}`;
   }

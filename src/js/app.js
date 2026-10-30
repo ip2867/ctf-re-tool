@@ -2464,14 +2464,92 @@ async function tryOpenPathFromMessage(message) {
     }
 
     // 走标准载入流程（它会做类型检测/CASE 目录/UI 更新）
+    // ⚠ 这里**不能**用 keepPlatformContext：那会让上一题的 _platformFiles 残留下来串题。
+    // 正确做法是先让 analyzeFile 正常清空，再把本题的同级材料写进去。
+    const sibs = Array.isArray(r.siblings) ? r.siblings.filter(Boolean) : [];
     await analyzeFile(r.path);
+    if (sibs.length && state.currentFile) {
+      state._platformFiles = sibs.slice();
+      state._materialsPreloaded = false;
+    }
     // 载入成功后会同步 state.currentFile；若仍为空说明载入失败
-    if (state.currentFile) return 'opened';
+    if (state.currentFile) {
+      // 立刻把题面等材料读进上下文，而不是等 AI 分析失败再回头找
+      if (sibs.length) await preloadMaterials(sibs);
+      return 'opened';
+    }
     return null;
   } catch (e) {
     addLog('warning', '解析消息中的路径失败: ' + e.message);
     return null;
   }
+}
+
+// 预先读取题目材料（题面/说明/密钥等），把内容直接放进对话上下文。
+//
+// ── 为什么必须"先读"而不是"失败再找" ──────────────────────────
+// 实测（驱动逆向）：目录里有 DancingKeys.sys（要分析的驱动）和
+// 「题面（必须给出）.docx」。题面内容只有两行：
+//     这是什么?
+//     25 40 5a 86 b5 f1 3e 58 80 9b db 0b 30 49 66 8c
+// 后面那串就是**要解的 16 字节密文**。
+// 不先读题面，AI 得先花大量工具调用去猜"这个驱动在校验什么"；
+// 读了题面，一句话就知道目标。这一步能省下的不是几分钟，是整轮的试错。
+async function preloadMaterials(paths) {
+  const list = (Array.isArray(paths) ? paths : []).filter(Boolean).slice(0, 8);
+  if (!list.length) return;
+  addLog('info', `预读题目材料 ${list.length} 个（题面/说明/密钥等）...`);
+
+  const inlined = [];
+  const failed = [];
+  for (const p of list) {
+    const name = String(p).split(/[\\/]/).pop();
+    try {
+      const rf = await window.electronAPI.readFile(p);
+      if (rf && rf.success) {
+        let body = String(rf.content || '');
+        if (!body.trim()) { failed.push({ p, why: '内容为空' }); continue; }
+        const truncated = body.length > 20000;
+        if (truncated) body = body.slice(0, 20000) + '\n...(已截断)';
+        inlined.push({ name, path: p, body, kind: rf.officeKind || '', truncated });
+        addLog('success', `已读入材料: ${name}（${body.length} 字符${rf.officeKind ? '，' + rf.officeKind : ''}）`);
+      } else {
+        failed.push({ p, why: (rf && rf.error) || '读取失败' });
+      }
+    } catch (e) {
+      failed.push({ p, why: e.message });
+    }
+  }
+
+  if (!inlined.length) {
+    if (failed.length) {
+      addLog('warning', `材料预读全部失败：${failed.map(f => f.p.split(/[\\/]/).pop() + '（' + f.why + '）').join('；')}`);
+    }
+    return;
+  }
+
+  // 存一份到证据目录（便于复盘 + 让 AI 后续能用 read_file 再取全文）
+  for (const it of inlined) {
+    try {
+      await caseAddEvidence('material', `题目材料：${it.name}`, it.body, it.kind || 'txt');
+    } catch (e) { /* 存证失败不阻塞 */ }
+  }
+
+  // 直接作为一条系统消息放进对话：让 AI 一开始就看见题面，而不是等它自己想起来去读
+  const parts = inlined.map(it =>
+    `### ${it.name}${it.kind ? '（' + it.kind + ' 提取）' : ''}${it.truncated ? '（已截断）' : ''}\n`
+    + '```\n' + it.body + '\n```\n'
+    + `（原文：\`${it.path}\`）`
+  );
+  addSystemMessage(
+    `**📎 已自动读取题目材料（${inlined.length} 个）**\n\n`
+    + `这些是与主文件同目录的材料，通常包含**题目要求、密文、密钥、提示**。\n`
+    + `已直接放进上下文，不需要再 read_file 一遍。\n\n`
+    + parts.join('\n\n')
+    + (failed.length ? `\n\n⚠ 以下材料读取失败：\n${failed.map(f => '- `' + f.p + '`：' + f.why).join('\n')}` : '')
+  );
+  state._materialsPreloaded = true;
+  state._preloadedMaterials = inlined.map(it => ({ name: it.name, path: it.path, kind: it.kind }));
 }
 
 // 发送消息（AI 请求进行中时，再次点击发送 = 请求停止）
@@ -9965,6 +10043,26 @@ rotl_cross / rotr_cross / add / sub / swap / swap_add / mul_const（仅奇数）
   失败返回 \`REMOTE_TIMEOUT/REMOTE_AUTH/REMOTE_REFUSED/REMOTE_UNCONFIGURED\` 前缀，**都是错误**，不要当成成功空输出。
 - \`traffic_extract({path:"x.pcap", protocol:"auto"})\`：解析抓包（每流端口/包数/字节数/熵/hex 预览）。
   http=0 表示二进制协议，不要当 Web 流量处理。
+- **\`list_dir\` + \`file_digest\` —— 动手分析前，先把题目目录里的材料全部看一遍。**
+  实测（驱动逆向）：题目目录里不止一个文件：
+  \`\`\`
+  DancingKeys.sys            22KB   要反汇编的目标
+  题面（必须给出）.docx      13KB   内容只有两行：
+                                     "这是什么?"
+                                     "25 40 5a 86 b5 f1 3e 58 80 9b db 0b 30 49 66 8c"
+  \`\`\`
+  后面那串就是**要解的 16 字节密文**。不先读题面，你得先去猜"这个驱动在校验什么"；
+  读了题面，一句话就知道目标。**这一步省下的不是几分钟，是整轮试错。**
+  \`\`\`
+  list_dir({path:"E:\\...\\题目目录"})          // 先看有哪些文件
+  file_digest({dir:"E:\\...\\题目目录"})         // 一次读全部，自动提取每种格式的文本
+  \`\`\`
+  \`file_digest\` 自动处理各种格式（**不需要按扩展名挑工具**）：
+  文本/代码（txt md json py c go rs js …）→ 给全文；
+  docx/xlsx/pptx → 解包抽正文；PDF → 抽 FlateDecode 文本；
+  图片 → 给尺寸 + 读图建议；归档 → 列条目；其它 → 魔数 + 熵 + strings。
+  它会自动跳过工具中间产物（\`.id0/.i64/.nam\` 等 IDA 数据库、\`.o\`、Office 锁文件）。
+  **判断权在你**：工具只负责"把每个文件变成人能读的样子"，哪个是题面、哪个是目标由你定。
 - **\`recover_string({func:"Java_..._check"})\` —— 凡是从反汇编里"抄"字符串，一律用它还原。**
   校验代码常写成逐字节比较（\`cmp byte ptr [rbx+1], 0x79\` ...），伪代码里折叠成 \`"bytectf{"\`，
   但**人抄一遍极易少一个字符**。实测：\`bytectf{\` 被抄成 \`bytecf{\`，所有输入第一步就被拒，

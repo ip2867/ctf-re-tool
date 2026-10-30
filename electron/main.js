@@ -527,6 +527,10 @@ ipcMain.handle('resolve-message-path', async (event, message) => {
         success: true, path: best.path, kind: 'file',
         pickedFromDir: hit.p, candidates: pick.all, tried,
         dirFiles: files.map(f => ({ name: f.name, size: f.size })),
+        // 同目录的其它文件：**不自动分析，但要登记为伴生材料**。
+        // 实测（驱动逆向）：目录里除了 DancingKeys.sys 还有「题面（必须给出）.docx」，
+        // 题面是解题的关键输入，不登记的话 AI 只能瞎猜题目要求。
+        siblings: files.map(f => f.path).filter(p => p !== best.path),
       };
     }
     // 目录里没文件（只有子目录）→ 往下钻一层
@@ -546,6 +550,7 @@ ipcMain.handle('resolve-message-path', async (event, message) => {
             success: true, path: b2.path, kind: 'file',
             pickedFromDir: sd, candidates: pick.all, tried,
             dirFiles: subs.map(f => ({ name: f.name, size: f.size })),
+            siblings: subs.map(f => f.path).filter(p => p !== b2.path),
           };
         }
       } catch (e) { /* 单个子目录失败不影响其它 */ }
@@ -3408,6 +3413,8 @@ function toolLabel(name, input) {
   };
   switch (name) {
     case 'read_file': return '读取 ' + short(i.path ? path.basename(i.path) : '', 40);
+    case 'file_digest': return '批量读文件 ' + (i.dir ? short(path.basename(String(i.dir)), 28) : (Array.isArray(i.paths) ? i.paths.length + ' 个' : ''));
+    case 'list_dir': return '列目录 ' + short(i.path ? path.basename(String(i.path)) : '', 28);
     case 'write_file': return '写入 ' + short(i.path ? path.basename(i.path) : '', 40);
     case 'bash': return '执行命令 ' + short(i.command, 50);
     case 'run_python': return '运行 Python 脚本' + (i.script ? `（${String(i.script).split('\n').length} 行）` : '');
@@ -3522,6 +3529,24 @@ ipcMain.handle('write-file', async (event, filePath, content) => {
 ipcMain.handle('read-file', async (event, filePath) => {
   try {
     if (isSensitivePath(filePath)) return { success: false, error: '拒绝读取受保护文件（含凭据）' };
+    // OOXML（docx/xlsx/pptx）是 ZIP+XML，按 utf8 直读只会得到二进制乱码。
+    // 实测（驱动逆向）：题面「题面（必须给出）.docx」里只有两行 —— 一句"这是什么?"和
+    // 一串 16 字节 hex，那正是要解的密文。不提取文本，AI 就只能猜题目要求。
+    const ext = path.extname(String(filePath || '')).toLowerCase();
+    if (['.docx', '.xlsx', '.pptx', '.docm', '.xlsm', '.pptm'].includes(ext)) {
+      const { extractOfficeText } = require('./office-text');
+      const r = extractOfficeText(path.resolve(filePath));
+      if (r.ok) {
+        return {
+          success: true,
+          content: r.text,
+          officeKind: r.kind,
+          officeParts: r.parts,
+          note: `已从 ${r.kind} 提取纯文本（${r.text.length} 字符）`,
+        };
+      }
+      return { success: false, error: `Office 文本提取失败：${r.error}（文件存在但不是标准 OOXML？）` };
+    }
     return { success: true, content: fs.readFileSync(path.resolve(filePath), 'utf8') };
   } catch (err) {
     return { success: false, error: err.message };
@@ -6440,7 +6465,7 @@ function parseClaudeResult(resp) {
 // 其后到下一个标记/段末的内容是参数（形如 name(args) 或裸命令行）。
 function parseTextToolCalls(rawText) {
   const KNOWN = new Set([
-    'read_file', 'write_file', 'bash', 'glob', 'grep',
+    'read_file', 'write_file', 'bash', 'glob', 'grep', 'file_digest', 'list_dir',
     'jeb_get_manifest', 'jeb_get_class_decompiled', 'jeb_get_method_decompiled',
     'jeb_get_exported_activities', 'jeb_get_all_classes', 'jeb_get_class_methods',
     'ida_decompile', 'ida_list_functions', 'ida_find_strings', 'ida_get_xrefs', 'ida_get_bytes',
@@ -6695,6 +6720,17 @@ function precheckToolCall(name, input) {
     if (i.content === undefined || i.content === null) return '缺少必填参数 content。';
   }
   if (name === 'read_file' && !i.path) return '缺少必填参数 path。';
+  if (name === 'file_digest') {
+    const hasPaths = Array.isArray(i.paths) && i.paths.length;
+    const hasPath = !!i.path;
+    if (!hasPaths && !hasPath && !i.dir) {
+      return 'file_digest 需要 paths（文件路径数组）或 dir（目录）或 path（单个文件）。'
+        + '拿到题目目录后建议直接传 dir，一次看完所有材料（题面/说明/密文/目标）。';
+    }
+  }
+  if (name === 'list_dir' && !i.path) {
+    return '缺少 path 参数（要列出的目录路径）。';
+  }
   // grep 的 path 是**可选**的（不传则在当前工作目录搜索），只在缺 pattern 时才拦。
   if (name === 'grep' && !i.pattern) return '缺少必填参数 pattern。';
   if (name === 'glob' && !i.pattern) return '缺少必填参数 pattern。';
@@ -7600,6 +7636,43 @@ function getToolDefinitions() {
         type: "object",
         properties: {
           path: { type: "string", description: "文件路径" }
+        },
+        required: ["path"]
+      }
+    },
+    {
+      name: "file_digest",
+      description:
+        "**一次读多个文件，把每个都变成可读摘要** —— 用来快速看清题目目录里都有什么、哪个是题面、哪个是要分析的目标。\n" +
+        "为什么需要它：题目附件常是混合的（驱动 + docx 题面 + 说明.md + 密文.txt + 图片），" +
+        "而「哪个是题面」这种事**看内容一眼就知道，工具猜不准**。所以这里不替你做选择，只负责把每个文件变成人能读的样子。\n" +
+        "**强烈建议：拿到题目目录后第一件事就是调它把整目录过一遍**，而不是等分析失败再回头找材料。\n" +
+        "支持的类型（自动识别，不需要你指定）：\n" +
+        "  · 文本/代码  txt md json xml py c cpp go rs js java php lua sh csv log pem key …（给全文，超长截断）\n" +
+        "  · OOXML      docx xlsx pptx（解包抽正文，题面常在这里）\n" +
+        "  · PDF        解 FlateDecode 流抽 Tj/TJ 文本\n" +
+        "  · 图片       png jpg gif bmp（给尺寸 + 提示：读图用 OCR 或直接看图）\n" +
+        "  · 归档       zip jar apk（列条目名）\n" +
+        "  · 其它二进制  魔数识别（PE/ELF/DEX/WASM/pcap…）+ 熵 + strings 摘要\n" +
+        "参数二选一：paths（路径数组）或 dir（目录，自动取其下所有文件）。",
+      input_schema: {
+        type: "object",
+        properties: {
+          paths: { description: "文件路径数组，如 [\"E:\\\\xxx\\\\a.sys\", \"E:\\\\xxx\\\\题面.docx\"]" },
+          dir: { type: "string", description: "目录路径（取其下所有文件，不含子目录递归）" },
+          max_text: { type: "number", description: "每个文本文件最多返回多少字符（默认 60000）" }
+        }
+      }
+    },
+    {
+      name: "list_dir",
+      description:
+        "列出一个目录里的文件（含大小/类型），用于先看清题目材料再决定读哪些。\n" +
+        "只列一层，不递归；子目录会标出来但不会展开（需要时再对子目录调一次）。",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "目录路径" }
         },
         required: ["path"]
       }
@@ -8516,6 +8589,135 @@ async function executeToolCall(toolName, input) {
       // ========== 文件操作工具 ==========
       case 'read_file':
         return readFile(input.path);
+
+      // 一次读多个文件 → 每个都变成可读摘要。判断交给 AI，工具只负责"把文件变成人能读的样子"。
+      case 'file_digest': {
+        const { digestMany, digestFile } = require('./file-digest');
+        let paths = Array.isArray(input.paths) ? input.paths.slice() : (input.path ? [input.path] : []);
+        // dir 模式：取其下所有文件（一层）
+        if (input.dir) {
+          try {
+            const d = path.resolve(String(input.dir));
+            if (!fs.existsSync(d)) return `目录不存在: ${d}`;
+            const ents = fs.readdirSync(d, { withFileTypes: true });
+            for (const ent of ents) {
+              if (ent.isDirectory()) continue;
+              paths.push(path.join(d, ent.name));
+            }
+          } catch (e) {
+            return `读取目录失败: ${e.message}`;
+          }
+        }
+        // 去重
+        const seen = new Set();
+        paths = paths.filter(p => {
+          const k = String(p).toLowerCase();
+          if (seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        });
+        if (!paths.length) {
+          return 'file_digest 需要 paths（文件路径数组）或 dir（目录）。';
+        }
+        const r = digestMany(paths, { maxText: Number(input.max_text) || undefined });
+        const OUT = [];
+        OUT.push(`## 共 ${r.items.length} 个文件（成功 ${r.ok}，失败 ${r.failed}）`);
+        OUT.push('');
+        // 先给一张总览表，方便 AI 一眼判断哪个是题面、哪个是目标
+        OUT.push('| 文件 | 大小 | 类型 | 要点 |');
+        OUT.push('|---|---|---|---|');
+        for (const it of r.items) {
+          if (!it.ok) {
+            OUT.push(`| ${it.name} | - | 读取失败 | ${it.error} |`);
+            continue;
+          }
+          const size = it.size >= 1024 ? (it.size / 1024).toFixed(1) + 'KB' : it.size + 'B';
+          let hint = '';
+          if (it.kind === 'text') hint = `${it.chars || 0} 字符${it.truncated ? '（截断）' : ''}`;
+          else if (it.kind === 'docx' || it.kind === 'xlsx' || it.kind === 'pptx') hint = `Office 正文 ${it.chars || 0} 字符`;
+          else if (it.kind === 'pdf') hint = `PDF 文本 ${it.chars || 0} 字符`;
+          else if (it.kind === 'image') hint = `图片 ${it.width || '?'}×${it.height || '?'}`;
+          else if (it.kind === 'archive') hint = `归档 ${it.entryCount || 0} 项`;
+          else if (it.kind === 'binary') hint = `${it.magic || '二进制'}，熵 ${it.entropy}`;
+          OUT.push(`| ${it.name} | ${size} | ${it.kind}${it.ext ? ' ' + it.ext : ''} | ${hint} |`);
+        }
+        OUT.push('');
+        // 再给每个文件的详细内容
+        for (const it of r.items) {
+          OUT.push(`---`);
+          OUT.push('');
+          OUT.push(`### ${it.name}`);
+          OUT.push(`路径：\`${it.path}\`　大小：${it.size} 字节　类型：${it.kind}${it.magic ? '（' + it.magic + '）' : ''}`);
+          if (!it.ok) {
+            OUT.push(`**读取失败**：${it.error}`);
+            continue;
+          }
+          if (it.note) OUT.push(`> ${it.note}`);
+          OUT.push('');
+          if (it.kind === 'text' || it.kind === 'docx' || it.kind === 'xlsx' || it.kind === 'pptx' || it.kind === 'pdf') {
+            OUT.push('```');
+            OUT.push(String(it.text || '').slice(0, 60000));
+            OUT.push('```');
+          } else if (it.kind === 'image') {
+            OUT.push(`尺寸：${it.width || '?'} × ${it.height || '?'}`);
+          } else if (it.kind === 'archive') {
+            OUT.push('条目：');
+            for (const e of (it.entries || []).slice(0, 80)) OUT.push('- ' + e);
+            if ((it.entries || []).length > 80) OUT.push(`… 另有 ${it.entries.length - 80} 项`);
+          } else if (it.kind === 'binary') {
+            OUT.push(`熵：${it.entropy}`);
+            OUT.push(`头部 64 字节：\`${it.headHex}\``);
+            if ((it.strings || []).length) {
+              OUT.push('可见字符串（前 40 条）：');
+              for (const s of it.strings.slice(0, 40)) OUT.push('- `' + s + '`');
+            }
+          }
+          OUT.push('');
+        }
+        OUT.push('---');
+        OUT.push('**下一步建议**：看清上面哪些是题面/说明（通常含题目要求、密文、提示），');
+        OUT.push('哪些是真正要分析的目标。**先读题面再动手**，比先埋头反汇编再回头找材料省得多。');
+        return OUT.join('\n');
+      }
+
+      case 'list_dir': {
+        try {
+          const d = path.resolve(String(input.path || ''));
+          if (!fs.existsSync(d)) return `目录不存在: ${d}`;
+          if (!fs.statSync(d).isDirectory()) return `不是目录: ${d}`;
+          const ents = fs.readdirSync(d, { withFileTypes: true });
+          const L = [`## ${d}（${ents.length} 项）`, ''];
+          const files = [];
+          const dirs = [];
+          for (const ent of ents) {
+            const full = path.join(d, ent.name);
+            if (ent.isDirectory()) { dirs.push(ent.name); continue; }
+            let size = 0;
+            try { size = fs.statSync(full).size; } catch (e) { size = 0; }
+            files.push({ name: ent.name, size, path: full });
+          }
+          if (dirs.length) {
+            L.push('**子目录**（未展开，需要时对其再调 list_dir）：');
+            for (const n of dirs) L.push('- ' + n);
+            L.push('');
+          }
+          if (files.length) {
+            L.push('| 文件 | 大小 |');
+            L.push('|---|---|');
+            for (const f of files.sort((a, b) => b.size - a.size)) {
+              const s = f.size >= 1024 ? (f.size / 1024).toFixed(1) + 'KB' : f.size + 'B';
+              L.push(`| ${f.name} | ${s} |`);
+            }
+            L.push('');
+            L.push('用 `file_digest({dir:"' + d + '"})` 一次读取全部内容并自动提取文本。');
+          } else {
+            L.push('（目录里没有文件）');
+          }
+          return L.join('\n');
+        } catch (e) {
+          return `列目录失败: ${e.message}`;
+        }
+      }
 
       case 'write_file':
         return writeFile(input.path, input.content);

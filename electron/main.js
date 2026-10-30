@@ -3358,6 +3358,46 @@ ipcMain.handle('get-file-info', async (event, filePath) => {
   }
 });
 
+// 启动 .bat/.cmd 启动器（如 Burp 的 MCP_Burp.bat）。
+//
+// 这个函数的存在感很强，是因为 Windows 上"带空格的 bat 路径 + 额外参数"极易踩坑。
+// 实测对照（路径 E:\ctf\tools\BurpSuite V2025.11.2\_p2.bat，目录名与文件名都含空格）：
+//
+//   spawn(cmd, ['/c', bat])                     → ✅ 无参数时可用
+//   spawn(cmd, ['/c', bat, arg])                → ❌ 'E:\ctf\tools\BurpSuite' 不是内部或外部命令
+//   spawn(cmd, ['/c', '"'+bat+'"', arg])        → ❌ 文件名、目录名或卷标语法不正确
+//   spawn(cmd, ['/c', '"'+bat+'" '+"'"+arg+"'"]) → ❌ 引号被当成文件名的一部分
+//   spawn(cmd, ['/s','/c','""'+bat+'""'], {windowsVerbatimArguments:true})
+//                                               → ✅ 无参数可用，参数也能正确传入
+//
+// 结论：必须用 `cmd /s /c ""<bat>" "<arg>"..."` 这种"整体加引号"形式，
+// 且必须配 windowsVerbatimArguments:true（让 Node 不要二次加引号），
+// 否则 cmd 会把含空格的路径按空格拆开——这正是
+// `'E:\ctf\tools\BurpSuite' 不是内部或外部命令` 的来源。
+//
+// 另一个坑：旧代码用 `cmd /c start "" <bat>`，start 会**再解析一遍**命令行，
+// 即使路径没空格，命中率也很差；且 start 会另开窗口，进程关系更难追踪。
+// 这里不用 start。
+//
+// detached + unref：Burp 是 GUI，进程不该被父进程生命周期 bound 住。
+// windowsHide:false —— Burp 有窗口，隐藏了用户会以为没启动。
+function spawnBatchLauncher(batPath, extraArgs = []) {
+  const quote = (s) => '"' + String(s).replace(/"/g, '""') + '"';
+  const inner = [quote(batPath)].concat(extraArgs.map(quote)).join(' ');
+  // /s + 外层再包一对引号：cmd 对 "/s /c" 的规则是"剥掉最外层引号后原样执行"，
+  // 这样内部每个参数都有自己的引号，边界清晰。
+  const child = spawn(process.env.ComSpec || 'cmd.exe', ['/s', '/c', '"' + inner + '"'], {
+    shell: false,
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: false,
+    windowsVerbatimArguments: true,
+  });
+  child.on('error', (err) => console.error('[batch] 启动失败:', batPath, err.message));
+  child.unref();
+  return child;
+}
+
 // 启动工具（spawn 参数数组，避免 shell 注入；jar 自动走 java -jar）
 ipcMain.handle('launch-tool', async (event, toolName, filePath) => {
   try {
@@ -3369,6 +3409,11 @@ ipcMain.handle('launch-tool', async (event, toolName, filePath) => {
     if (['ida', 'ida64', 'jeb'].includes(toolName)) {
       try { hardenEditorConfigs(); } catch (e) { /* 配置固化失败不阻塞启动 */ }
     }
+    // 启动前先确认路径真实存在：否则 spawn 成功后仍然"什么都没发生"，
+    // 上层却拿到 success:true（这正是"日志说 burp 已启动、实际没起来"的成因之一）。
+    if (!fs.existsSync(toolPath)) {
+      return { success: false, error: `工具路径不存在: ${toolPath}（请在设置页检查 ${toolName} 的路径）` };
+    }
 
     let cmd, args;
     if (/\.jar$/i.test(toolPath)) {
@@ -3376,10 +3421,9 @@ ipcMain.handle('launch-tool', async (event, toolName, filePath) => {
       args = ['-jar', toolPath];
       if (filePath) args.push(filePath);
     } else if (/\.(bat|cmd)$/i.test(toolPath)) {
-      // 批处理启动器（如 Burp 的 Start.bat）：经 cmd start 拉起，路径空格安全
-      cmd = 'cmd';
-      args = ['/c', 'start', '', toolPath];
-      if (filePath) args.push(filePath);
+      // 批处理启动器：见 spawnBatchLauncher 的注释（不能用 cmd start）
+      spawnBatchLauncher(toolPath, filePath ? [filePath] : []);
+      return { success: true, message: `已启动 ${toolName}` };
     } else if (/\.vbs$/i.test(toolPath)) {
       cmd = 'wscript';
       args = [toolPath];
@@ -5004,12 +5048,40 @@ async function launchBurpForMcp() {
     } catch (e) { /* 清理失败不阻塞 */ }
 
     // 2) 启动
-    const child = /\.(bat|cmd)$/i.test(burpPath)
-      ? spawn('cmd', ['/c', 'start', '', burpPath], { shell: false, detached: true, stdio: 'ignore', windowsHide: true })
-      : spawn(burpPath, [], { shell: false, detached: true, stdio: 'ignore' });
-    child.on('error', (err) => console.error('Burp 启动失败:', err.message));
-    child.unref();
-    return { success: true, message: '已拉起 Burp（等待 MCP 端口就绪）' };
+    // ⚠️ 这里原来写的是 `spawn('cmd', ['/c','start','',burpPath])`，
+    //    路径含空格时 start 会二次解析、把目录当命令，报
+    //    `'E:\ctf\tools\BurpSuite' 不是内部或外部命令`，
+    //    而本函数仍然返回 success:true → 日志显示"burp 已启动"，实际什么都没起。
+    //    改用 spawnBatchLauncher（直接 cmd /c "<bat>"，实测可行）。
+    if (/\.(bat|cmd)$/i.test(burpPath)) {
+      spawnBatchLauncher(burpPath);
+    } else {
+      const child = spawn(burpPath, [], { shell: false, detached: true, stdio: 'ignore' });
+      child.on('error', (err) => console.error('Burp 启动失败:', err.message));
+      child.unref();
+    }
+    // 3) 确认真的起来了：等 MCP 端口监听。
+    //    只看"spawn 没抛错"是不够的——bat 可能在内部失败（路径错、java 缺失、被拦）。
+    //    这里给一段时间轮询 127.0.0.1:<mcp 端口>，起不来就如实报错，让上层把真实原因写进日志。
+    let host = '127.0.0.1', port = 9876;
+    try {
+      const u = new URL(config.mcp.burp);
+      host = u.hostname || host;
+      port = Number(u.port) || port;
+    } catch (e) { /* 配置异常用默认端口 */ }
+    const deadline = Date.now() + 90000;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 2000));
+      if (await probeTcpPort(host, port, 1200)) {
+        return { success: true, message: `已拉起 Burp，MCP 端口 ${host}:${port} 就绪` };
+      }
+    }
+    return {
+      success: false,
+      error: `已执行 Burp 启动器，但 90s 内 MCP 端口 ${host}:${port} 未监听。`
+        + `常见原因：①启动器路径含空格且未被正确引用；②Burp 弹出对话框（如"删除旧临时文件"）挡住了扩展加载；`
+        + `③MCP 扩展未安装/未启用；④端口不是 ${port}（可在设置页核对 mcp.burp）。`,
+    };
   } catch (err) {
     return { success: false, error: err.message };
   }
@@ -5247,24 +5319,11 @@ async function burpEnsureReady() {
     });
     if (!listening) {
       burpMcpState.autoLaunchTried = true;
+      // launchBurpForMcp 内部已经等到 MCP 端口就绪（或超时后给出具体原因），
+      // 这里不再重复轮询——之前两处各等 90s，失败时还要白等一轮。
       const launched = await launchBurpForMcp();
-      if (launched.success) {
-        // 启动到端口就绪通常 20-40s（Burp 本体较重）；按 1s 轮询，最多等 90s
-        const deadline = Date.now() + 90000;
-        while (Date.now() < deadline) {
-          const ok = await new Promise((resolve) => {
-            try {
-              const u = new URL(config.mcp.burp);
-              const socket = require('net').connect({ host: u.hostname, port: Number(u.port) || 80 }, () => {
-                socket.destroy(); resolve(true);
-              });
-              socket.setTimeout(1200, () => { socket.destroy(); resolve(false); });
-              socket.on('error', () => resolve(false));
-            } catch (e) { resolve(false); }
-          });
-          if (ok) break;
-          await sleep(1000);
-        }
+      if (!launched.success) {
+        console.error('[Burp MCP] 自动拉起失败: ' + (launched.error || '未知原因'));
       }
     }
   }

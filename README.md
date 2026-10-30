@@ -1,11 +1,11 @@
-# CTF-RE-TOOL v1.9.2
+# CTF-RE-TOOL v1.10.0
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)]()
 [![Electron](https://img.shields.io/badge/Electron-35-47848F?logo=electron&logoColor=white)]()
 
-一个基于 Electron 的 **CTF 逆向 AI 解题工作台**（Windows 桌面应用）。把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成一条 AI 可自主驱动的流水线，并通过 MCP 实时接入 **IDA / JEB / Burp**，内置 **11 个逆向方法论技能**（Skills）与**可检索的结构化知识库**（Wiki）。
+一个基于 Electron 的 **CTF 逆向 AI 解题工作台**（Windows 桌面应用）。把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成一条 AI 可自主驱动的流水线，并通过 MCP 实时接入 **IDA / JEB / Burp**，内置 **13 个逆向方法论技能**（Skills）与**可检索的结构化知识库**（Wiki）。
 
 设计原则：**AI 是解题主体，工具提供能力**。不是把功能堆在一起，而是让 AI 在解题过程中真正调用工具、识别算法、验证结论。
 
@@ -14,12 +14,12 @@
 - **花指令自动修复**：11 类花指令特征识别 + 只 nop 跳转本身的等长修补（字节偏移与语义都不变），修复后自动让 IDA 重新分析并等到就绪；实测把非对齐跳转降 78%、边界冲突点降 98%，让原本反编译失败的关键函数变得可读。
 - **运行期探测**：`snapshot_diff` 前后快照就地差分，直接量出混淆代码对数据做了什么；`force_continue` 强制改寄存器让被提前打断的循环跑满；`global_reads` 统计全局引用识别单行校验；`angr_solve` 生成绕开 libc 启动并 hook 间接跳转的符号执行脚本。
 - **本地验证闭环**：AI 给出的每个 flag 都附 `[VERIFY]` 契约，工具自动生成 Python 复现脚本本地跑一遍，标注 ✅已验证 / ⚠️未验证——**不靠"AI 说解出来了"就当解出来了**。
-- **结构化知识库**：50 条可检索条目（43 篇历年题 + 7 篇方法论），每条带 `attack_chain` 解法链 / `failed_attempts` 避坑；按题目特征自动预取，命中即注入 AI 上下文。
+- **结构化知识库**：58 篇可检索条目（51 篇 reverse + 6 篇 frida + 1 篇 firmware），每条带 `attack_chain` 解法链 / `failed_attempts` 避坑；按题目特征自动预取，命中即注入 AI 上下文。
 - **经验自进化**：每次解题沉淀的多步攻击链写入经验库，下次同类题自动速查复用。
 
-**下载**：[v1.9.2 便携版 CTF-RE-TOOL.exe](https://github.com/ip2867/ctf-re-tool/releases/download/v1.9.2/CTF-RE-TOOL.exe)（74.11 MB，单文件双击即用，无需安装 / 无需 Node.js）
+**下载**：[v1.10.0 便携版 CTF-RE-TOOL.exe](https://github.com/ip2867/ctf-re-tool/releases/download/v1.10.0/CTF-RE-TOOL.exe)（74.22 MB，单文件双击即用，无需安装 / 无需 Node.js）
 
-> 校验：`SHA256 = 0b81078183312a1e8acb31ab1c4f784ad430284c7423ed64b8d3d29ed32ee167`
+> 校验：`SHA256 = 9ecb738615799a26f3b355d6d1f39765b7e688baa59b3fcb0f7901eb0d1a57be`（也可直接下载 [.sha256](https://github.com/ip2867/ctf-re-tool/releases/download/v1.10.0/CTF-RE-TOOL.exe.sha256)）
 >
 > 首次运行请在「设置」页填写 IDA / JEB / jadx 等外部工具路径（本工具是调度框架，不含这些工具）。
 
@@ -230,7 +230,7 @@ ctf-tool-v2/
 │   ├── index.html        # 主页面（CSP + SRI 加固）
 │   ├── css/style.css     # 样式（暖白简约主题）
 │   └── js/app.js         # 渲染层逻辑（AI 编排、Tool-Use 循环、Hook 生成、验证闭环、WP 生成）
-├── skills/               # 11 个逆向方法论技能（SKILL.md，AI 经 read_skill 按需加载）
+├── skills/               # 13 个逆向方法论技能（SKILL.md，AI 经 read_skill 按需加载）
 │   ├── ctf-dispatch/     #   总调度：分类 → 选方法 → 卡题换路
 │   ├── ctf-reverse-binary/ ctf-reverse-android/ ctf-reverse-langs/
 │   ├── ctf-reverse-tooling/   #   Z3/angr/Unicorn 自动化求解 + 迷宫题
@@ -368,6 +368,42 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 | [CHANGELOG-ARCHIVE.md](docs/CHANGELOG-ARCHIVE.md) | v1.4.0 及更早的更新日志 |
 
 ## 更新日志
+
+### v1.10.0 (2026-10-31) — 让 AI 看得更全、判断更准、不再被工具自身误导
+
+这一版的主题不是"加功能"，而是**把工具误导 AI 的地方逐个堵掉**。多数问题都属于
+"界面按钮能用、对话里下指令就不行"，或"日志看起来像 A，实际是 B"——不修就会让 AI
+在错误方向上烧掉整轮预算。
+
+**新增能力**
+
+| 能力 | 解决什么 |
+|---|---|
+| `file_digest` | 一次读多个文件（文本/OOXML/PDF/图片/二进制自动识别），**哪个是题面、哪个是要分析的目标交给 AI 判断**，而不是靠扩展名猜 |
+| 文件对话框多选 | 一次选入全部材料，AI 统一消化 |
+| `recover_string` | 从 `cmp ..., imm` 逐字节比较里确定性还原字符串前缀，杜绝手抄漏字母（把 `bytectf{` 抄成 `bytecf{` 这类错误，会让所有输入在第一步就被拒，而日志只报"校验失败"） |
+| `frida_lint` | 结构性检查"语法合法但运行必炸"的坑（如 `/ ====== /` 被当成正则） |
+| Nox 启动回落 | CLI 启动器有 bug（`player is not exist!`）时自动换用主程序 |
+| Frida 版本检测 | client/server 不一致时直接给出升级命令，不再只报 `connection closed` |
+| 消息带路径自动载入 | 直接发路径就能打开文件 |
+
+**修复（都是实测踩出来的）**
+
+- **对话里下指令时 `ida_open_file` 不再失败** — 它此前隐含假设 IDA 已在运行，而只有界面按钮会拉起。于是返回"未能切换到目标文件"，文案又像是"文件打不开"，AI 据此判定"本机没有 IDA"转去手工分析。现在工具内部自己做「探活 → 拉起 → 等端口就绪」。
+- **cmd 的 `&` 探测链不再被误判失败** — `where X 2>nul & dir Y 2>nul` 因前一条失败被整体判为"命令执行失败"，即使后面成功了。改为逐条执行，任一有输出即成功；全无输出时明确说"这本身是有效结论"。
+- **flag 前缀不再被截断** — `bytectf{...}` 曾被正则匹配成 `ctf{...}`（丢掉 `byte`）。更隐蔽的是下游用子串判定，于是截断版也被标成"已验证"，最后交上去的 flag 是错的。JS 侧还有个镜像问题：`\b` 版正则会**完全匹配不到** `bytectf{}`，flag 直接丢失。
+- **全面审查修复的 6 类缺陷**：
+  - `ida_dbg` 的 `status`/`suspend`/`clear_remote`/`snapshot_diff` 在 schema 里声明、precheck 却拦死 → **AI 永远调不到**，其中 `snapshot_diff` 还是工具描述重点推荐的首选路径；
+  - AI 的 `read_file`/`write_file` 绕过路径边界（IPC 有校验、工具路径没有）→ 可读 `config.json` 拿 apiKey/口令，可往系统目录写文件；
+  - 跨题状态残留（`lastVerifyContracts`/`nativeIntel` 等）→ 上一题的契约会参与本题的 flag 判定，上一题的 SO 反编译会被拼进本题提示词；
+  - 工具清单不一致（`wiki_read` 参数映射错、`KNOWN` 缺 8 个工具、`browser_js` 有实现无声明）；
+  - 伪 Markdown 渲染破坏内容（`2*3*4` 渲染成斜体、代码块围栏被拆成零散 `<code>`，缩进全丢）；
+  - `autoAnalyze`/`runHook` 无重入锁且无异常兜底 → 连点两次并行跑两条求解流程，报错则变成"点了没反应"。
+
+**质量**
+
+- 测试 **110 个**全通过，回归题 **13/13** 通过。
+- 新增**清单一致性测试**：把工具集合的 6 份清单（schema / dispatch / toolLabel / KNOWN / MAP / precheck）两两比对。此前测试全绿却藏着上面那些 bug，正是因为没人让这些清单对账；现在任何一处漏更新都会红。
 
 ### v1.9.2 (2026-10-26) — 运行期探测原语：让工具能量"代码做了什么"
 

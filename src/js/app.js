@@ -643,13 +643,112 @@ async function handleDrop(e) {
   }
 }
 
+// 选择文件（支持多选）
+//
+// 为什么改成多选：题目材料是混合的 —— 驱动/EXE + docx 题面 + 说明.md + 密文.txt。
+// 只让选一个，用户得反复操作，而 AI 也需要看到全部材料才能判断
+// "哪个是题面、哪个是要分析的目标"。
+//
+// 选中多个时的处理：
+//   · 先用 file_digest 把全部材料摘要一遍（题面/说明/密文都进上下文）
+//   · 再挑"最像题目本体"的那个做深入分析（可执行/二进制优先，文档垫底）
+//   · 剩下的登记为伴生材料，AI 随时可用 read_file 取全文
 async function handleSelectFile() {
-  const filePath = await window.electronAPI.selectFile();
-  if (filePath) {
-    addLog('info', '选择的文件: ' + filePath);
-    await analyzeFile(filePath);
-  } else {
+  const picked = await window.electronAPI.selectFile(null, true);
+  if (!picked) {
     addLog('info', '未选择文件或对话框已取消');
+    return;
+  }
+  const paths = Array.isArray(picked) ? picked.filter(Boolean) : [picked];
+  if (!paths.length) {
+    addLog('info', '未选择文件或对话框已取消');
+    return;
+  }
+  addLog('info', paths.length > 1
+    ? `选择了 ${paths.length} 个文件`
+    : '选择的文件: ' + paths[0]);
+  for (const p of paths) addLog('info', '  - ' + p);
+
+  if (paths.length === 1) {
+    await analyzeFile(paths[0]);
+    return;
+  }
+
+  // ── 多选：先摘要全部材料，再挑主文件深入分析 ──
+  let main = null;
+  let others = [];
+  try {
+    const dg = await window.electronAPI.fileDigest(paths);
+    const items = (dg && Array.isArray(dg.items)) ? dg.items : [];
+    addLog('info', `材料摘要：成功 ${dg.ok} 个，失败 ${dg.failed} 个` +
+      (dg.skipped && dg.skipped.length ? `，跳过 ${dg.skipped.length} 个工具产物` : ''));
+
+    // 挑主文件：可执行/二进制优先，纯文档垫底
+    const score = (it) => {
+      const n = String(it.name || '').toLowerCase();
+      let s = 0;
+      if (it.kind === 'binary') s += 20;
+      else if (it.kind === 'text') s += 8;
+      else if (it.kind === 'archive') s += 4;
+      else if (['docx', 'xlsx', 'pptx', 'pdf'].includes(it.kind)) s -= 10;
+      else if (it.kind === 'image') s -= 6;
+      if (/\.(apk|exe|dll|sys|elf|so|out|bin|pyc|dex|wasm)$/.test(n)) s += 10;
+      if (/\.(txt|md|docx?|pdf|png|jpg)$/.test(n)) s -= 5;
+      return s;
+    };
+    const ranked = items.filter(i => i.ok).slice().sort((a, b) => score(b) - score(a));
+    if (ranked.length) {
+      main = ranked[0].path;
+      others = ranked.slice(1).map(i => i.path);
+    }
+
+    // 把材料内容直接放进对话：AI 一开始就能看到题面，而不是等失败再找
+    if (items.length) {
+      const successful = items.filter(i => i.ok);
+      const failedItems = items.filter(i => !i.ok);
+      const parts = [];
+      for (const it of successful) {
+        const isTextLike = ['text', 'docx', 'xlsx', 'pptx', 'pdf'].includes(it.kind);
+        if (isTextLike && it.text) {
+          const t = it.text.length > 30000 ? it.text.slice(0, 30000) + '\n...(截断)' : it.text;
+          parts.push(`#### ${it.name}（${it.kind}，${it.size} 字节）\n\`\`\`\n${t}\n\`\`\``);
+        } else if (it.kind === 'binary') {
+          parts.push(`#### ${it.name}（二进制：${it.magic || '未知'}，熵 ${it.entropy}，${it.size} 字节）\n`
+            + '```\n' + (it.strings || []).slice(0, 25).join('\n') + '\n```');
+        } else if (it.kind === 'image') {
+          parts.push(`#### ${it.name}（图片 ${it.width || '?'}×${it.height || '?'}，${it.size} 字节）`);
+        } else if (it.kind === 'archive') {
+          parts.push(`#### ${it.name}（归档 ${it.entryCount || 0} 项）\n`
+            + (it.entries || []).slice(0, 40).map(e => '- ' + e).join('\n'));
+        } else {
+          parts.push(`#### ${it.name}（${it.kind}，${it.size} 字节）`);
+        }
+      }
+      let msg = `**📎 已读入 ${successful.length} 个材料**\n\n`
+        + `本次选了 ${paths.length} 个文件。下面是各文件内容（自动按类型提取文本），`
+        + `**请先判断哪些是题面/说明（常含题目要求、密文、提示），哪个是真正要分析的目标**，再动手。\n\n`
+        + parts.join('\n\n');
+      if (failedItems.length) {
+        msg += `\n\n⚠ 读取失败 ${failedItems.length} 个：\n`
+          + failedItems.map(f => '- `' + f.name + '`：' + f.error).join('\n');
+      }
+      if (dg.skipped && dg.skipped.length) {
+        msg += `\n\n（已自动跳过 ${dg.skipped.length} 个工具中间产物，如 IDA 的 .id0/.nam/.til）`;
+      }
+      addSystemMessage(msg);
+    }
+  } catch (e) {
+    addLog('warning', '材料摘要失败（继续按多选首个文件分析）: ' + e.message);
+  }
+
+  if (!main) main = paths[0];
+  addLog('info', `主分析目标: ${main}`);
+  if (others.length) addLog('info', `伴生材料 ${others.length} 个（AI 可用 read_file 取全文）`);
+
+  await analyzeFile(main);
+  if (others.length && state.currentFile) {
+    state._platformFiles = others.slice();
+    state._preloadedMaterials = [];
   }
 }
 

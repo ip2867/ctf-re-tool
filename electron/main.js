@@ -504,7 +504,29 @@ ipcMain.handle('resolve-message-path', async (event, message) => {
     }
 
     if (!hit.isDir) {
-      return { success: true, path: hit.p, kind: 'file', candidates: pick.all, tried };
+      // 消息里若有多个**都存在的文件**路径，全部返回，交给 AI 判断哪个是题面、哪个是目标
+      // （只挑一个会丢掉另一半信息，而用户的意图本来就是"这些都给你"）。
+      const existingFiles = [];
+      for (const p of pick.all) {
+        try {
+          if (fs.existsSync(p) && fs.statSync(p).isFile()) existingFiles.push(p);
+        } catch (e) { /* 忽略单个探测失败 */ }
+      }
+      return {
+        success: true, path: hit.p, kind: 'file',
+        candidates: pick.all, tried,
+        files: existingFiles.length ? existingFiles : [hit.p],
+        // 同级材料：同一个目录下的其它文件（AI 可能还需要题面/说明）
+        siblings: (() => {
+          try {
+            const d = path.dirname(hit.p);
+            return fs.readdirSync(d, { withFileTypes: true })
+              .filter(e => !e.isDirectory())
+              .map(e => path.join(d, e.name))
+              .filter(p => p !== hit.p);
+          } catch (e) { return []; }
+        })(),
+      };
     }
 
     // 目录：展开，挑主文件
@@ -3981,19 +4003,40 @@ ipcMain.handle('frida-ps', async (event, opts) => {
 });
 
 // 选择文件对话框
-ipcMain.handle('select-file', async (event, filters) => {
+//
+// multi=true 时允许一次选多个文件（Ctrl/Shift 多选）。
+// 为什么需要：题目材料常是混合的 —— 驱动 + docx 题面 + 说明.md + 密文.txt。
+// 只能选一个的话，用户得反复操作，而 AI 又需要看到全部材料才能判断
+// "哪个是题面、哪个是要分析的目标"。
+ipcMain.handle('select-file', async (event, filters, multi) => {
+  const wantMulti = multi === true || (filters && filters.multi === true);
   const result = await dialog.showOpenDialog(mainWindow, {
-    properties: ['openFile'],
-    filters: [
-      { name: '所有文件', extensions: ['*'] },
-      { name: '逆向题目', extensions: ['apk', 'exe', 'dll', 'so', 'elf', 'pyc', 'dex', 'wasm', 'bin', 'out'] }
-    ]
+    properties: wantMulti ? ['openFile', 'multiSelections'] : ['openFile'],
+    filters: Array.isArray(filters)
+      ? filters
+      : [
+        { name: '所有文件', extensions: ['*'] },
+        { name: '逆向题目', extensions: ['apk', 'exe', 'dll', 'so', 'elf', 'pyc', 'dex', 'wasm', 'bin', 'out', 'sys'] },
+        { name: '题目材料（题面/说明/密文）', extensions: ['docx', 'pdf', 'txt', 'md', 'json', 'xml', 'png', 'jpg'] },
+      ]
   });
 
   if (result.canceled) {
     return null;
   }
-  return result.filePaths[0];
+  // 多选返回数组；单选保持返回首路径（向后兼容既有调用方）
+  return wantMulti ? result.filePaths : result.filePaths[0];
+});
+
+// 批量文件摘要（渲染层多选材料时调用）
+ipcMain.handle('file-digest', async (event, paths, opts) => {
+  try {
+    const { digestMany } = require('./file-digest');
+    const list = Array.isArray(paths) ? paths : [paths];
+    return digestMany(list, opts || {});
+  } catch (e) {
+    return { items: [], ok: 0, failed: 0, skipped: [], error: e.message };
+  }
 });
 
 // 打开外部链接（仅允许 http/https，防止 openExternal 拉起任意协议）

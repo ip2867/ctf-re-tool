@@ -16,7 +16,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   extractApkSO: (apkPath) => ipcRenderer.invoke('extract-apk-so', apkPath),
   // PYC 反汇编/常量提取（多后端回退，pycdc 失败也能出结果）
   pycDecompile: (pycPath) => ipcRenderer.invoke('pyc-decompile', pycPath),
-  selectFile: (filters) => ipcRenderer.invoke('select-file', filters),
+  selectFile: (filters, multi) => ipcRenderer.invoke('select-file', filters, multi),
+  // 批量文件摘要（多选材料时用：一次拿到每个文件的可读内容）
+  fileDigest: (paths, opts) => ipcRenderer.invoke('file-digest', paths, opts),
   getFilePath: (file) => webUtils.getPathForFile(file),
 
   // 工具调用

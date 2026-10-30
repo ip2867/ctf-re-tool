@@ -439,6 +439,24 @@ function extractZipEntries(zipPath, filterFn, outBaseDir) {
   return results;
 }
 
+// 源码类扩展名 → 语言名。
+// 这些是"人写的文本"，正确入口是**读全文按语言语义分析**，不是固件采集也不是 IDA。
+// 单独列出来（而不是塞进 TXT）是为了让提示词能给出对的方向：
+// .py 沙箱逃逸题和 .c 算法题需要完全不同的分析套路。
+const SOURCE_LANG = {
+  '.py': 'Python', '.pyw': 'Python',
+  '.sh': 'Shell', '.bash': 'Shell', '.zsh': 'Shell',
+  '.c': 'C', '.h': 'C/C++ 头文件', '.cc': 'C++', '.cpp': 'C++', '.cxx': 'C++', '.hpp': 'C++ 头文件',
+  '.go': 'Go', '.rs': 'Rust', '.rb': 'Ruby', '.php': 'PHP',
+  '.java': 'Java', '.kt': 'Kotlin', '.swift': 'Swift',
+  '.lua': 'Lua', '.pl': 'Perl', '.r': 'R',
+  '.jsx': 'JSX', '.tsx': 'TSX', '.ts': 'TypeScript', '.vue': 'Vue',
+  '.cs': 'C#', '.m': 'Objective-C', '.sql': 'SQL',
+  '.html': 'HTML', '.htm': 'HTML', '.css': 'CSS',
+  '.ini': 'INI 配置', '.conf': '配置文件', '.toml': 'TOML',
+};
+const SOURCE_EXTS = Object.keys(SOURCE_LANG);
+
 // 文件类型检测
 ipcMain.handle('detect-file-type', async (event, filePath) => {
   try {
@@ -608,6 +626,15 @@ ipcMain.handle('detect-file-type', async (event, filePath) => {
     else if (ext === '.txt' || ext === '.enc' || ext === '.log' || ext === '.md' || ext === '.csv') {
       fileType = 'TXT';
       description = '文本文件（直读内容分析：密文/编码/提示常以纯文本给出）';
+    }
+    // 源码类（.py/.sh/.c/.go/.rs/...）：**直读源码**分析，绝不进固件流程。
+    // 实测（homebrewEventLoop 的 server.py）：2322 字节 Python2 源码被识别成 UNKNOWN
+    // → 走 analyzeBIN（Kali 固件预检 + magic/熵块采集）→ 白等 2 分钟且方向全错。
+    // 源码题（协议交互/沙箱逃逸/逻辑题）的正确入口是"读全文 → 按语言语义分析"，
+    // 与 TXT 同路（analyzeXMLText 直读），只是需要标出语言以便提示词给对方向。
+    else if (SOURCE_EXTS.includes(ext)) {
+      fileType = 'SOURCE';
+      description = `源码文件（${SOURCE_LANG[ext] || '未知语言'}；直读源码按语言语义分析，不进固件/IDA 流程）`;
     }
 
     return {

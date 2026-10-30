@@ -77,13 +77,17 @@ function detectCapabilities(buf, ext) {
   return { archive, fs: fsType, pcap, pcapng, httpHint, textual, executable, firmware };
 }
 
-// route: traffic | zip | extract | local-probe | web | burp | static
+// route: traffic | zip | extract | local-probe | web | burp | static | source
 // 规则（能力优先，扩展名只作补充）：
 //   pcap 且含 HTTP → burp；pcap 纯二进制 → traffic
 //   JS/HTML → web（本地文件；有 Burp 则 burp）
 //   archive/fs → extract
-//   unknown 且无 fs 能力 → local-probe
+//   源码类扩展名 → source（直读源码，不进固件/IDA）
+//   **纯文本（textual）→ source**，绝不能落进 local-probe
+//     （实测 server.py：2322B 纯文本被判 UNKNOWN → local-probe → Kali 固件流程，
+//      白等 2 分钟且方向全错。文本题的信息就在文本里，直接读。）
 //   可执行 → static
+//   其余未知 → local-probe
 function decideRoute(input) {
   const i = input || {};
   const cap = i.capabilities || {};
@@ -93,7 +97,11 @@ function decideRoute(input) {
   if (cap.pcap) return cap.httpHint ? 'burp' : 'traffic';
   if (fileType === 'JS' || fileType === 'HTML' || /^\.(js|mjs|html?)$/i.test(ext)) return 'web';
   if (cap.archive || cap.fs) return 'extract';
+  if (fileType === 'SOURCE') return 'source';
   if (fileType === 'PE' || fileType === 'ELF' || cap.executable) return 'static';
+  // 文本能力优先于"未知探测"：纯文本永远不需要 Kali 固件预检/熵块采集。
+  // 放在 executable 之后，因为带 MZ/ELF 魔数的文件即使含可打印字节也不是"文本题"。
+  if (cap.textual) return 'source';
   if (!fsTypeCapability(cap)) return 'local-probe';
   return 'static';
 }

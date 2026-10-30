@@ -3217,6 +3217,13 @@ async function autoAnalyze() {
     await analyzeBinContainer(state.currentFile);
     return;
   }
+  if (capRoute === 'source') {
+    // 源码/纯文本：信息就在文本里，直读分析。绝不进固件流程（Kali 预检+熵块采集对它毫无意义）。
+    // 实测 server.py：UNKNOWN → analyzeBIN，白等 2 分钟且方向全错（把协议题当固件题）。
+    addLog('info', '[分诊] 检测到源码/文本内容 → 直读分析（不进固件/IDA 流程）');
+    await analyzeSourceText(state.currentFile, state.fileType);
+    return;
+  }
 
   // 根据文件类型执行不同的分析流程
   switch (state.fileType) {
@@ -3320,6 +3327,12 @@ async function autoAnalyze() {
       // （enc.txt 密文等）：直读全文喂 AI 文本分析——绝不进 Kali 固件流程
       //（ExceLLM/enc.txt 实测：UNKNOWN 落 Kali，3 次握手超时白烧 60s，而信息就在文本里）。
       await analyzeXMLText();
+      break;
+    }
+    case 'SOURCE': {
+      // 源码文件（.py/.sh/.c/.go/...）：直读全文按语言语义分析。
+      // 这类题的解法是"读懂逻辑 + 构造输入/回放协议"，与固件解包、IDA 反编译都无关。
+      await analyzeSourceText(state.currentFile, state.fileType);
       break;
     }
     case 'PCAP': {
@@ -3478,6 +3491,164 @@ ${knowledge}
   } catch (e) {
     endStreamMessage();
     addLog('error', 'XML AI 分析异常: ' + e.message);
+  } finally {
+    state.aiBusy = false;
+  }
+}
+
+// 源码扩展名 → 语言名（渲染层提示词用；与主进程 SOURCE_LANG 保持同一套语义，
+// 但这里只需覆盖常见项，未命中时回落为"未知语言"。）
+const SOURCE_LANG_HINT = {
+  '.py': 'Python', '.pyw': 'Python',
+  '.sh': 'Shell', '.bash': 'Shell', '.zsh': 'Shell',
+  '.c': 'C', '.h': 'C 头文件', '.cc': 'C++', '.cpp': 'C++', '.cxx': 'C++', '.hpp': 'C++ 头文件',
+  '.go': 'Go', '.rs': 'Rust', '.rb': 'Ruby', '.php': 'PHP',
+  '.java': 'Java', '.kt': 'Kotlin', '.swift': 'Swift',
+  '.lua': 'Lua', '.pl': 'Perl', '.r': 'R',
+  '.jsx': 'JSX', '.tsx': 'TSX', '.ts': 'TypeScript', '.vue': 'Vue',
+  '.cs': 'C#', '.m': 'Objective-C', '.sql': 'SQL',
+  '.ini': 'INI 配置', '.conf': '配置文件', '.toml': 'TOML',
+};
+
+// 源码文件分析（.py/.sh/.c/.go/…）：直读全文，按语言语义解题。
+//
+// 为什么单独一路（实测 server.py 的教训）：
+//   2322 字节的 Python2 源码被 detect-file-type 判成 UNKNOWN → analyzeBIN（Kali 固件流程）
+//   → 先等 22 端口超时，再用 magic/熵块"采集固件"，最后让 AI 对着源码猜"密文在哪"。
+//   而这类题（协议交互/沙箱逃逸/逻辑还原）的信息**全在源码里**：
+//     · 服务端逻辑、白名单、过滤器 → 直接读
+//     · 真实 flag 在远端文件里 → 本地永远解不出，必须说清楚而不是硬凑
+//   所以正确做法是：读全文 + 语言相关的分析指引 + **禁止编造验证数据**。
+//
+// 与 analyzeXMLText 的区别只在提示词：那边是"结构化数据/公式反推"，
+// 这里是"读懂程序行为 → 构造输入或复刻协议"。骨架（读全文/存证/闭环/经验）一致。
+async function analyzeSourceText(filePath, fileType) {
+  const label = (state.fileInfo && state.fileInfo.fileName) || path.basename(String(filePath || 'source'));
+  const ext = ('.' + String(label).split('.').pop()).toLowerCase();
+  const lang = SOURCE_LANG_HINT[ext] || '未知语言';
+  addSolveNote('文件', `开始分析源码：${label}（${lang}）`);
+  addLog('info', '源码直读分析流程（不进固件/IDA；信息在文本里）');
+  addLog('info', '========================================');
+
+  // [1/2] 读全文并入证据
+  let src = '';
+  let truncated = false;
+  try {
+    const rf = await window.electronAPI.readFile(filePath);
+    if (rf && rf.success) {
+      src = String(rf.content || '');
+      const LIMIT = 262144;
+      if (src.length > LIMIT) { src = src.slice(0, LIMIT); truncated = true; }
+      await caseAddEvidence('source_code', `源码原文（${lang}）`, src, 'txt');
+      addLog('success', `✅ 源码已读入并存证（${src.length} 字符${truncated ? '，已截断' : ''}）`);
+    } else {
+      addLog('warning', '源码读取失败: ' + ((rf && rf.error) || '未知'));
+    }
+  } catch (e) {
+    addLog('warning', '源码读取异常: ' + e.message);
+  }
+
+  // 伴生文件清单（同包其它文件常是关键：requirements/配置/密文/密钥）
+  const sideFiles = (Array.isArray(state._platformFiles) ? state._platformFiles : [])
+    .filter(p => String(p) !== String(filePath));
+  const sideInline = [];
+  const sideList = [];
+  for (const sp of sideFiles.slice(0, 8)) {
+    try {
+      const rf = await window.electronAPI.readFile(sp);
+      if (rf && rf.success) {
+        const body = String(rf.content || '');
+        if (body.length > 0 && body.length <= 8192) {
+          sideInline.push(`### ${sp.split(/[\\/]/).pop()}\n\`\`\`\n${body}\n\`\`\``);
+        } else {
+          sideList.push(sp);
+        }
+      } else {
+        sideList.push(sp);
+      }
+    } catch (e) { sideList.push(sp); }
+  }
+  const sideNote = (sideInline.length || sideList.length)
+    ? `\n\n## 同包伴生文件（本题材料，必须一起看）\n`
+      + (sideInline.length ? sideInline.join('\n\n') + '\n' : '')
+      + (sideList.length ? `\n其余（用 read_file 读取）：\n${sideList.map(p => `- ${p}`).join('\n')}\n` : '')
+    : '';
+
+  // [2/2] AI 求解
+  addLog('info', '[2/2] AI 读取源码并分析...');
+  const knowledge = await prefetchKnowledge(src.slice(0, 30000), 'SOURCE');
+
+  const prompt = `我正在分析一个 CTF 题目，载体是**源代码**（${lang}），不是二进制、不是固件、不是镜像。
+
+文件路径：${filePath}
+
+## 源码全文
+\`\`\`${String(ext).replace('.', '') || 'text'}
+${src || '（读取失败，请用 read_file 工具自行读取）'}
+\`\`\`${sideNote}
+${knowledge}
+
+## 分析方向（按题目类型对齐，不要套用二进制/固件的套路）
+
+这是**源码题**。二进制那套（IDA 反编译 / 花指令 / Unicorn 仿真 / 固件 binwalk / 熵块分析）
+在这里**全部不适用**——源码已经是最高层表达，直接读逻辑即可。常见子类型：
+
+| 看到什么 | 是什么题 | 怎么解 |
+|---|---|---|
+| socket / recv / send / 交互协议 / PoW | 协议交互、沙箱逃逸 | 复刻服务端逻辑，构造能通过过滤的输入；本地写脚本模拟一遍 |
+| eval / exec / 过滤白名单 / 黑名单 | 沙箱逃逸 | 列清楚**能表达什么**（字符集、可用名字、可用操作），再找表达力缺口 |
+| 一堆数学运算 / 循环 / 位运算 | 算法还原 | 判断是否可逆（只含 ^ ~ 移位 加减 交换 → 逆序回推）；含 & \| 查表 → 枚举/符号执行 |
+| 读文件 / 读环境变量 / 启动参数 | 找隐藏数据 | 看真实数据从哪来——**如果来自服务端或运行环境，本地就没有** |
+| 硬编码常量数组 | 密钥/密文 | 直接取出来解 |
+
+## ⚠️ 硬性纪律（违反即无效）
+
+1. **不得编造 [VERIFY] 数据**。[VERIFY] 的语义是"用给定算法+密钥把给定密文解出预期结果"，
+   工具会**真的本地跑一遍**。如果题目里**没有密文**（源码题常常没有，flag 在远端文件里），
+   就**必须明说"本地无密文、无法离线求解"**，而不是硬凑一个 code/ciphertext 让验证去失败。
+2. **不得把"正则模板"当成 flag**。形如 \`flag\\{[0-9a-zA-Z_]+\\}\`、\`*ctf\\{...\\}\` 的是**格式模板**，
+   真 flag 是它的一个具体实例。看到模板要说"这是格式约束，不是答案"。
+3. **区分"能本地解"与"必须打远端"**。若源码显示 flag 来自 \`open('flag')\`、数据库、
+   远端服务或环境变量，那么**本地文件里根本不存在答案**——正确输出是
+   "题型 + 完整利用链/复刻脚本 + 需要什么外部条件"，而不是硬给一个字符串。
+4. 若确实离线可解（硬编码密文、可逆算法），照常给 [FLAG] 并附 [VERIFY]。
+
+**输出契约：**
+1. flag：单独一行 \`[FLAG]flag内容[/FLAG]\`
+2. 离线可解时附 \`${VERIFY_CONTRACT}\`
+3. 必须打远端时，给出**可直接运行的完整脚本**（PoW + 利用链），并明确列出需要的地址/端口/依赖
+4. 末尾 \`[EXPERIENCE]每条一行,最多5条[/EXPERIENCE]\`
+不要臆造工具结果；工具失败就换路径继续。`;
+
+  addLog('info', '源码分析提示构建完成，长度: ' + prompt.length + ' 字符');
+
+  state.aiBusy = true;
+  beginStreamMessage();
+  const startTime = Date.now();
+  try {
+    const result = await claudeChatCascade(
+      [{ role: 'user', content: prompt }],
+      `你是CTF源码题解题专家。可调用工具：read_file 读取伴生文件，bash/run_python 执行验证脚本。\n`
+      + `关键纪律：源码题的 flag 若来自远端/环境变量，本地就是没有——必须说清楚并给出利用脚本，不要编造。\n`
+      + `解题学习闭环（强制）：回答最后必须输出 [EXPERIENCE]每条一行，格式"题型特征→关键套路/踩过的坑→下次怎么做"，最多5条、每条200字内[/EXPERIENCE]（确无新收获则写"无新增经验"）。`
+      + experienceSection()
+    );
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    addLog('info', `AI 响应完成，耗时 ${elapsed} 秒`);
+    endStreamMessage();
+    if (result.success && result.text) {
+      const clean = String(result.text).replace(/\s+/g, ' ').trim().slice(0, 4000);
+      addSolveNote('求解结果', clean);
+      state.lastAiText = result.text;
+      await finalizeSolve(result.text, { source: 'ai' });
+      addSystemMessage(`**🎯 源码分析结果**\n\n**文件**: ${label}\n\n${result.text}`);
+    } else {
+      addLog('warning', 'AI 分析未返回有效结果: ' + ((result && result.error) || '未知'));
+      endStreamMessage();
+    }
+  } catch (e) {
+    endStreamMessage();
+    addLog('error', '源码 AI 分析异常: ' + e.message);
   } finally {
     state.aiBusy = false;
   }
@@ -11878,6 +12049,20 @@ async function runNegativeAssertionCheck(aiText, opts = {}) {
   return r;
 }
 
+// 所有契约都没有密文 → 说明这题本地根本没有可解的东西。
+// 典型：源码题里 flag 来自远端 open('flag')，AI 仍按"输出契约"硬造了一个空 ciphertext 的 [VERIFY]。
+// 这时报"契约无命中"会误导下一轮去硬凑答案，应改成"本题本地无密文"。
+function contractsAllEmpty(contracts) {
+  const list = Array.isArray(contracts) ? contracts : [];
+  if (!list.length) return false;
+  return list.every(c => {
+    if (!c) return true;
+    const ct = String(c.ciphertext == null ? '' : c.ciphertext).trim();
+    // custom / node_js 的 code 自带密文时可以没有 ciphertext 字段，但那种情况通常也已失败
+    return ct === '';
+  });
+}
+
 // 验证闭环：解析 [VERIFY] → 本地复现 → 标记 flag 验证状态
 async function runVerification(aiText) {
   const contracts = parseVerifyContracts(aiText);
@@ -11904,7 +12089,14 @@ async function runVerification(aiText) {
     ? `本地复现通过（flag）：${flagHits.join(', ')}`
     : (decoyHits.length
       ? `本地复现只命中**诱饵**（非真 flag）：${decoyHits.join(', ')} —— 当前层是 decoy，真 flag 在下一层载体`
-      : (r.hits.length ? `本地复现通过（命中中间值/密钥，非 flag）：${r.hits.join(', ')}` : `本地复现失败（${contracts.length} 个契约无命中）`));
+      : (r.hits.length ? `本地复现通过（命中中间值/密钥，非 flag）：${r.hits.join(', ')}`
+        : (contractsAllEmpty(contracts)
+          // 契约本身没有密文 → 不是"解错了"，而是"这题本地没有密文可解"。
+          // 实测 server.py：AI 在压力下硬造了一个空 ciphertext 的 [VERIFY]，
+          // 工具跑完报"1 个契约无命中"，看起来像解法错误，实际是题目设计上
+          // flag 就在远端。把它报成失败会把 AI 推上去硬凑答案。
+          ? '未做本地复现：契约没有密文（本题属于"本地无密文"类型——flag 不在本地文件里）'
+          : `本地复现失败（${contracts.length} 个契约无命中）`)));
   addSolveNote('验证', note);
   addLog(flagHits.length ? 'success' : (decoyHits.length ? 'warning' : (r.hits.length ? 'info' : 'warning')), `[验证闭环] ${note}`);
 

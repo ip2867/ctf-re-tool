@@ -8478,6 +8478,105 @@ ${result.text}`;
   }
 }
 
+// 兜底补取函数：当 list_funcs 返回的条目**全部**落在映像外时（IDA 把未定义的外部符号
+// 合成到虚拟地址末尾，list_funcs 又按地址排序，于是第一页全是一排 PLT 桩），
+// 不能就此放弃——真实函数还在 .text 里，只是没被返回。
+//
+// 实测（ByteCTF2019 easy_rust）：
+//   .bss 到 0x36208 结束；IDA 把 pthread_getattr_np 等合成到 0x362a8 起
+//   → 77/77 全被剔除 → funcs=[] → "无有效数据"短路 → 整题放弃。
+//   而 .text 是 0x5140-0x25095，里面全是真实函数（Rust 已 strip 符号，名字是 sub_xxx）。
+//
+// 策略：直接问 IDA 要"所有落在可执行段内的函数"（py_eval，不依赖插件前端过滤/分页）。
+// 这样做是安全的：段边界来自 IDA 自己的加载结果，比我们解析 PT_LOAD 更贴合实际。
+async function rescueFunctionsFromIda(filePath, imgMap) {
+  const out = [];
+  // 我们自己的可执行段范围（用于二次过滤，防 IDA 会话串台时又混进别人的函数）
+  let textLo = 0, textHi = 0;
+  const secs = (imgMap && imgMap.sections) || [];
+  for (const s of secs) {
+    if (s.executable && (s.vsize || 0) > 0) {
+      const a = imgMap.vaIsAbsolute ? s.va : imgMap.imageBase + s.va;
+      const b = a + s.vsize;
+      if (!textLo || a < textLo) textLo = a;
+      if (b > textHi) textHi = b;
+    }
+  }
+  const inText = (addr) => !textLo || (addr >= textLo && addr < textHi);
+
+  // ── 路线 A：py_eval 直接问 IDA 要可执行段内所有函数（最可靠）──
+  try {
+    const code = [
+      'import idautils, ida_funcs, idc, ida_segment',
+      '_out = []',
+      '_segs = []',
+      'for _s in idautils.Segments():',
+      '    _sg = ida_segment.getseg(_s)',
+      '    if _sg is None: continue',
+      '    if _sg.perm & ida_segment.SEGPERM_EXEC:',
+      '        _segs.append((_sg.start_ea, _sg.end_ea))',
+      'print("EXEC_SEGS", len(_segs))',
+      'for _ea in idautils.Functions():',
+      '    for (_a, _b) in _segs:',
+      '        if _a <= _ea < _b:',
+      '            _fn = ida_funcs.get_func(_ea)',
+      '            _nm = idc.get_func_name(_ea) or ("sub_%X" % _ea)',
+      '            _sz = (_fn.end_ea - _fn.start_ea) if _fn else 0',
+      '            _out.append((_ea, _sz, _nm))',
+      '            break',
+      'print("EXEC_FUNCS", len(_out))',
+      'for (_ea, _sz, _nm) in _out[:8000]:',
+      '    print("FN %#x %d %s" % (_ea, _sz, _nm))',
+    ].join('\n');
+    const r = await window.electronAPI.idaMcpCall('py_eval', { code });
+    const txt = (r && r.success) ? String(r.result || '') : '';
+    if (txt) {
+      const re = /^FN\s+(0x[0-9a-fA-F]+)\s+(\d+)\s+(.+)$/gm;
+      let m;
+      while ((m = re.exec(txt)) !== null) {
+        const addr = parseInt(m[1], 16);
+        if (!inText(addr)) continue;
+        out.push({ address: m[1], name: String(m[3]).trim(), size: Number(m[2]) || 0 });
+      }
+      if (out.length) {
+        addLog('info', `[IDA] 兜底补取（py_eval）：可执行段 ${hexOr(textLo)}-${hexOr(textHi)} 内枚举到 ${out.length} 个函数`);
+        return out;
+      }
+      const segN = (/EXEC_SEGS\s+(\d+)/.exec(txt) || [])[1];
+      const fnN = (/EXEC_FUNCS\s+(\d+)/.exec(txt) || [])[1];
+      addLog('warning', `[IDA] py_eval 返回可执行段 ${segN || '?'} 个 / 段内函数 ${fnN || '?'} 个，可用 ${out.length} 个`);
+    } else {
+      addLog('warning', '[IDA] py_eval 无返回（可能未启用 py_eval 扩展），改用 list_funcs 大页重取');
+    }
+  } catch (e) {
+    addLog('warning', '[IDA] py_eval 补取失败，改用 list_funcs 大页重取: ' + e.message);
+  }
+
+  // ── 路线 B：list_funcs 用大 count 再取一次，自己做落界（不依赖 py_eval）──
+  try {
+    const r = await window.electronAPI.idaMcpCallPaged('list_functions', { queries: {} });
+    const raw = (r && Array.isArray(r.result)) ? r.result : [];
+    for (const f of raw) {
+      const addr = parseAddrLoose(f && (f.address != null ? f.address : f.addr));
+      if (!Number.isFinite(addr) || !inText(addr)) continue;
+      out.push(f);
+    }
+    if (out.length) {
+      addLog('info', `[IDA] 兜底补取（list_funcs）：${raw.length} 条中 ${out.length} 条落在可执行段内`);
+    } else {
+      addLog('warning', `[IDA] 兜底补取为空：list_funcs 共 ${raw.length} 条，无一落在 ${hexOr(textLo)}-${hexOr(textHi)}。`
+        + '该文件可能确实只有导入桩（或被加壳/未完成自动分析）');
+    }
+  } catch (e) {
+    addLog('warning', '[IDA] list_funcs 补取失败: ' + e.message);
+  }
+  return out;
+}
+
+function hexOr(n) {
+  return Number.isFinite(n) && n > 0 ? '0x' + n.toString(16) : '?';
+}
+
 // 自动求解PE/ELF flag（混合方案）
 async function autoSolveBinaryFlag(fileType) {
   if (!state.currentFile) {
@@ -8523,13 +8622,30 @@ async function autoSolveBinaryFlag(fileType) {
           const { kept, dropped } = filterFunctionsInImage(funcs, im.map);
           if (dropped.length) {
             addLog('warning', `[IDA] 越界地址 ${dropped.length}/${funcs.length} 个不在映像内`
-              + `（ImageBase=0x${im.map.imageBase.toString(16)}, SizeOfImage=0x${im.map.sizeOfImage.toString(16)}），判定为串台，已剔除`);
+              + `（ImageBase=0x${im.map.imageBase.toString(16)}, SizeOfImage=0x${im.map.sizeOfImage.toString(16)}）`);
             const sample = dropped.slice(0, 3).map(f => {
               const a = (f && (f.address != null ? f.address : f.addr)) || '?';
               return String(a);
             }).join(', ');
             addLog('warning', `[IDA] 越界样例: ${sample}`);
             funcs = kept;
+          }
+          // ⚠️ 全部被剔除 ≠ 串台。实测（ByteCTF2019 easy_rust）：
+          //   .bss 到 0x36208 结束，但 IDA 把未定义的外部符号合成到 0x362a8 起，
+          //   list_funcs 第一页返回的正是一排 PLT 桩（pthread_* 等）→ 77/77 全越界。
+          //   真实主体函数在 .text（0x5140-0x25095）里，却一条都没取到。
+          // 旧行为：直接 funcs=[] → 后续"无有效数据"短路 → 整题放弃。
+          // 正确做法：把"全部越界"当成**函数表不可用**的信号，改用 IDA 自己的
+          //   内存分段重建候选范围，再按地址区段补取（而不是放弃）。
+          if (!funcs.length) {
+            addLog('warning', '[IDA] 函数全部越界——判定为「IDA 合成条目」（非串台），改用 IDA 段边界补取真实函数');
+            const rescued = await rescueFunctionsFromIda(state.currentFile, im.map);
+            if (rescued.length) {
+              funcs = rescued;
+              addLog('success', `[IDA] 兜底补取到 ${rescued.length} 个函数（来自 IDA 段内地址）`);
+            } else {
+              addLog('warning', '[IDA] 兜底补取仍为空：该文件可能确实只有导入桩（或被加壳），继续走字符串/字节路径');
+            }
           }
         }
       } catch (e) { /* 映像解析失败不阻塞，但也不再声称"地址已验证" */ }
@@ -13229,6 +13345,21 @@ async function decompileEntryFunction(functionList) {
       if (!n) continue;
       if (/^_*(win)?main(@\d+)?$/i.test(n) && !candidates.includes(n)) candidates.push(n);
     }
+    // ── Rust：没有 C 风格 main 符号 ──
+    // 实测（ByteCTF2019 easy_rust）：入口是个 mangled 名（_ZN...4main17h...E），
+    // 候选表全是 C/C++ 风格 → 8 次 decompile 全部 "Not found" → 认定"没有入口函数"。
+    // Rust 的实际入口链是：_start → __libc_start_main → lang_start → 用户的 main。
+    // 这里把 mangled main / lang_start / rust_eh_personality 相邻的候选都加进来，
+    // 并优先选"demangle 后含 main 且不是 lang_start 包装"的那个。
+    const rustMangledMain = [];
+    for (const f of functionList) {
+      const n = String((f && f.name) || '');
+      if (!n) continue;
+      if (/^_ZN.*4main\d*h[0-9a-f]+E$/i.test(n)) rustMangledMain.push(n);
+      else if (/lang_start|rust_eh_personality|rust_begin_unwind/i.test(n) && !candidates.includes(n)) candidates.push(n);
+    }
+    // mangled main 排在 C 风格 main 之后、CRT 桩之前（它们最可能是本题逻辑入口）
+    for (const n of rustMangledMain) if (!candidates.includes(n)) candidates.push(n);
   }
   // 最后才考虑 CRT 启动桩
   candidates.push('_WinMainCRTStartup', '__tmainCRTStartup', '_mainCRTStartup', 'start', '_start');
@@ -13318,6 +13449,12 @@ function selectKeyFunctions(funcs, limit) {
     if (/encrypt|decrypt|encode|decode|crypt|cipher|flag|key|check|verify|hash|digest|md5|sha\d?|base64|rc4|tea|aes|sm4/i.test(n)) s += 4;
     if (/vm_|operad|operand|opcode|bytecode|dispatch|handler|interp|exec|eval|table|scramble|obfuscat|translat|transform/i.test(n)) s += 3;
     if (/^_*(win)?main(_?crtstartup)?(@\d+)?$/i.test(n) || /^_?start$/i.test(n)) s += 2;
+    // Rust：入口是 mangled 名（_ZN..4main17h..E），C 风格正则匹配不到 → 单独加权。
+    // lang_start 是 std 的包装（调用用户 main），加权略低但仍要能被选中。
+    if (/^_ZN.*4main\d*h[0-9a-f]+E$/i.test(n)) s += 5;
+    else if (/lang_start/i.test(n)) s += 2;
+    // Rust 的 crate 私有函数也是 _ZN...E 形态；给基础分避免被 C 风格 sub_* 挤掉。
+    else if (/^_ZN.*E$/i.test(n) && sz >= 60) s += 1;
     // 对话框/窗口过程是**校验逻辑最常见的落点**（按钮点击 → 校验）。
     // 实测：30 个 sub_*(0x150) + DialogFunc(0xa9) 时，+3 仍全被 sub_* 挤出 top10；
     // 必须 +5 才能让 DialogFunc 进入（sub_*=4 分，DialogFunc=5 分）。

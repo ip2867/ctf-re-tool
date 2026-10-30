@@ -2429,6 +2429,51 @@ function switchTab(tabId) {
   });
 }
 
+// 消息里带绝对路径 → 自动打开。
+//
+// 返回值约定（决定 processUserMessage 后续怎么走）：
+//   'opened-and-handled' —— 已经载入并跑完分析，调用方直接 return
+//   'opened'             —— 只是载入了文件，后续快捷命令继续处理
+//   null                 —— 消息里没有可用路径，或载入失败（保持原行为）
+async function tryOpenPathFromMessage(message) {
+  try {
+    if (!window.electronAPI.resolveMessagePath) return null;
+    const r = await window.electronAPI.resolveMessagePath(message);
+    if (!r || !r.success || !r.path) {
+      // 有路径但不存在时，明确告知（否则又是"他不理我"）
+      if (r && r.reason && r.candidates && r.candidates.length) {
+        addLog('warning', `消息里的路径无法使用：${r.reason}`);
+        addSystemMessage(`**⚠️ 找不到这个路径**\n\n\`${r.reason}\`\n\n`
+          + (r.tried && r.tried.length ? `已尝试：\n${r.tried.map(p => '- `' + p + '`').join('\n')}\n\n` : '')
+          + '请确认路径是否正确（可以直接把文件拖进窗口，或用「选择文件」按钮）。');
+      }
+      return null;
+    }
+
+    const same = state.currentFile && String(state.currentFile) === String(r.path);
+    if (same) return 'opened';   // 已经是当前文件，不重复载入
+
+    addLog('info', `消息中检测到路径，自动载入: ${r.path}`);
+    if (r.pickedFromDir) {
+      addLog('info', `（从目录挑出主文件：${r.pickedFromDir}）`);
+    }
+    if (Array.isArray(r.dirFiles) && r.dirFiles.length > 1) {
+      addLog('info', `候选文件 ${r.dirFiles.length} 个：`
+        + r.dirFiles.slice(0, 8).map(f => f.name).join(', ')
+        + (r.dirFiles.length > 8 ? ' …' : ''));
+    }
+
+    // 走标准载入流程（它会做类型检测/CASE 目录/UI 更新）
+    await analyzeFile(r.path);
+    // 载入成功后会同步 state.currentFile；若仍为空说明载入失败
+    if (state.currentFile) return 'opened';
+    return null;
+  } catch (e) {
+    addLog('warning', '解析消息中的路径失败: ' + e.message);
+    return null;
+  }
+}
+
 // 发送消息（AI 请求进行中时，再次点击发送 = 请求停止）
 async function sendMessage() {
   const input = document.getElementById('chat-input');
@@ -2459,6 +2504,15 @@ async function processUserMessage(message) {
   const lowerMessage = message.toLowerCase();
   // 词边界匹配工具（必须先于所有使用点声明，否则 TDZ 崩溃）
   const hasWord = (w) => new RegExp('(^|[^a-z0-9])' + w + '($|[^a-z0-9])').test(lowerMessage);
+
+  // ⚠ 最先做：消息里带绝对路径 → 自动打开它。
+  // 为什么放最前面：用户最自然的交互就是把路径写在聊天里
+  //   E:\ctf\...\驱动逆向 这个有两个文件是一道ctf逆向题目，你打开后求解flag
+  // 而下面的快捷命令（"求解flag" → autoAnalyze）只认对话框选中的文件，
+  // 于是直接打印「请先选择文件」什么都不做 —— 用户看到的就是"他不理我"。
+  // 这里先解析路径并载入，后续快捷命令才有 currentFile 可用。
+  const autoOpened = await tryOpenPathFromMessage(message);
+  if (autoOpened === 'opened-and-handled') return;
 
   // 简单命令直接处理（不需要AI理解）
   if (lowerMessage === '分析' || lowerMessage === '自动分析' || lowerMessage === 'analyze') {

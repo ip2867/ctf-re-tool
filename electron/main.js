@@ -457,6 +457,134 @@ const SOURCE_LANG = {
 };
 const SOURCE_EXTS = Object.keys(SOURCE_LANG);
 
+// 从自然语言消息里解析"要分析哪个文件"。
+//
+// 为什么需要：用户最自然的交互是把路径直接写在聊天里
+//   E:\ctf\...\驱动逆向\attachment_x\驱动逆向 这个有两个文件是一道ctf逆向题目，你打开后求解flag
+// 旧实现只认对话框选中的文件 → 命中"求解flag"快捷命令 → autoAnalyze() → 「请先选择文件」
+// → 用户看到的就是"他不理我"。
+//
+// 返回 { success, path, kind, candidates, expanded }
+//   · 路径存在且是文件 → path 就是它
+//   · 路径存在且是目录 → 自动展开，挑出"最像题目主文件"的一个（见 pickMainFile）
+//   · 都不存在 → success:false，但要说明"哪几个候选试过了"，避免静默失败
+ipcMain.handle('resolve-message-path', async (event, message) => {
+  try {
+    const { pickPathFromMessage, extractPaths } = require('./path-intent');
+    const pick = pickPathFromMessage(message);
+    if (!pick) return { success: false, reason: '消息里没有绝对路径' };
+
+    const tried = [];
+    const tryOne = (p) => {
+      tried.push(p);
+      try {
+        if (!fs.existsSync(p)) return null;
+        const st = fs.statSync(p);
+        return { p, isDir: st.isDirectory(), size: st.size };
+      } catch (e) { return null; }
+    };
+
+    // 先试挑中的那个，再试消息里的其它候选（用户常先说目录再说文件）
+    let hit = tryOne(pick.path);
+    if (!hit) {
+      for (const p of pick.all) {
+        if (p === pick.path) continue;
+        hit = tryOne(p);
+        if (hit) break;
+      }
+    }
+    // 仍找不到：试着把路径尾部当作"目录 + 子名"，或用上层传入的 base 目录拼
+    if (!hit) {
+      return {
+        success: false,
+        reason: `路径不存在：${pick.path}`,
+        candidates: pick.all,
+        tried,
+      };
+    }
+
+    if (!hit.isDir) {
+      return { success: true, path: hit.p, kind: 'file', candidates: pick.all, tried };
+    }
+
+    // 目录：展开，挑主文件
+    let entries = [];
+    try { entries = fs.readdirSync(hit.p, { withFileTypes: true }); } catch (e) { entries = []; }
+    const files = [];
+    const subdirs = [];
+    for (const ent of entries) {
+      const full = path.join(hit.p, ent.name);
+      if (ent.isDirectory()) subdirs.push(full);
+      else {
+        let size = 0;
+        try { size = fs.statSync(full).size; } catch (e) { size = 0; }
+        files.push({ path: full, name: ent.name, size });
+      }
+    }
+    const best = pickMainFile(files);
+    if (best) {
+      return {
+        success: true, path: best.path, kind: 'file',
+        pickedFromDir: hit.p, candidates: pick.all, tried,
+        dirFiles: files.map(f => ({ name: f.name, size: f.size })),
+      };
+    }
+    // 目录里没文件（只有子目录）→ 往下钻一层
+    for (const sd of subdirs.slice(0, 6)) {
+      try {
+        const subs = fs.readdirSync(sd)
+          .map(n => {
+            const full = path.join(sd, n);
+            let size = 0, isDir = false;
+            try { const st2 = fs.statSync(full); size = st2.size; isDir = st2.isDirectory(); } catch (e) { }
+            return isDir ? null : { path: full, name: n, size };
+          })
+          .filter(Boolean);
+        const b2 = pickMainFile(subs);
+        if (b2) {
+          return {
+            success: true, path: b2.path, kind: 'file',
+            pickedFromDir: sd, candidates: pick.all, tried,
+            dirFiles: subs.map(f => ({ name: f.name, size: f.size })),
+          };
+        }
+      } catch (e) { /* 单个子目录失败不影响其它 */ }
+    }
+    return {
+      success: false,
+      reason: `目录里没找到可分析的文件：${hit.p}`,
+      candidates: pick.all, tried,
+      dirFiles: files.map(f => ({ name: f.name, size: f.size })),
+    };
+  } catch (e) {
+    return { success: false, reason: e.message };
+  }
+});
+
+// 从目录的文件列表里挑"最像题目主文件"的那个。
+// 规则：可执行/题意载体优先，纯文档（说明/图片）垫底。
+function pickMainFile(files) {
+  if (!Array.isArray(files) || !files.length) return null;
+  const score = (f) => {
+    const n = String(f.name || '').toLowerCase();
+    let s = 0;
+    // 明确的可分析载体
+    if (/\.(apk|exe|dll|elf|so|out|bin|py|pyc|dex|jar|wasm|luac|class)$/.test(n)) s += 10;
+    else if (/\.(c|cpp|h|hpp|go|rs|js|mjs|html?|php|rb|lua|sh|txt|enc|json|xml|pcap|pcapng)$/.test(n)) s += 6;
+    // 说明/图片/压缩包：通常是材料而非主文件
+    if (/\.(md|png|jpg|jpeg|gif|bmp|svg|pdf|docx?|pptx?|xlsx?)$/.test(n)) s -= 8;
+    if (/\.(zip|rar|7z|tar|gz)$/.test(n)) s -= 3;
+    // 名字像说明文件的
+    if (/^(readme|说明|instructions?|hint|题目描述|writeup)/i.test(n)) s -= 10;
+    // 体积：太小可能是碎片，太大可能是素材；中间区间给一点分
+    if (f.size > 1024) s += 2;
+    if (f.size > 100 * 1024) s += 1;
+    return s;
+  };
+  const sorted = files.slice().sort((a, b) => score(b) - score(a) || b.size - a.size);
+  return sorted[0] || null;
+}
+
 // 文件类型检测
 ipcMain.handle('detect-file-type', async (event, filePath) => {
   try {

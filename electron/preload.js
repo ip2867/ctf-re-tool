@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // 文件分析
   detectFileType: (filePath) => ipcRenderer.invoke('detect-file-type', filePath),
+  // 从聊天消息里解析"要分析哪个文件"（目录会自动展开挑主文件）
+  resolveMessagePath: (message) => ipcRenderer.invoke('resolve-message-path', message),
   // 加密算法指纹扫描（读文件字节，确定性识别 SM4/AES/SM3/TEA… 及"本层无指纹=可能是壳"）
   scanCryptoFingerprints: (filePath) => ipcRenderer.invoke('scan-crypto-fingerprints', filePath),
   getFileInfo: (filePath) => ipcRenderer.invoke('get-file-info', filePath),

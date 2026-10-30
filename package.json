@@ -1,6 +1,6 @@
 {
   "name": "ctf-reverse-tool",
-  "version": "1.9.2",
+  "version": "1.9.3",
   "description": "CTF 逆向 AI 解题工作台：Electron 桌面应用，AI 工具循环（Tool-Use）+ 本地验证闭环，通过 MCP 接入 IDA/JEB/Burp，内置 11 个逆向方法论技能与可检索知识库，支持本地 PE 与 Kali 远程 ELF 定向动态调试",
   "main": "electron/main.js",
   "author": "ip2867",

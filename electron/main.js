@@ -3270,6 +3270,7 @@ function toolLabel(name, input) {
     case 'angr_solve': return 'angr 求解 ' + short(i.binary ? path.basename(i.binary) : '', 30);
     case 'emu_trace': return '执行轨迹 ' + short(i.binary ? path.basename(i.binary) : '', 28) + (i.start ? ' @' + short(i.start, 12) : '');
     case 'ida_apply_trace': return '回填轨迹到 IDA';
+    case 'rev_solve': return '可逆逆推' + (Array.isArray(i.ops) ? `（${i.ops.length} 条算子）` : '');
     case 'ida_get_bytes': return 'IDA 读取字节 ' + short(i.address, 30);
     case 'ida_list_functions': return 'IDA 列出函数';
     case 'ida_find_strings': return 'IDA 查找字符串 ' + short(i.keyword || i.pattern || '', 30);
@@ -6288,7 +6289,7 @@ function parseTextToolCalls(rawText) {
     'jeb_get_exported_activities', 'jeb_get_all_classes', 'jeb_get_class_methods',
     'ida_decompile', 'ida_list_functions', 'ida_find_strings', 'ida_get_xrefs', 'ida_get_bytes',
     'ida_list_globals', 'ida_disasm', 'ida_dbg', 'ida_dbg_mem', 'ida_open_file', 'angr_solve',
-    'emu_trace', 'ida_apply_trace',
+    'emu_trace', 'ida_apply_trace', 'rev_solve',
     'remote_exec', 'traffic_extract', 'recipe', 'gui_input', 'crypto',
     'browser_search', 'browser_open', 'run_command', 'run_python', 'adb_command', 'frida_hook',
     'read_skill', 'wiki_search', 'wiki_read', 'burp_get_history', 'burp_get_message', 'burp_call',
@@ -6302,7 +6303,7 @@ function parseTextToolCalls(rawText) {
     ida_get_bytes: 'address', ida_find_strings: 'regex', frida_hook: 'script', adb_command: 'command',
     ida_disasm: 'address', ida_dbg: 'action', ida_dbg_mem: 'action', remote_exec: 'command', traffic_extract: 'path',
     ida_list_globals: 'filter', ida_open_file: 'path', angr_solve: 'binary',
-    emu_trace: 'binary', ida_apply_trace: 'trace'
+    emu_trace: 'binary', ida_apply_trace: 'trace', rev_solve: 'ops'
   };
   // 标记：<｜｜tool▁calls▁begin｜｜> / <|tool_calls_begin|> / 变体（全角/半角竖线、▁/_ 分隔）
   const MARK = /<\s*[|｜]\s*[|｜]?\s*tool[\u2581_ ]?calls[\u2581_ ]?begin\s*[|｜]?\s*[|｜]\s*>/gi;
@@ -6576,6 +6577,16 @@ function precheckToolCall(name, input) {
       return 'mode=function 需要 start（要调用的函数地址，如 0x401006）。'
         + '不确定就用 ida_list_functions 找一个"参数是输入、返回值像结果"的函数；'
         + '或改用 mode="entry" 从入口跑（仅静态链接目标可靠）。';
+    }
+  }
+  if (name === 'rev_solve') {
+    if (!Array.isArray(i.ops) || !i.ops.length) {
+      return 'rev_solve 需要 ops（循环体算子列表），如 '
+        + '[{op:"xor",dst:"Y",src:"X"},{op:"not",reg:"X"},{op:"swap_add",a:"X",b:"Y"}]。'
+        + '先判断循环体是否只含 ^ ~ 移位 加减 交换——含 & | 查表就不能这样逆，改用 angr_solve。';
+    }
+    if (i.target == null && i.init == null) {
+      return 'rev_solve 需要 target（目标值数组）或 init（已知初值，只回代验证）。';
     }
   }
   if (name === 'ida_apply_trace') {
@@ -7656,6 +7667,35 @@ function getToolDefinitions() {
       }
     },
     {
+      name: "rev_solve",
+      description:
+        "**可逆循环逆推**：校验主体是 N 轮循环、循环体只由双射算子组成时，从目标值逆序回退直接还原输入。\n" +
+        "为什么优先用它：能倒着走就别上 Z3/angr——几千轮也只是几毫秒，而符号执行常要几百秒还可能失败。\n" +
+        "支持的算子（op 字段）：\n" +
+        "  xor（dst^=src）/ xor_const / xor_cond_not（dst ^= ~src if src 偶 else src）/\n" +
+        "  not（reg=~reg）/ rotl_single / rotr_single / rotl_cross（(hi,lo) 当整体循环左移 1）/\n" +
+        "  add / sub / swap / swap_add（t=a; a=b; b=b+a）/ mul_const（仅奇数）\n" +
+        "**不能逆**的情形：循环体含 `& 掩码`、`| 或`、查表/S-box、单向哈希——这些请改用 angr_solve。\n" +
+        "生成的脚本会先做「正逆互逆」自检（不依赖目标值），再反解，最后回代验证；\n" +
+        "只有 VERIFY=PASS 才是真解。参数：regs / width / rounds / target / ops。",
+      input_schema: {
+        type: "object",
+        properties: {
+          ops: {
+            description: "循环体算子（按正向顺序）。例：[{op:'xor',dst:'Y',src:'X'},{op:'not',reg:'X'},{op:'swap_add',a:'X',b:'Y'}]"
+          },
+          regs: { description: "寄存器名数组（默认 ['X','Y']）" },
+          width: { type: "number", description: "位宽 8/16/32/64（默认 64）" },
+          rounds: { type: "number", description: "循环轮数（默认 1）" },
+          target: { description: "目标值数组，顺序对应 regs" },
+          init: { description: "已知初值（可选；给出则跳过反解，只回代验证）" },
+          pack: { type: "boolean", description: "是否打包成字节输出（默认 true）" },
+          endian: { type: "string", enum: ["little", "big"], description: "打包字节序（默认 little）" }
+        },
+        required: ["ops"]
+      }
+    },
+    {
       name: "emu_trace",
       description:
         "用 Unicorn 真跑目标，记录**运行期地面真值**：每个间接跳转点实际去了哪里、全部控制流边、执行过的区间。\n" +
@@ -8704,6 +8744,42 @@ async function executeToolCall(toolName, input) {
         } catch (err) {
           return `browser_js 失败: ${err.message}`;
         }
+      }
+
+      // ══════ 可逆循环逆推 ══════
+      case 'rev_solve': {
+        const { buildRevSolveScript } = require('./rev-loop');
+        const r = buildRevSolveScript(input);
+        if (r.error) return `参数错误：${r.error}`;
+        let saved = '';
+        try {
+          const dir = currentCaseDir || currentWorkDir;
+          if (dir) {
+            fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
+            const p = path.join(dir, 'scripts', 'rev_solve.py');
+            fs.writeFileSync(p, r.script, 'utf8');
+            saved = p;
+          }
+        } catch (e) { /* 落盘失败不影响返回脚本 */ }
+        const L = [];
+        L.push('## rev_solve 脚本已生成（未执行）');
+        L.push('');
+        L.push('```python');
+        L.push(r.script);
+        L.push('```');
+        L.push('');
+        L.push(`参数：regs=${r.meta.regs.join(',')} / width=${r.meta.width} / rounds=${r.meta.rounds} / ops=${r.meta.opCount} 条`);
+        L.push('');
+        L.push('## 用法');
+        L.push('`run_python({script:<上面的内容>})`，看三行输出：');
+        L.push('- `SELFCHECK_OK` —— 正逆互逆通过（不通过说明算子表写错，别信后面的数）');
+        L.push('- `VERIFY = PASS` —— 回代精确命中目标（这才算真解）');
+        L.push('- `INPUT_TXT` / `INPUT_HEX` —— 解出的输入');
+        if (saved) L.push(`（脚本已落盘：${saved}）`);
+        L.push('');
+        L.push('## 设计要点');
+        for (const n of r.notes) L.push('- ' + n);
+        return L.join('\n');
       }
 
       // ══════ 执行轨迹（分段 dispatch / VM 混淆的核心链路）══════

@@ -9518,6 +9518,17 @@ ${sideFilesBlock}
    **确认模型与真实程序一致**——这一步能挡住绝大多数"抄错常量/看错方向"的错误；
 3. 写逆函数 \`g(目标)\` 逐轮回退，得到输入后打包成字节再跑一次真实程序验证。
 
+**别手写逆函数，用 \`rev_solve\`**——手写极易把逆向顺序写错（尤其"交换后相加"、
+"交叉循环移位"），错了以后回代失败却不知道错在哪一步：
+
+\`rev_solve({regs:["X","Y"], width:64, rounds:N, ops:[{op:"xor_cond_not",dst:"Y",src:"X"},{op:"not",reg:"X"},{op:"rotl_cross",hi:"X",lo:"Y"},{op:"swap_add",a:"X",b:"Y"}], target:[目标X,目标Y]})\`
+
+生成脚本后用 run_python 跑，**必须看到两行才算真解**：
+\`SELFCHECK_OK\`（正逆互逆通过；不通过=算子表写错，别信后面的数）和 \`VERIFY = PASS\`（回代精确命中目标）。
+可用算子：xor / xor_const / xor_cond_not / not / rotl_single / rotr_single /
+rotl_cross / rotr_cross / add / sub / swap / swap_add / mul_const（仅奇数）。
+**含 \`& 掩码\`、\`| 或\`、查表/S-box 的循环不能这样逆**（信息已丢失），转 angr_solve。
+
 只有在出现 \`& | *\`、查表、S-box 这类**不可逆**操作时，才转去 \`angr_solve\`。
 先问一句"这个循环能不能倒着走"，往往能省掉几百秒的符号执行。
 - \`ida_dbg_mem({action:"read", regions:[{addr:"0x401000", size:32}]})\`：读内存（返回带空格的 hex）；

@@ -11265,7 +11265,19 @@ def dec_node_js(code, inp):
         except Exception:
             pass
 
-FLAG_RE = re.compile(rb"(?:nctf|flag|ctf|nssctf|sctf|dasctf|hgame|iscc|sictf|moectf|hnctf|bjdctf|gwht|picoctf|cyberpeace)\\{[^}\\s]{1,200}\\}", re.I)
+# ⚠️ 前缀必须从「标识符边界」开始，否则会被截断成已知前缀。
+#   实测：bytectf{d0f2...} 曾被下面这条正则匹配成 ctf{d0f2...}（丢掉 "byte"），
+#   xmctf{yy} 被匹配成 ctf{yy}。后果很隐蔽——本地复现脚本打印的是截断版，
+#   而验证闭环用「答案出现在复现输出里」的子串判定，于是截断版也能被认成"已验证"，
+#   最后交上去的 flag 是错的。这不是某一题的问题：任何「前缀尾部恰好是已知前缀」的
+#   赛题（bytectf / xmctf / ...{）都会中招。
+#   修法：先用「标识符 + 花括号」整词匹配（左侧不许紧邻字母数字下划线），
+#   已知前缀列表只作兜底（极端情况下前缀不是合法标识符时仍能命中）。
+FLAG_RE = re.compile(
+    rb"(?<![A-Za-z0-9_])"
+    rb"(?:[A-Za-z][A-Za-z0-9_]{1,24}\\{[^}\\s]{1,200}\\}"
+    rb"|(?:nctf|flag|ctf|nssctf|sctf|dasctf|hgame|iscc|sictf|moectf|hnctf|bjdctf|gwht|picoctf|cyberpeace)\\{[^}\\s]{1,200}\\})",
+    re.I)
 
 def printable(b):
     try:
@@ -13460,10 +13472,18 @@ async function pruneExperience(keep) {
   }
 }
 
-// flag 提取：支持 flag/ctf/NSSCTF/SCTF/DASCTF 等常见前缀，去重
+// flag 提取：支持任意 prefix{...}（flag/ctf/NSSCTF/SCTF/DASCTF/bytectf/xmctf...），去重
+//
+// ⚠️ 不能只用"已知前缀列表"，否则会被截断或漏掉：
+//   · 用 `\b(?:flag|ctf|...)\{` 时，`bytectf{d0f2...}` 里 `ctf` 左边是 `e`（同为单词字符），
+//     `\b` 不成立 → 整条**匹配不到**，flag 直接丢失；
+//   · 若换成不带边界的列表式，`bytectf{...}` 会被截成 `ctf{...}`（丢掉 "byte"），
+//     而下游"答案出现在复现输出里"是子串判定，截断版也会被认成已验证。
+//   正确做法：通用「标识符 + 花括号」形态，左侧禁止紧邻标识符字符（防止从中间切开），
+//   已知前缀列表已不需要——前缀只要是 `[A-Za-z][A-Za-z0-9_]*` 就能提取。
 function extractFlags(text) {
   const out = [];
-  const re = /\b(?:flag|ctf|nssctf|sctf|dasctf|hgame|iscc|sictf|moectf|hnctf|bjdctf|gwht|picoctf|cyberpeace)\{[^}\s]{1,200}\}/gi;
+  const re = /(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_]{1,24}\{[^}\s]{1,200}\}/g;
   let m;
   const s = String(text || '');
   // 过滤占位符/模板（如 flag{...}、flag{?????}、flag{xxxxxxxxx}、flag{?????????}），

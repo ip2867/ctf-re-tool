@@ -3658,18 +3658,19 @@ async function analyzeXMLText() {
   let sideInline = '';
   const sideList = [];
   for (const sp of sideFiles.slice(0, 6)) {
+    const base = String(sp).split(/[\\/]/).pop();
     try {
-      const rf = await window.electronAPI.readFile(sp);
-      if (rf && rf.success) {
-        const body = String(rf.content || '');
-        const isTexty = body.length > 0 && !/[\x00-\x08\x0e-\x1f]/.test(body.slice(0, 400));
-        if (isTexty && body.length <= 8192) {
-          sideInline += `\n### ${String(sp).split(/[\\/]/).pop()}（内联全文，${body.length} 字符）\n\`\`\`\n${body}\n\`\`\`\n`;
-        } else {
-          sideList.push(`${sp}（${body.length} 字符${isTexty ? '' : '，二进制'}）`);
-        }
+      // 统一走 file_digest：docx/pdf/xlsx 也能提取正文，不再受"8KB + 纯文本"限制
+      const dg = await window.electronAPI.fileDigest([sp]);
+      const it = dg && dg.items && dg.items[0];
+      if (it && it.ok && it.text && it.text.trim()) {
+        const cap = ['docx', 'xlsx', 'pptx', 'pdf'].includes(it.kind) ? 12000 : 8000;
+        sideInline += `\n### ${base}（${it.kind}，${it.size} 字节）\n\`\`\`\n${it.text.slice(0, cap)}\n\`\`\`\n`;
+      } else if (it && it.ok && it.kind === 'binary') {
+        sideInline += `\n### ${base}（二进制：${it.magic || '未知'}，熵 ${it.entropy}，${it.size} 字节）\n`
+          + '\`\`\`\n' + (it.strings || []).slice(0, 20).join('\n') + '\n\`\`\`\n';
       } else {
-        sideList.push(sp);
+        sideList.push(`${sp}（${it && it.error ? it.error : '未能提取文本'}）`);
       }
     } catch (e) { sideList.push(sp); }
   }
@@ -3811,21 +3812,23 @@ async function analyzeSourceText(filePath, fileType) {
     addLog('warning', '源码读取异常: ' + e.message);
   }
 
-  // 伴生文件清单（同包其它文件常是关键：requirements/配置/密文/密钥）
+  // 伴生文件清单（同包其它文件常是关键：requirements/配置/密文/密钥/题面）
+  // 统一走 file_digest：能提取文本的就内联（docx/pdf/xlsx 也算），提不出的才给路径。
   const sideFiles = (Array.isArray(state._platformFiles) ? state._platformFiles : [])
     .filter(p => String(p) !== String(filePath));
   const sideInline = [];
   const sideList = [];
   for (const sp of sideFiles.slice(0, 8)) {
+    const base = String(sp).split(/[\\/]/).pop();
     try {
-      const rf = await window.electronAPI.readFile(sp);
-      if (rf && rf.success) {
-        const body = String(rf.content || '');
-        if (body.length > 0 && body.length <= 8192) {
-          sideInline.push(`### ${sp.split(/[\\/]/).pop()}\n\`\`\`\n${body}\n\`\`\``);
-        } else {
-          sideList.push(sp);
-        }
+      const dg = await window.electronAPI.fileDigest([sp]);
+      const it = dg && dg.items && dg.items[0];
+      if (it && it.ok && it.text && it.text.trim()) {
+        const cap = ['docx', 'xlsx', 'pptx', 'pdf'].includes(it.kind) ? 12000 : 8000;
+        sideInline.push(`### ${base}（${it.kind}）\n\`\`\`\n${it.text.slice(0, cap)}\n\`\`\``);
+      } else if (it && it.ok && it.kind === 'binary') {
+        sideInline.push(`### ${base}（二进制：${it.magic || '未知'}，熵 ${it.entropy}）\n`
+          + '```\n' + (it.strings || []).slice(0, 20).join('\n') + '\n```');
       } else {
         sideList.push(sp);
       }
@@ -9694,30 +9697,46 @@ async function toolUseDeepSolveBinary(analysisData, fileType) {
   // 平台手包伴生文件（flag.out/input.bin/README 等）：AI 的 run_python/bash 可直接用绝对路径访问。
   // 多文件题优化（not-baby-parallelism 四轮实测）：文本类伴生文件**内容直接内联**进提示词，
   // 省掉 AI 每轮"重新发现+read_file+凭记忆复述"的重复劳动（此前同一文件被推演 5 遍）。
+  //
+  // ⚠ 旧实现用扩展名白名单判断"能否内联"，导致 docx/pdf/xlsx 这类**题面载体**被跳过：
+  //   实测（驱动逆向）题面就在「题面（必须给出）.docx」里，内容是"这是什么?" + 16 字节密文，
+  //   而白名单里没有 docx → 被归为"二进制/大文件，用 read_file 处理" → AI 根本没看到密文。
+  // 现在改为：统一走 file_digest 判断类型，只要能提取出文本就内联（docx/xlsx/pptx/pdf 都算）。
   const sideFiles = (Array.isArray(state._platformFiles) ? state._platformFiles : [])
     .filter(p => String(p) !== String(state.currentFile));
-  const TEXT_EXT = /\.(txt|out|md|json|log|csv|py|c|cpp|h|js|html|xml|yaml|yml|ini|cfg)$/i;
   let sideFilesBlock = '';
   if (sideFiles.length) {
     const parts = [];
     const inlined = [];
     for (const p of sideFiles) {
       let inlinedThis = false;
+      const base = String(p).split(/[\\/]/).pop();
       try {
-        const st = await window.electronAPI.getFileInfo(p).catch(() => null);
-        const sz = st && st.success ? st.size : 0;
-        if (sz <= 8192 && (TEXT_EXT.test(p) || sz === 0)) {
-          const rf = await window.electronAPI.readFile(p);
-          if (rf && rf.success) {
-            parts.push(`### ${p}（内容已内联）\n\`\`\`\n${String(rf.content).slice(0, 6000)}\n\`\`\``);
-            inlined.push(p.split('\\').pop());
-            inlinedThis = true;
-          }
+        const dg = await window.electronAPI.fileDigest([p]);
+        const it = dg && dg.items && dg.items[0];
+        if (it && it.ok && it.text && it.text.trim()) {
+          // 文本类（含 Office/PDF 提取出的正文）：内联，给足但不过量
+          const cap = ['docx', 'xlsx', 'pptx', 'pdf'].includes(it.kind) ? 12000 : 6000;
+          const truncated = it.text.length > cap;
+          parts.push(`### ${base}（${it.kind}${truncated ? '，已截断' : ''}）\n`
+            + '```\n' + it.text.slice(0, cap) + '\n```');
+          inlined.push(base);
+          inlinedThis = true;
+        } else if (it && it.ok && it.kind === 'binary') {
+          // 二进制伴生件：给出魔数/熵/strings 摘要，比"让 AI 自己去 read_file"有用
+          parts.push(`### ${base}（二进制：${it.magic || '未知'}，熵 ${it.entropy}，${it.size} 字节）\n`
+            + '```\n' + (it.strings || []).slice(0, 20).join('\n') + '\n```');
+          inlined.push(base);
+          inlinedThis = true;
+        } else if (it && it.ok && it.kind === 'image') {
+          parts.push(`### ${base}（图片 ${it.width || '?'}×${it.height || '?'}）\n`
+            + '（需要读图中文字请用 OCR，或直接从图判断结构）');
+          inlinedThis = true;
         }
       } catch (e) { /* 读失败按未内联处理 */ }
-      if (!inlinedThis) parts.push(`- ${p}（二进制/大文件，用 read_file 或 run_python 处理）`);
+      if (!inlinedThis) parts.push(`- ${p}（未能提取文本，用 read_file 或 run_python 处理）`);
     }
-    sideFilesBlock = `\n## 同包伴生文件（${sideFiles.length} 个${inlined.length ? `，其中 ${inlined.length} 个已内联全文` : ''}）\n${parts.join('\n')}\n⚠️ 输入样例/输出样例/说明文档往往就是解题钥匙——上面对象已给出，**不要凭记忆推演，直接用**。\n`;
+    sideFilesBlock = `\n## 同包伴生文件（${sideFiles.length} 个${inlined.length ? `，其中 ${inlined.length} 个已提取内容` : ''}）\n${parts.join('\n')}\n⚠️ 输入样例/输出样例/说明文档/题面往往就是解题钥匙——上面内容已给出，**不要凭记忆推演，直接用**。\n`;
   }
   // 平台题目描述（含官方用法说明，如 "Run with pppp -n ..."）：此前被丢弃，AI 每轮都在猜参数语义
   //
@@ -10315,6 +10334,16 @@ ${cachedDataSummary || '暂无'}
 
 ### main函数
 ${analysisData.mainCode ? analysisData.mainCode.substring(0, 2000) : '暂无'}
+
+## 同包材料（如果初判失败，先回来看这里）
+${(() => {
+    const sibs = (Array.isArray(state._platformFiles) ? state._platformFiles : [])
+      .filter(p => String(p) !== String(state.currentFile));
+    if (!sibs.length) return '（无）';
+    return sibs.map(p => `- \`${p}\``).join('\n')
+      + '\n\n⚠ 初判没找到 flag 时，**先怀疑"材料没看全"**而不是"算法没读懂"：'
+      + '题面/说明/密文常在这里。用 `file_digest({paths:[...]})` 一次读完（自动提取 docx/pdf/图片）。';
+  })()}
 
 ## 任务
 请使用工具进行分析（最多5次调用）：

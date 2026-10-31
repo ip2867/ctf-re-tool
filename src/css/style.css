@@ -189,6 +189,15 @@ body {
 
 .panel-center {
   flex: 1;
+  /* 三栏布局的中栏必须是「固定视口高 + 内部滚动」的 flex 容器：
+     缺 display:flex 时子级 .chat-messages 的 flex:1 失效，会被对话内容
+     撑高，把整个 main-container（100vh-42px）顶穿——表现为"中间栏随
+     对话越来越长、左右栏正常"。min-width:0 防 flex 内容把中栏撑破。 */
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
   background: var(--bg-primary);
   border-right: 1px solid var(--border-color);
 }

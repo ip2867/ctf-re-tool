@@ -53,6 +53,10 @@ const { decideKaliPreflight, decideKaliRemotePlan } = require('./kali-preflight'
 const pcap = require('./pcap');
 // run_python 的工作目录与产物扫描
 const { pickPythonCwd, snapshotDir, scanNewArtifacts } = require('./py-artifacts');
+// 载荷提取脚本生成（主进程与渲染层共用同一份实现）
+// ⚠️ 曾经只在渲染层 src/js/app.js 里定义，而本文件直接调用 →
+//    ReferenceError，extract_payload 工具 100% 不可用且测试全绿。
+const { buildPayloadExtractPython, PAYLOAD_ENCODINGS } = require('./payload-extract');
 
 // ============ 全局异常兜底（防闪退） ============
 // 之前主进程没有任何 uncaughtException/unhandledRejection 处理：任意一个后台任务
@@ -3500,6 +3504,7 @@ function toolLabel(name, input) {
     case 'ida_apply_trace': return '回填轨迹到 IDA';
     case 'rev_solve': return '可逆逆推' + (Array.isArray(i.ops) ? `（${i.ops.length} 条算子）` : '');
     case 'recover_string': return '还原比较字符串 ' + short(i.func || '（文本）', 24);
+    case 'vm_disasm': return 'VM 反汇编 ' + short(i.array, 24) + (i.path ? ' @' + short(path.basename(String(i.path)), 20) : '');
     case 'ida_get_bytes': return 'IDA 读取字节 ' + short(i.address, 30);
     case 'ida_list_functions': return 'IDA 列出函数';
     case 'ida_find_strings': return 'IDA 查找字符串 ' + short(i.keyword || i.pattern || '', 30);
@@ -6579,7 +6584,7 @@ function parseTextToolCalls(rawText) {
     'jeb_get_exported_activities', 'jeb_get_all_classes', 'jeb_get_class_methods',
     'ida_decompile', 'ida_list_functions', 'ida_find_strings', 'ida_get_xrefs', 'ida_get_bytes',
     'ida_list_globals', 'ida_disasm', 'ida_dbg', 'ida_dbg_mem', 'ida_open_file', 'angr_solve',
-    'emu_trace', 'ida_apply_trace', 'rev_solve', 'recover_string',
+    'emu_trace', 'ida_apply_trace', 'rev_solve', 'recover_string', 'vm_disasm',
     'remote_exec', 'traffic_extract', 'recipe', 'gui_input', 'crypto',
     'browser_search', 'browser_open', 'browser_js', 'run_command', 'run_python', 'adb_command', 'frida_hook',
     'read_skill', 'wiki_search', 'wiki_read', 'burp_get_history', 'burp_get_message', 'burp_call',
@@ -6603,6 +6608,9 @@ function parseTextToolCalls(rawText) {
     ida_disasm: 'address', ida_dbg: 'action', ida_dbg_mem: 'action', remote_exec: 'command', traffic_extract: 'path',
     ida_list_globals: 'filter', ida_open_file: 'path', angr_solve: 'binary',
     emu_trace: 'binary', ida_apply_trace: 'trace', rev_solve: 'ops', recover_string: 'func',
+    // vm_disasm 的必填是 array + (source|path)：裸参数形态只能填一个，故映射到 array
+    // （最少它还知道"我要分析哪个数组"，源文本仍需显式给）
+    vm_disasm: 'array',
     file_digest: 'paths', list_dir: 'path', scan_crypto: 'path',
     extract_payload: 'path', junk_scan: 'path', junk_patch: 'path', junk_repair: 'path',
     analyze_structure: 'path', gen_block_cipher_solver: 'path', gen_sm4_solver: 'path',
@@ -6893,6 +6901,19 @@ function precheckToolCall(name, input) {
     if (!i.disasm && !i.func) {
       return 'recover_string 需要 disasm（反汇编文本）或 func（函数名/地址）之一。'
         + '最省事的方式是传 func，让工具自己去 IDA 取反汇编。';
+    }
+  }
+  if (name === 'vm_disasm') {
+    if (!i.array || !String(i.array).trim()) {
+      return 'vm_disasm 需要 array（数组名，如 m_mem / nums / opcode）。'
+        + '先看源码里那个"几万项的大数组"叫什么，再传进来。';
+    }
+    if ((!i.source || !String(i.source).trim()) && (!i.path || !String(i.path).trim())) {
+      return 'vm_disasm 需要 source（数组文本）或 path（源文件路径）之一。'
+        + '推荐直接传 path，工具会自动读文件并定位数组。';
+    }
+    if (i.layout != null && (!Array.isArray(i.layout) || i.layout.length < 2)) {
+      return 'layout 必须是长度 ≥2 的数组（如 ["op","a","b","c"]），表示一条指令占几个元素。不填则自动推断。';
     }
   }
   if (name === 'emu_trace') {
@@ -8016,6 +8037,38 @@ function getToolDefinitions() {
       }
     },
     {
+      name: "vm_disasm",
+      description:
+        "把**自定义 VM / 字节码解释器**从「一整坨数字」变成「可读的指令流 + 控制流」。\n" +
+        "适用场景：附件里有一个巨大的平坦数值数组（几万到几十万项），旁边是形如\n" +
+        "  while(1){ a=mem[pc]; b=mem[pc+1]; ...; mem[c]=~(mem[a]&mem[b]); }\n" +
+        "的取指-译码-执行循环。此时数组是**程序**，不是数据。\n" +
+        "做的事（全部确定性，不做语义猜测）：\n" +
+        "  1. 提取数组字面量（支持 name=[...] / name:[...] / var name=[...]）\n" +
+        "  2. 推断指令宽度（按 opcode 取值集中度），或按 layout 显式指定\n" +
+        "  3. 切成指令序列 → 基本块 → 跳转边（按「操作数落在指令边界上的命中率」判定）\n" +
+        "  4. 统计每个 opcode 的出现次数与操作数形态\n" +
+        "  5. 生成可运行的 Python 模拟器骨架\n" +
+        "⚠️ **每个 opcode 的语义都是 TODO 占位**：本工具不知道 op 0x03 是加法还是输出，\n" +
+        "必须由你从反编译的 switch/case 逐条确认后填入。硬塞「看起来合理」的语义只会产出假结果。\n" +
+        "拿到报告后：先看 opcode 统计与基本块数量决定「复刻模拟器」还是「z3 建模」，\n" +
+        "再按反编译补全骨架里的 TODO。",
+      input_schema: {
+        type: "object",
+        properties: {
+          source: { type: "string", description: "源文本（JS/HTML 内容），或留空用 path 指定文件" },
+          path: { type: "string", description: "源文件路径（HTML/JS 均可）；给了就自动读文件" },
+          array: { type: "string", description: "数组名，如 m_mem / nums / opcode" },
+          layout: {
+            type: "array",
+            description: "可选，显式指令布局（数组长度=指令宽度），如 [\"op\",\"a\",\"b\",\"c\"]。不给则自动推断"
+          },
+          max_blocks: { type: "number", description: "报告里最多展示多少个基本块（默认 20）" }
+        },
+        required: ["array"]
+      }
+    },
+    {
       name: "ida_list_globals",
       description: "列出 IDA 中的全局符号（自动分页，默认每页 500 条直到 next_offset=null）。可按 filter 过滤名字，用 offset/count 手动翻页。",
       input_schema: {
@@ -9013,6 +9066,52 @@ async function executeToolCall(toolName, input) {
         return L.join('\n');
       }
 
+      case 'vm_disasm': {
+        const { vmDisasm, formatVmReport } = require('./vm-disasm');
+        let text = String(input.source || '');
+        const srcPath = String(input.path || '').trim();
+        if (!text.trim() && srcPath) {
+          if (!fs.existsSync(srcPath)) return `文件不存在: ${srcPath}`;
+          let st;
+          try { st = fs.statSync(srcPath); } catch (e) { return `读取失败: ${e.message}`; }
+          // 大文件保护：VM 题的 HTML/JS 常见几 MB，全部读入但别把进程撑爆
+          if (st.size > 64 * 1024 * 1024) {
+            return `源文件 ${(st.size / 1048576).toFixed(1)}MB，超过 64MB 上限。`
+              + `请先用 read_file 或 grep 定位数组所在片段，再用 source 参数传入片段。`;
+          }
+          try { text = fs.readFileSync(srcPath, 'utf8'); } catch (e) { return `读取失败: ${e.message}`; }
+        }
+        if (!text.trim()) {
+          return 'vm_disasm 需要 source（数组文本）或 path（源文件路径）之一，外加 array（数组名）。';
+        }
+        const r = vmDisasm({
+          source: text,
+          array: input.array,
+          layout: input.layout,
+          max_blocks: input.max_blocks,
+        });
+        if (r.error) {
+          return `vm_disasm 失败: ${r.error}\n\n`
+            + '排查建议：\n'
+            + '1. 数组名是否与源码一致（区分大小写，如 m_mem / MEM / nums）；\n'
+            + '2. 数组是否真的是字面量（`name = [...]`）——若是从别处拼接/解码而来，需先还原；\n'
+            + '3. 若数组在压缩/混淆的 JS 里，先用 recipe 解码或先 grep 出片段。';
+        }
+        // 骨架落盘，方便直接 python 运行
+        let saved = '';
+        try {
+          const dir = currentCaseDir || currentWorkDir;
+          if (dir) {
+            fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
+            const p = path.join(dir, 'scripts', 'vm_sim.py');
+            fs.writeFileSync(p, r.skeleton, 'utf8');
+            saved = p;
+          }
+        } catch (e) { /* 落盘失败不影响返回 */ }
+        const report = formatVmReport(r);
+        return report + (saved ? `\n\n（模拟器骨架已保存到 ${saved}）` : '');
+      }
+
       case 'ida_dbg': {
         // ctx 让 start 能决定 local/remote：
         //   PE → Local Windows debugger；ELF 且配了 Kali → remote gdb（gdbserver）
@@ -9528,7 +9627,7 @@ async function executeToolCall(toolName, input) {
         }
         const buf = fs.readFileSync(f);
         const py = buildPayloadExtractPython(spec);
-        if (!py) return `不支持的编码方式: ${spec.encode && spec.encode.kind}（支持 xor/add/periodic-xor/rolling-xor/rolling-add/base64/hex/none）`;
+        if (!py) return `不支持的编码方式: ${spec.encode && spec.encode.kind}（支持 ${PAYLOAD_ENCODINGS.join('/')}）`;
         const outPath = String(input.out || '').trim() || path.join(app.getPath('temp'), `payload_${spec.offset.toString(16)}.bin`);
         const scriptPath = path.join(app.getPath('temp'), `extract_${Date.now().toString(36)}.py`);
         fs.writeFileSync(scriptPath, py, 'utf8');
@@ -11710,6 +11809,20 @@ ipcMain.handle('wiki-search', async (event, query, max) => {
 ipcMain.handle('wiki-read', async (event, nameOrRel) => {
   try { return { success: true, content: wikiRead(nameOrRel) }; }
   catch (err) { return { success: false, error: err.message }; }
+});
+
+// 载荷提取脚本生成：渲染层不再自带副本，统一取主进程实现
+// （此前 app.js 与 main.js 各写一份，主进程那份漏了函数体 → extract_payload 全废）
+ipcMain.handle('build-payload-extract-python', async (event, spec) => {
+  try {
+    const py = buildPayloadExtractPython(spec || {});
+    if (!py) {
+      return { success: false, error: `不支持的编码方式: ${(spec && spec.encode && spec.encode.kind) || '?'}（支持 ${PAYLOAD_ENCODINGS.join('/')}）` };
+    }
+    return { success: true, script: py };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
 });
 
 // ========== CASE 证据体系 ==========

@@ -141,6 +141,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   wikiSearch: (query, max) => ipcRenderer.invoke('wiki-search', query, max),
   wikiRead: (nameOrRel) => ipcRenderer.invoke('wiki-read', nameOrRel),
 
+  // 载荷提取脚本生成（主进程是唯一实现，渲染层不再自带一份副本）
+  buildPayloadExtractPython: (spec) => ipcRenderer.invoke('build-payload-extract-python', spec),
+
   // CASE 证据体系
   caseInit: (baseName, md5) => ipcRenderer.invoke('case-init', baseName, md5),
   appendFile: (filePath, line) => ipcRenderer.invoke('append-file', filePath, line),

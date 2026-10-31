@@ -1894,69 +1894,21 @@ async function runStageHandoff(handoff, fromAiText) {
 // 工具直接做：解码 → 写盘 → 校验魔数 → 自动接力。
 //
 // 只处理"高置信度且参数完整"的载荷（PE/ELF/DEX、已知编码），失败则静默交给 AI 手动处理。
-function buildPayloadExtractPython(p) {
-  const e = p.encode || {};
-  const off = p.offset;
-  const n = p.length;
-  const lines = [
-    'import sys, re, base64',
-    'src, dst = sys.argv[1], sys.argv[2]',
-    'd = open(src, "rb").read()',
-    `o = ${off}`,
-  ];
-  if (n) lines.push(`n = ${n}`);
-  else lines.push('n = len(d) - o');
-  switch (e.kind) {
-    case 'none':
-      lines.push('blob = d[o:o+n]');
-      break;
-    case 'xor':
-      lines.push(`s = ${e.stride || 1}`, `key = ${e.key}`);
-      lines.push('blob = bytes(d[o+i*s] ^ key for i in range(n))');
-      break;
-    case 'add':
-      lines.push(`s = ${e.stride || 1}`, `key = ${e.key}`);
-      // 编码是 out = in + key，解码必须 **减** key（此前误写成加，导致解出乱码）。
-      lines.push('blob = bytes((d[o+i*s] - key) & 0xff for i in range(n))');
-      break;
-    case 'periodic-xor':
-      lines.push(`keys = [${(e.key || []).join(', ')}]`);
-      lines.push('blob = bytes(d[o+i] ^ keys[i % len(keys)] for i in range(n))');
-      break;
-    case 'rolling-xor':
-      lines.push('blob = bytearray(); prev = 0');
-      lines.push('for i in range(n):');
-      lines.push('    prev = d[o+i] ^ prev');
-      lines.push('    blob.append(prev)');
-      lines.push('blob = bytes(blob)');
-      break;
-    case 'rolling-add':
-      lines.push('blob = bytearray(); prev = 0');
-      lines.push('for i in range(n):');
-      lines.push('    prev = (d[o+i] - prev) & 0xff');
-      lines.push('    blob.append(prev)');
-      lines.push('blob = bytes(blob)');
-      break;
-    case 'base64':
-      lines.push('s = re.sub(rb"[^A-Za-z0-9+/=]", b"", d[o:])');
-      lines.push('s += b"=" * (-len(s) % 4)');
-      lines.push('blob = base64.b64decode(s)[:n]');
-      break;
-    case 'hex':
-      lines.push('s = re.sub(r"[^0-9a-fA-F]", "", d[o:].decode("latin-1"))');
-      lines.push('blob = bytes.fromhex(s[:n*2])');
-      break;
-    default:
-      return null;   // 未知编码：不自动提取
-  }
-  lines.push('open(dst, "wb").write(blob)');
-  lines.push('print("OK", len(blob), blob[:4].hex())');
-  return lines.join('\n');
-}
-
 // 尝试自动提取载荷。返回 { ok, path, head, p } 或 { ok:false, reason }
+//
+// ⚠️ 这里不再自带 buildPayloadExtractPython 的副本。
+//    原先 app.js 有一份、electron/main.js 也"以为"有一份，结果主进程那份只留了调用、
+//    没有函数体 → extract_payload 工具 100% 抛 ReferenceError，而测试全绿。
+//    现在主进程的 electron/payload-extract.js 是唯一实现，渲染层经 IPC 取用。
 async function autoExtractPayload(filePath, payload) {
-  const py = buildPayloadExtractPython(payload);
+  let py = null;
+  try {
+    const r = await window.electronAPI.buildPayloadExtractPython(payload);
+    if (!r || !r.success) return { ok: false, reason: 'unsupported-encoding: ' + ((r && r.error) || '') };
+    py = r.script;
+  } catch (e) {
+    return { ok: false, reason: 'build-script-failed: ' + e.message };
+  }
   if (!py) return { ok: false, reason: 'unsupported-encoding' };
   // 有 CASE 目录时用 CASE（每题独立归档）；否则用全局 scripts 目录。
   // ⚠️ getScriptsDir() 返回的**已经是** .../scripts，不能再拼 /scripts，
@@ -13467,6 +13419,11 @@ async function prefetchKnowledge(haystack, fileType, extra = []) {
       // 结构特征（魔改题靠这些也适用）
       [/virtualalloc|sizeofimage/i, 'pe加载器 内嵌pe 手工映射'],
       [/opcode|\bdispatch\b|取指|解释器|轮函数/i, 'vm 虚拟机 opcode 分组密码 魔改算法识别'],
+      // 大数组电路型 VM：数组本身就是程序（几万项）+ 按符号位判型 + 恒定控制流。
+      // 它与上面的 switch 型 VM 是两套判据（那个有 switch，这个没有），
+      // 对应的工具也不同（这个用 vm_disasm 先切基本块，不是去认标准算法）。
+      [/m_mem|mem\s*=\s*\[|基本块链|恒定控制流|nand\s*电路|电路\s*nand|while\s*\(\s*1\s*\)\s*\{[^}]*\[pc/i,
+       'vm 虚拟机 字节码 解释器 opcode'],
       // 大常量表 = S 盒候选（64 个 int32 ≈ 256 字节 S 盒；也接受 256 项的大表）
       [/共 (64|128|256) 个/, 's盒 分组密码 sm4 aes 查表'],
       [/分组密码|16 字节块|每 16 字节|轮密钥|round.?key/i, '分组密码 魔改sm4 轮密钥 sm4 aes'],

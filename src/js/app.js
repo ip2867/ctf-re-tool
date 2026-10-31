@@ -4932,8 +4932,14 @@ async function analyzeELF() {
   addLog('info', '开始ELF分析流程');
   addLog('info', '========================================');
 
-  // 第1步：启动IDA
-  addLog('info', '[1/4] 启动IDA分析...');
+  // 第1步：DIE查壳（与 PE 流程对齐）。此前 ELF 流程没有这一步，
+  // 用户按自动分析后 DIE 不弹、无法肉眼确认是否加壳（实测 elfstudy 漏掉）。
+  // 工具不读取检测结果——是否加壳由用户看窗口后自行判断。
+  addLog('info', '[1/5] 检查是否加壳...');
+  await launchTool('die');
+
+  // 第2步：启动IDA
+  addLog('info', '[2/5] 启动IDA分析...');
   addLog('info', `IDA打开文件: ${state.currentFile}`);
   await launchTool('ida');
 
@@ -4944,16 +4950,16 @@ async function analyzeELF() {
   // 自动连接IDA MCP（端口轮询等待，冷启动不再因固定重试窗口失败）
   const idaMcpConnected = await connectIdaMcpWithWait();
 
-  // 第2步：检查反调试
-  addLog('info', '[2/4] 检查反调试特征...');
+  // 第3步：检查反调试
+  addLog('info', '[3/5] 检查反调试特征...');
   addLog('info', '常见：ptrace(PTRACE_TRACEME)/TracerPid检测');
 
-  // 第3步：算法识别
-  addLog('info', '[3/4] 识别加密算法...');
+  // 第4步：算法识别
+  addLog('info', '[4/5] 识别加密算法...');
   addLog('info', '特征：0x9E3779B9→TEA, S盒→AES, CRC多项式→CRC32');
 
-  // 第4步：生成Hook脚本
-  addLog('info', '[4/4] 生成Frida Hook脚本...');
+  // 第5步：生成Hook脚本
+  addLog('info', '[5/5] 生成Frida Hook脚本...');
   await generateFridaScript();
 
   // ========== 第5步：自动求解flag ==========

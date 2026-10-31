@@ -6319,9 +6319,24 @@ function postClaudeStream(requestBody, onDelta) {
     };
 
     const req = client.request(options, (res) => {
-      // SSE 流内的空闲超时：异常连接若长时间无数据，会一直挂到硬超时，
-      // 表现为工具"卡住不动"。这里 120s 无数据即断开，交给上层重试/报错。
-      try { req.setTimeout(120000, () => { req.destroy(new Error('Claude 流空闲超时（120s 无数据）')); }); } catch (e) {}
+      // SSE 流内的空闲超时——分两段：
+      //   · **首字节等待**（服务器收到请求后、还没吐任何 SSE 数据）：思考模型
+      //     （deepseek/GLM reasoning）面对长输入时，服务端会先跑完思考再吐事件，
+      //     或网关整段缓冲后一次吐出。这个阶段 120s 完全不够（实测 elfstudy
+      //     106KB 提示词 2 分钟+ 无首字节是正常的），给了 300s。
+      //   · **流中途**（已经收到过 SSE 数据后再卡住）：120s 无数据基本可断定
+      //     连接死了，保持原值快速失败。
+      // 表现对齐：修复前「卡住 10+ 分钟无任何日志」（静默重试 × 每轮 120s 超时），
+      // 修复后首字节最多等 300s，且每次重试都会写 console 日志可诊断。
+      let gotSSEData = false;
+      const armIdle = (ms, tag) => {
+        try {
+          req.setTimeout(ms, () => {
+            req.destroy(new Error('Claude 流空闲超时（' + tag + ' ' + Math.round(ms / 1000) + 's 无数据）'));
+          });
+        } catch (e) { /* 已销毁的请求上 setTimeout 会抛，忽略 */ }
+      };
+      armIdle(300000, '首字节等待');
       // 非 200：收完 body 走统一错误处理
       if (res.statusCode < 200 || res.statusCode >= 300) {
         let data = '';
@@ -6346,6 +6361,14 @@ function postClaudeStream(requestBody, onDelta) {
       // 流式推流过滤：若模型把工具调用当文本吐（<｜｜tool▁calls▁begin｜｜> 之类），
       // 这些标记不该显示到聊天区（否则用户看到一堆乱码标记）。检测到即停推。
       let streamDirty = false;
+
+      // 收到第一批 SSE 数据后，把空闲超时从「首字节等待 300s」收紧为「流中途 120s」
+      res.once('data', () => {
+        if (!gotSSEData) {
+          gotSSEData = true;
+          armIdle(120000, '流中途');
+        }
+      });
 
       const handleEvent = (ev) => {
         switch (ev.type) {
@@ -6475,8 +6498,12 @@ async function claudeTransport(requestBody, onDelta) {
       return resp;
     } catch (e) {
       lastErr = e;
+      // 重试必须留痕：此前静默重试（每轮最长 120s 超时 × 5 次 + 指数退避），
+      // 用户看到的就是"卡住 10+ 分钟无任何日志"。写出第几次、什么错、还剩几次。
       if (!deltaEmitted && attempt < maxRetries) {
-        await sleep(backoff(attempt));
+        const wait = backoff(attempt);
+        console.log(`[Claude API] 第 ${attempt + 1} 次尝试失败（${e.message}），${Math.round(wait / 1000)}s 后重试（剩余 ${maxRetries - attempt} 次）`);
+        await sleep(wait);
         continue;
       }
       throw e;

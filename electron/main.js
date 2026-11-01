@@ -3488,6 +3488,7 @@ function toolLabel(name, input) {
     case 'write_file': return '写入 ' + short(i.path ? path.basename(i.path) : '', 40);
     case 'bash': return '执行命令 ' + short(i.command, 50);
     case 'run_python': return '运行 Python 脚本' + (i.script ? `（${String(i.script).split('\n').length} 行）` : '');
+    case 'z3_solve': return '符号求解' + (i.constraints ? `（${String(i.constraints).split('\n').length} 行约束）` : '');
     case 'glob': return '查找文件 ' + short(i.pattern, 40);
     case 'grep': return '搜索 ' + short(i.pattern, 40) + (i.path ? ' @' + short(path.basename(i.path), 24) : '');
     case 'scan_crypto': return '扫描算法指纹 ' + short(i.path ? path.basename(i.path) : '', 40);
@@ -6617,7 +6618,8 @@ function parseTextToolCalls(rawText) {
     'read_skill', 'wiki_search', 'wiki_read', 'burp_get_history', 'burp_get_message', 'burp_call',
     'switch_to_next_stage',
     'scan_crypto', 'extract_payload', 'gen_block_cipher_solver', 'gen_sm4_solver',
-    'analyze_structure', 'junk_scan', 'junk_patch', 'junk_repair'
+    'analyze_structure', 'junk_scan', 'junk_patch', 'junk_repair',
+    'z3_solve'
   ]);
   // 工具名 → 参数名映射（模型给裸参数时也能用；无参工具不在此表）
   //
@@ -6628,6 +6630,7 @@ function parseTextToolCalls(rawText) {
   // 这里的键必须都能在 schema 里找到同名属性，由 tests/test_tool_manifests.js 锁定。
   const MAP = {
     bash: 'command', run_command: 'command', run_python: 'script', glob: 'pattern', grep: 'pattern',
+    z3_solve: 'constraints',
     read_file: 'path', write_file: 'path', read_skill: 'name', wiki_read: 'path', wiki_search: 'query',
     browser_open: 'url', browser_search: 'query', browser_js: 'url',
     ida_decompile: 'function_name', ida_get_xrefs: 'address',
@@ -6878,6 +6881,9 @@ function precheckToolCall(name, input) {
   }
   if (name === 'run_python' && (!i.script || !String(i.script).trim())) {
     return '缺少必填参数 script。请把完整 Python 代码放在 script 字段里（不要传文件路径）。';
+  }
+  if (name === 'z3_solve' && (!i.constraints || !String(i.constraints).trim())) {
+    return '缺少必填参数 constraints。请传入约束代码，例如 `x = BitVec("x",32)\\ns.add(x ^ 0x1234 == 0xabcd)`。';
   }
   if (name === 'write_file') {
     if (!i.path || !String(i.path).trim()) return '缺少必填参数 path。';
@@ -8489,6 +8495,31 @@ function getToolDefinitions() {
         required: ["script"]
       }
     },
+    {
+      name: "z3_solve",
+      description:
+        "**符号求解** —— 把「满足这组约束的输入是什么」交给 z3，而不是手写爆破或启发式搜。\n" +
+        "什么时候用：校验逻辑是纯算术/位运算的约束组（异或链、加法进位、模运算、比较链）；" +
+        "flag 每字节独立但被少量约束耦合（逐字符校验）；需要「找一组可行解」；约束里有 32/64 位回绕、移位、符号扩展——手算易错，z3 的 BitVec 语义位精确。\n" +
+        "什么时候别用：涉及真实内存读写、syscall、浮点精度、几千项以上的大表查表——那些用 emu_trace / run_python。\n" +
+        "约束写法（不需要 import / Solver / print，工具自动补全）：\n" +
+        "  x = BitVec('x', 32)\n" +
+        "  s.add(x ^ 0x1234 == 0xabcd)\n" +
+        "返回 JSON：status(sat/unsat/unknown/error) + model（变量名→数值）+ summary（可读摘要，字节值附字符）。\n" +
+        "**unsat 是有效结果**（约束组无解，应回头检查推导），不是工具失败。\n" +
+        "位运算注意：`^` 只对 BitVec 成立；Int 请用 z3 的算术写法。",
+      input_schema: {
+        type: "object",
+        properties: {
+          constraints: {
+            type: "string",
+            description: "约束代码。声明符号变量并 add 约束；s = Solver() 可省略（工具会建）。例：x = BitVec('x',32)\\ns.add(x ^ 0x1234 == 0xabcd)"
+          },
+          timeout: { type: "number", description: "求解超时秒数，默认 30" }
+        },
+        required: ["constraints"]
+      }
+    },
     // ========== ADB/Frida 工具 ==========
     {
       name: "adb_command",
@@ -9583,6 +9614,8 @@ async function executeToolCall(toolName, input) {
         return await execCommandAsync(input.command);
       case 'run_python':
         return await runPythonScript(input.script, input.cwd);
+      case 'z3_solve':
+        return await runZ3Solve(input.constraints, input.timeout);
 
       // ========== ADB/Frida 工具 ==========
       case 'adb_command':
@@ -10695,6 +10728,18 @@ async function runPythonScript(script, cwdOpt) {
       }
     });
   });
+}
+
+// ─── z3_solve：符号求解 ───
+// 设计：AI 只写「约束代码」，本函数用 electron/z3-solve.js 的模板包装成完整脚本，
+// 再走同一条 python 执行管道。为什么不用 run_python 让 AI 自己写全脚本：
+// ① import/Solver/check/model 的样板每次都要重写且容易漏（unsat 时 model() 抛异常）；
+// ② 结果需要结构化（JSON: status/model/summary），否则 AI 还得自己解析文本输出；
+// ③ z3 未安装时的报错要可操作（提示 pip install z3-solver），而不是裸 ModuleNotFoundError。
+async function runZ3Solve(constraints, timeoutSec) {
+  const { buildZ3SolveScript } = require('./z3-solve');
+  const script = buildZ3SolveScript(constraints, { timeout: timeoutSec });
+  return await runPythonScript(script, null);
 }
 
 // 执行ADB命令（spawn 参数数组）

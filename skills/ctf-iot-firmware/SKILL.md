@@ -150,6 +150,42 @@ qemu-arm ./target arg1 arg2
 | 加密固件解密 | 固件头/段加密 | 先逆解密逻辑拿 key，再解全镜像 |
 | CGI/Web 逻辑 | 固件带 httpd + www | 分析 CGI 程序，找命令注入/参数校验 |
 | 迷宫/规则 | 少见但存在 | 转 ctf-reverse-tooling |
+| **OTA 包 + 校验器分离** | 给了 `ota_*.bin` + 校验/打包程序（可能是别的架构） | 见 §10 |
+
+## 10. OTA 包 / 跨架构校验（强网杯 firmware 题实战）
+
+**典型形态**：三个文件 —— `fw_a`（校验器，x86-64 ELF）、`fw_b.bin`（目标固件，RISC-V ELF）、
+`ota_package.bin`（升级包，几十~几百字节）。flag 在包里但被加密。
+
+**判定顺序**（别一上来就 binwalk）：
+
+1. `file` 三个文件先看清架构。**校验器和目标架构不同是常态**（x86 工具校验 ARM/RISC-V 镜像）。
+2. 校验器**跑起来看 usage**：`./fw_a` 直接执行，它自己会打印参数格式，
+   比反汇编猜快十倍。例：`usage: ./fw_a <ota_package.bin> <keymat_hex32> <vm_out8_hex16>`。
+3. **在小文件里找结构，不要先啃 1MB 的那个**：`ota_package.bin` 只有 176 字节，
+   `xxd` 一遍就能看出 magic + 版本 + key + 条目表 + 载荷：
+   ```
+   QWBP | ver(u32) | key16 | count(u32) | entry[] { off(u32) len(u32) hash(u32) } | 段数据
+   ```
+   条目的 `off` 是**包内偏移**（不是文件偏移），按 `len` 取出就是密文段。
+4. **段尾的 magic 段才是 flag 容器**：搜 `QWBPFLAG` / `FLAG` 之类字样，
+   紧跟 u32 长度 + 密文。找到它比逆整个校验器划算。
+5. 哈希对不上（crc32/fnv/adler 都试过不匹配）说明**哈希是带 key 的 MAC**，
+   不要再穷举标准算法 —— 去校验器里找它的 hash 实现。
+6. 缺参数（如 `vm_out8_hex16`）时：**那个值来自另一个固件的运行输出**。
+   如果那个固件是别的架构跑不起来（没有 qemu-*），注意它可能只是打印一段常量：
+   直接读它的 `.rodata` / 尾部字符串区就能拿到，不必真跑。
+7. **交叉验证而不是硬猜**：校验器自己会判断对错（成功/失败两个出口）。
+   构造候选参数喂进去，用它的退出码/输出当 oracle，比盲试快。
+
+**坑**：
+- 校验器可能是**静态链接**的，`ldd` 显示"不是动态可执行文件"是正常的，不是文件坏了。
+- Windows 上用 `curl` 拉 GitHub raw 常被代理挡（返回 000）；PyPI 通常通。
+- RISC-V 32 位 ELF 在没有 qemu-riscv32 的环境里不能直接跑；
+  用 Unicorn（`UC_ARCH_RISCV, UC_MODE_32`）仿真时注意 **`mem_map(0x100000,...)` 可能失败而
+  `mem_map(0x0,...)` 成功** —— 这是 Unicorn 该版本的对齐限制，先试从 0 映射。
+  另外 `UC_RISCV_INSN_ECALL` 在部分版本不存在，改用 `UC_HOOK_CODE` 判断指令字
+  `0x00000073` 来拦截 ecall。
 
 ## 9. 输出契约
 

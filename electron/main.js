@@ -48,7 +48,7 @@ const { detectCapabilities, decideRoute } = require('./file-capability');
 // 远程执行错误分类（Kali SSH）
 const { classifyRemoteError } = require('./remote-exec');
 // Kali 远程预检决策（不可达时跳过远程命令，别白等 3 次 60s 超时）
-const { decideKaliPreflight, decideKaliRemotePlan } = require('./kali-preflight');
+const { decideKaliPreflight, decideKaliRemotePlan, decideDynDebugReadiness } = require('./kali-preflight');
 // PCAP 解析（仅 Node 标准库）
 const pcap = require('./pcap');
 // run_python 的工作目录与产物扫描
@@ -816,8 +816,11 @@ ipcMain.handle('detect-file-type', async (event, filePath) => {
 // 本扫描器**直接读文件字节**，不依赖 IDA、不受引用关系限制，给出确定性的算法候选。
 const CRYPTO_FP = [
   // [名称, 字节模式（hex，空格分隔），说明]
-  ['SM4-FK', 'a3 b1 ba c6 56 aa 33 50 67 7d 91 97 b2 70 22 dc', 'SM4 系统参数 FK（铁证，出现即 SM4）'],
-  ['SM4-FK-BE', 'c6 ba b1 a3 50 33 aa 56 97 91 7d 67 dc 22 70 b2', 'SM4 FK（大端存放）'],
+  // SM4 FK 的两种字节序都要搜：C 里写 `uint32_t fk[]={0xa3b1bac6,...}` 时，
+  // 小端机器上文件字节是 `c6 ba b1 a3`（LE）；而按"常量书写顺序"转储/大端机器上是 `a3 b1 ba c6`（BE）。
+  // 实测：旧条目把两者的名字与描述写反了（叫 -BE 的那条其实是 LE），命名已按实际字节序更正。
+  ['SM4-FK-BE', 'a3 b1 ba c6 56 aa 33 50 67 7d 91 97 b2 70 22 dc', 'SM4 系统参数 FK（大端书写序：0xa3b1bac6 起）'],
+  ['SM4-FK-LE', 'c6 ba b1 a3 50 33 aa 56 97 91 7d 67 dc 22 70 b2', 'SM4 FK（小端存放：uint32_t 数组在 x86 上的原始字节）'],
   ['SM4-SBOX', 'd6 90 e9 fe cc e1 3d b7', 'SM4 标准 S 盒首 4 字节'],
   ['SM4-CK', '00 07 0e 15', 'SM4 轮常量 CK 起始（配合 256 双射表判定）'],
   ['AES-SBOX', '63 7c 77 7b f2 6b 6f c5', 'AES S 盒首 8 字节'],
@@ -836,7 +839,9 @@ const CRYPTO_FP = [
   ['CHACHA-SIGMA', '65 78 70 61 6e 64 20 33 32 2d 62 79 74 65 20 6b', 'ChaCha20/Salsa20 sigma 常量 "expand 32-byte k"'],
   // Blowfish 的 P 数组前两项（π 的小数位），后接 4 个 256 项 32 位 S 盒。
   ['BLOWFISH-P', '88 6a 3f 24 d3 08 a3 85', 'Blowfish P 数组首 2 项 0x243F6A88 0x85A308D3（小端）'],
-  ['TEA-DELTA-INV', '47 c8 86 61', 'TEA delta 取反 0x61C88647（小端）'],
+  // 0x61C88647 的小端是 `47 86 c8 61`。旧条目写成 `47 c8 86 61` 是把字节序搞混了
+  // （那是 0xC88647 的变体，实际匹配不到）——实测重算后更正。
+  ['TEA-DELTA-INV', '47 86 c8 61', 'TEA delta 取反 -0x9E3779B9 = 0x61C88647（小端）'],
   ['CRC32-POLY', '20 83 b8 ed', 'CRC32 多项式 0xEDB88320（小端）'],
   // ⚠️ 旧条目 '00 01 02 03 04 05 06 07 08 09' 已删除：这 10 个字节几乎出现在每个程序里
   // （栈/结构体/索引数组的初始化），实测 20 题里 12 题被打上"RC4（疑）"，全是误报，
@@ -2867,7 +2872,9 @@ function scanCryptoFingerprints(filePath) {
   if (payloads.length) {
     for (const p of payloads) summary.push(payloadDescription(p, payloads.length));
   }
-  if (has('SM4-FK') || has('SM4-FK-BE')) {
+  // SM4 FK 的两个端序条目都要认：FK-LE（x86 上的 uint32_t 原始字节）是常态，
+  // FK-BE（按常量书写顺序转储）出现在大端平台或文本→二进制转换的题里。
+  if (has('SM4-FK-LE') || has('SM4-FK-BE')) {
     const customSbox = out.find(o => o.fp === 'SBOX-256' && o.algo === 'CUSTOM-BLOCK');
     const stdSbox = out.find(o => o.fp === 'SBOX-256' && o.algo === 'SM4');
     if (customSbox) {
@@ -2881,7 +2888,7 @@ function scanCryptoFingerprints(filePath) {
       summary.push({ algo: 'SM4', confidence: 'high', evidence: '命中 SM4 FK 系统参数（铁证）', note: '按 SM4 结构解；S 盒位置需在 IDA 中确认是否标准。' });
     }
   }
-  if (!has('SM4-FK') && !has('SM4-FK-BE') && out.some(o => o.fp === 'SBOX-256' && o.algo === 'CUSTOM-BLOCK')) {
+  if (!has('SM4-FK-LE') && !has('SM4-FK-BE') && out.some(o => o.fp === 'SBOX-256' && o.algo === 'CUSTOM-BLOCK')) {
     const cb = out.filter(o => o.fp === 'SBOX-256' && o.algo === 'CUSTOM-BLOCK');
     // 大文件（>16MB）通常是**通用程序**（浏览器/DLL/运行时，如 electron.exe 200MB），
     // 里面合法地嵌着各种密码库与随机置换表；仅凭双射表不能断言"这是本题的算法"。
@@ -2972,7 +2979,7 @@ function scanCryptoFingerprints(filePath) {
   const hugeBinary = size > 16 * 1024 * 1024;
   const hugeNote = hugeBinary ? '（⚠️ 文件 >16MB，属通用程序量级，此常量可能来自其自带密码库，非本题算法）' : '';
   const hugeConf = (c) => (hugeBinary ? 'low' : c);
-  if (has('SHA256-IV')) summary.push({ algo: 'SHA256', confidence: 'medium', evidence: 'SHA256 IV', note: '哈希：同上。' });
+  if (has('SHA256-IV')) summary.push({ algo: 'SHA256', confidence: hugeConf('medium'), evidence: 'SHA256 IV' + hugeNote, note: '哈希：同上。' });
   if (has('SHA1-IV')) summary.push({ algo: 'SHA1', confidence: hugeConf('medium'), evidence: 'SHA1 IV（大端 16B，与 MD5 的字节序相反）' + hugeNote, note: '哈希：爆破/碰撞/长度扩展（SHA1(key||msg) 可做 length-extension）。' });
   // CHACHA-SIGMA 只在流密码里出现，且是字符串常量 → 强证据（但大二进制要降级）。
   if (has('CHACHA-SIGMA')) summary.push({ algo: 'ChaCha20/Salsa20', confidence: hugeConf('high'), evidence: 'sigma 常量 "expand 32-byte k"' + hugeNote, note: '按流密码解：ChaCha20 需 32B key + 12B nonce（或 16B=Salsa 形态）；注意 counter 初值。' });
@@ -3022,7 +3029,7 @@ function scanCryptoFingerprints(filePath) {
           sboxFileOffset: sboxHit.offset, sboxStride: sboxHit.stride || 1,
           sboxRelation: { relatedTo: isAes ? 'AES' : 'SM4', kind: 'exact', same: 256,
             desc: `与标准 ${isAes ? 'AES' : 'SM4'} 完全相同` },
-          ckFileOffset: isSm4 ? (out.find(o => o.fp === 'SM4-FK') ? null : null) : null,
+          ckFileOffset: null,   // 标准 SM4 直接用 gmssl，不需要 CK 偏移（保留字段形态）
           fkCandidates: [],
           notes: [`标准 ${isAes ? 'AES' : 'SM4'} S 盒（${sboxHit.stride > 1 ? sboxHit.stride + ' 字节步长存放' : '连续字节'}）`],
         };
@@ -8526,8 +8533,13 @@ function getToolDefinitions() {
         "约束写法（不需要 import / Solver / print，工具自动补全）：\n" +
         "  x = BitVec('x', 32)\n" +
         "  s.add(x ^ 0x1234 == 0xabcd)\n" +
+        "**查表请用内置 `lookup_expr(变量, [(索引, 值), ...])`**，不要自己拼 If 链：\n" +
+        "写 `If(v < K, A, B)` 时 z3 按**有符号**比较，索引 ≥ 0x80 会被当成负数，导致整张表查错，\n" +
+        "表现是「明明有解却报 unsat」（本项目实测 128/256 项全错）。lookup_expr 内部用 ULT + 平衡树，无此问题。\n" +
+        "  也内置了 `rotl/rotr/rol/ror/lshr/ashr/zext/sext/extract/bswap32` 等小写别名，可直接用。\n" +
         "返回 JSON：status(sat/unsat/unknown/error) + model（变量名→数值）+ summary（可读摘要，字节值附字符）。\n" +
         "**unsat 是有效结果**（约束组无解，应回头检查推导），不是工具失败。\n" +
+        "**解出后必须回代验证**：把 model 的字节喂回原校验函数跑一遍，相等才算解出；as_text 看着像 flag 不算证据。\n" +
         "位运算注意：`^` 只对 BitVec 成立；Int 请用 z3 的算术写法。",
       input_schema: {
         type: "object",
@@ -11553,6 +11565,14 @@ ipcMain.handle('kali-preflight-decide', async (event, input) => {
 
 ipcMain.handle('kali-remote-plan', async (event, input) => {
   try { return { success: true, plan: decideKaliRemotePlan(input || {}) }; }
+  catch (e) { return { success: false, error: e.message }; }
+});
+
+// 「SSH 通 ≠ 能调」的判定：input 是 kali_probe 的实测结果
+// （reachable / ptraceWorks / ptraceScope / hasGdb / hasGdbserver / probeTimedOut）。
+// 判定原则：ptrace 实测结果优先于 scope 值——scope=0 也可能因容器 seccomp 失败。
+ipcMain.handle('kali-dyn-debug-readiness', async (event, input) => {
+  try { return { success: true, decision: decideDynDebugReadiness(input || {}) }; }
   catch (e) { return { success: false, error: e.message }; }
 });
 

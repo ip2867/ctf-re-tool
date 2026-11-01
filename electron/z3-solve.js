@@ -60,8 +60,32 @@ _g['lshr'] = LShR
 _g['ashr'] = lambda v, n: v >> n
 _g['rol'] = RotateLeft
 _g['ror'] = RotateRight
-_g['zext'] = ZeroExt
-_g['sext'] = SignExt
+
+# zext/sext 的**参数顺序**是个真实陷阱：z3 原生是 ZeroExt(位宽, 值)，
+# 而按直觉/按「把值扩到 N 位」的思路会写成 zext(值, 位宽) —— 直接抛
+# Z3Exception: First argument must be an integer。这里两种顺序都接受，
+# 用「谁不是整数谁就是表达式」来判断，AI 不必记住原生签名。
+def _ext_pick(a, b, fn, name):
+    a_is_int = isinstance(a, int)
+    b_is_int = isinstance(b, int)
+    if a_is_int and not b_is_int:
+        return fn(a, b)                    # ZeroExt(24, v) —— z3 原生顺序
+    if b_is_int and not a_is_int:
+        return fn(b, a)                    # zext(v, 24)    —— 直觉顺序
+    raise TypeError(name + "(x, n): 需要一个 int 位宽和一个 BitVec 表达式，"
+                    "收到 %r 与 %r" % (type(a).__name__, type(b).__name__))
+
+
+def _zext(a, b):
+    return _ext_pick(a, b, ZeroExt, 'zext')
+
+
+def _sext(a, b):
+    return _ext_pick(a, b, SignExt, 'sext')
+
+
+_g['zext'] = _zext
+_g['sext'] = _sext
 _g['extract'] = Extract
 
 def _bswap8(v):

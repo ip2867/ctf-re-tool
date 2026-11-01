@@ -1,6 +1,6 @@
 ---
 name: ctf-antidebug
-description: 反调试识别与绕过：Android(Java/Native) 与 Windows PE/Linux ELF 的检测点定位和 Frida 绕过脚本编写。程序闪退/检测到调试器/静态分析正常但动态异常时使用。
+description: 反调试识别与绕过：Android(Java/Native)、Windows PE、Linux ELF 的检测点定位与 Frida 绕过脚本；含信号类反调试（SIGILL/SIGFPE/fork+pipe）、反沙箱/反 VM、故障驱动 VM 的确定性取证。程序闪退/检测到调试器/静态分析正常但动态异常/在虚拟机里拒绝运行/单步就崩时使用。
 license: MIT
 metadata:
   user-invocable: "true"

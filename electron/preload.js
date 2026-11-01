@@ -160,5 +160,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Kali 远程预检决策（纯模块在主进程；渲染层只传事实、消费结论）
   kaliPreflightDecide: (input) => ipcRenderer.invoke('kali-preflight-decide', input),
   kaliRemotePlan: (input) => ipcRenderer.invoke('kali-remote-plan', input),
+  // 「SSH 通 ≠ 能调」判定：传入 kali_probe 的实测结果，拿 ok/blockers/warns/guidance
+  kaliDynDebugReadiness: (input) => ipcRenderer.invoke('kali-dyn-debug-readiness', input),
   classifyRemoteError: (input) => ipcRenderer.invoke('classify-remote-error', input)
 });

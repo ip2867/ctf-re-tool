@@ -69,6 +69,17 @@ console.log('\n[5] 源码：analyzeBIN 在第一次 execKaliCommand 之前预检
   ok(/kaliPreflightDecide/.test(preloadSrc), 'preload 暴露 kaliPreflightDecide');
   ok(/ipcMain\.handle\('kali-preflight-decide'/.test(mainSrc), '主进程有 kali-preflight-decide');
   ok(/decideKaliPreflight\(/.test(mainSrc), 'main.js 调用纯模块决策');
+
+  // 「SSH 通 ≠ 能调」判定必须**可达**：只在模块里定义而没接 IPC/预加载 = AI 拿不到结论。
+  // 这一条是被实测抓出来的：decideDynDebugReadiness 原本只定义未调用。
+  ok(/decideDynDebugReadiness\s*\}?\s*=?\s*require|decideDynDebugReadiness\s*\}/.test(mainSrc) ||
+     /decideKaliRemotePlan,\s*decideDynDebugReadiness\s*\}/.test(mainSrc),
+    'main.js 从纯模块引入了 decideDynDebugReadiness');
+  ok(/ipcMain\.handle\('kali-dyn-debug-readiness'/.test(mainSrc),
+    '主进程注册 kali-dyn-debug-readiness');
+  ok(/decideDynDebugReadiness\(input\s*\|\|\s*\{\}\)/.test(mainSrc),
+    'kali-dyn-debug-readiness 真的调用纯模块');
+  ok(/kaliDynDebugReadiness/.test(preloadSrc), 'preload 暴露 kaliDynDebugReadiness');
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);

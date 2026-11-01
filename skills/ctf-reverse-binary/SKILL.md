@@ -285,6 +285,12 @@ python tests/kali_probe.py --json   # 机器可读，ok/blockers/warns 结构化
 unicorn / strace / objdump / gcc / qemu-riscv32 + **ptrace 实测**。
 退出码 0=可用，2=未配置或 SSH 不通。
 
+**本机基线（2026-11 实测，可用作对照）**：x86_64 / kernel 6.12 / ptrace_scope=0 /
+ptrace 实测 `PTRACE_OK` / gdb+gdbserver+strace+objdump+gcc 齐备 /
+python3.14 + z3 5.3.3 + capstone + unicorn 2.1.4 已装。
+**仅 `qemu-riscv32` 缺失** → RISC-V 固件题只能走 Unicorn（`UC_ARCH_RISCV`），
+没法直接跑原生 RISC-V 二进制。
+
 **关键判据是"实测"不是"看配置"**：`ptrace_scope=0` 也可能因容器 seccomp 而失败，
 所以判定顺序必须是「ptrace 实跑结果优先，scope 值只作参考」。
 工具侧对应 `decideDynDebugReadiness()`（`electron/kali-preflight.js`）。

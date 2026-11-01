@@ -60,6 +60,12 @@ EXE/ELF → DIE查壳 → (有壳:脱壳) → IDA静态取数
 4. 常见结构：`输入 → 变换函数 → memcmp(变换结果, 常量密文)` —— 变换函数就是要还原的算法
 5. `sub_XXXX` 小函数被 main 一次调用且含循环+异或/移位 → 大概率是加密核心
 
+**校验逻辑是纯算术/位运算时，直接上 `z3_solve`**，不要手写爆破：
+把反编译出来的校验循环逐条翻成约束（`s.add(...)`），工具自动补全 Solver/check/结果提取，
+返回 `status/model/as_text`。约束是 `BitVec`（`^` 只对 BitVec 成立），
+右移用 `LShR`，可用小写别名 `rotl/rotr/lshr/zext/extract`。
+**unsat 是有效结果**（说明推导有矛盾），不是工具坏了。详见 ctf-reverse-tooling §1。
+
 ### 2.1 编译器符号差异（2026-09 验收实战沉淀）
 
 - **mingw 入口是 `_main`**（不是 `main`）：`decompile('main')` 返回 Not found 时按候选序列

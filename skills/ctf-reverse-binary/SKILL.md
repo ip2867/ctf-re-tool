@@ -332,8 +332,9 @@ ptrace(PTRACE_GETREGS, p, 0, &r);      /* 能读到 rip 才算通 */
 标准流程：
 
 ```
-阶段0 静态底图  list_funcs → decompile(主入口/候选) → xref(字符串/常量表)
-                → scan_crypto(算法族) → globals_by_address(常量表内容)
+阶段0 静态底图  ida_list_functions → ida_decompile(主入口/候选)
+                → ida_get_xrefs(字符串/常量表地址) → scan_crypto(算法族)
+                → ida_list_globals / ida_get_bytes(常量表内容)
 阶段1 写假设    候选A 0x4012d0 check_input(buf,len)
                 职责: XXTEA 加密后与 0x404060 比较
                 要取: 入参 buf 指针、加密后缓冲区

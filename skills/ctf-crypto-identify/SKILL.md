@@ -71,7 +71,11 @@ metadata:
 | `scan_crypto(path)` | 拿到**任何**文件先调一次（含自己提取出的新文件） | 算法常量 + S 盒关系 + 内嵌载荷 + 高熵块 + 结构推理 |
 | `extract_payload(path,...)` | scan 报告内嵌载荷后 | 解码写出的新文件（校验魔数） |
 | `analyze_structure(path)` | scan 报"自定义分组密码"后 | 骨架假设（SM4/AES/未知）+ 置信度 + 证据 |
-| `gen_sm4_solver(path)` | analyze_structure 判定 SM4 骨架后 | 可跑的全组合解密脚本 |
+| `gen_block_cipher_solver(path)` | analyze_structure 判定骨架后 | 可跑的全组合解密脚本（`skeleton=sm4\|aes` 可强制骨架） |
+| `gen_sm4_solver(path)` | **旧名**，等价于 `gen_block_cipher_solver(skeleton='sm4')` | 保留兼容，新代码用上面的名字 |
+
+⚠️ **求解器只覆盖 SM4/AES 骨架**。DES/Blowfish 会明确告知不支持——
+不要因为脚本跑不出就断定"算法认错"，也不要指望它能解任意分组密码。
 
 **关于 IDA 的 FindCrypt 插件**：本机 `%APPDATA%\Hex-Rays\IDA Pro\plugins\findcrypt-yara`
 是**空目录**（插件未安装），所以**不要指望在 IDA 里跑 FindCrypt**。等价能力已内置：

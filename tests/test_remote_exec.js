@@ -33,8 +33,39 @@ console.log('[1] classifyRemoteError');
   // 空 stdout + 非零退出码必须是错误
   const e = classifyRemoteError({ success: true, stdout: '', exitCode: 1, host: 'h', port: 22 });
   ok(e.isError === true, 'exitCode≠0 即使 success=true 也是错误');
+  ok(e.code === 'REMOTE_CMD_FAILED', `exitCode≠0 → REMOTE_CMD_FAILED（${e.code}）`);
   const okr = classifyRemoteError({ success: true, stdout: 'ok', exitCode: 0, host: 'h', port: 22 });
   ok(okr.isError === false, '正常退出 → 非错误');
+}
+
+console.log('\n[1b] "命令失败" 与 "连不上" 必须分开（实测踩过：ls 报 REMOTE_REFUSED）');
+{
+  // 真实的 `ls /nonexistent`：连接正常、命令非零退出、报错在 stderr
+  const cmdFail = classifyRemoteError({
+    success: false, exitCode: 2, host: '192.168.230.129', port: 22,
+    stdout: '', stderr: "ls: 无法访问 '/definitely/not/here': 没有那个文件或目录",
+    error: "ls: 无法访问 '/definitely/not/here': 没有那个文件或目录",
+  });
+  ok(cmdFail.code === 'REMOTE_CMD_FAILED', `命令失败 → REMOTE_CMD_FAILED（${cmdFail.code}）`);
+  ok(cmdFail.isError === true, '命令失败是错误');
+  ok(/无法访问/.test(cmdFail.message), '保留远端原始报错');
+  ok(cmdFail.message.includes('连接正常'), '消息说明连接是通的，AI 才不会去查网络');
+
+  // 连接层失败：stdout/stderr 都空，只有 error
+  const connFail = classifyRemoteError({
+    success: false, host: '192.168.230.129', port: 22,
+    stdout: '', stderr: '', error: 'connect ECONNREFUSED 192.168.230.129:22',
+  });
+  ok(connFail.code === 'REMOTE_REFUSED', `连接失败 → REMOTE_REFUSED（${connFail.code}）`);
+
+  // 负向断言：两者必须可区分（分类若合并，这条会失败）
+  ok(cmdFail.code !== connFail.code, '命令失败与连接失败的分类必须不同，否则 AI 会误判');
+  // 负向断言：把连接类错误文案伪装成"有 stderr"，也不该被误判成命令失败
+  const tricky = classifyRemoteError({
+    success: false, host: 'h', port: 22,
+    stdout: 'connection refused', stderr: '', error: 'connect ECONNREFUSED h:22',
+  });
+  ok(tricky.code === 'REMOTE_REFUSED', `连接类关键词优先（${tricky.code}）`);
 }
 
 console.log('\n[2] 固定前缀被 tool-result 识别为失败');
@@ -49,6 +80,12 @@ console.log('\n[2] 固定前缀被 tool-result 识别为失败');
     const tr = toToolResult(msg);
     ok(tr.isError === true, `${p} 被识别为 isError（${JSON.stringify(tr).slice(0, 120)}）`);
   }
+  // 新增前缀也必须被登记，否则 is_error=false
+  const cmdMsg = classifyRemoteError({
+    success: false, exitCode: 1, host: 'h', port: 22, stdout: '', stderr: 'ls: no such file',
+  }).message;
+  const tr2 = toToolResult(cmdMsg);
+  ok(tr2.isError === true, `REMOTE_CMD_FAILED 被识别为 isError（${JSON.stringify(tr2).slice(0, 120)}）`);
 }
 
 console.log('\n[3] 源码接线：schema / dispatch / KNOWN / MAP / toolLabel / precheck');

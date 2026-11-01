@@ -34,7 +34,7 @@ const FAILURE_PREFIXES = [
   '无结构推理输入', '未找到知识页',
   '阶段接力失败', '未知工具', '文件不存在', '参数错误',
   // 远程执行 / Burp 的固定失败前缀：靠行首字符串判定失败，不登记就会 is_error=false
-  'REMOTE_TIMEOUT', 'REMOTE_AUTH', 'REMOTE_REFUSED', 'REMOTE_UNCONFIGURED',
+  'REMOTE_TIMEOUT', 'REMOTE_AUTH', 'REMOTE_REFUSED', 'REMOTE_UNCONFIGURED', 'REMOTE_CMD_FAILED',
   'BURP_DOWN',
 ];
 
@@ -233,6 +233,14 @@ function toToolResult(value) {
   if (value && typeof value === 'object' && value.__toolError) {
     return { text: String(value.message || '工具调用失败'), isError: true };
   }
+  // Error 实例必须单独处理：JSON.stringify(new Error('x')) === '{}'，
+  // 消息与栈全被丢掉、还被判成"成功"，AI 只收到一个 "{}"。
+  // 这是实测抓到的：dispatch 里若有分支 return 一个 Error，整条链路静默失效。
+  if (value instanceof Error) {
+    const msg = String(value.message || value.name || '工具调用失败');
+    const head = value.name && value.name !== 'Error' ? `${value.name}: ${msg}` : msg;
+    return { text: head, isError: true };
+  }
   if (typeof value === 'string') {
     return { text: value, isError: !!toolFailureReason(value) };
   }
@@ -241,6 +249,11 @@ function toToolResult(value) {
   else if (typeof value === 'object') {
     try { text = JSON.stringify(value, null, 2); } catch (e) { text = String(value); }
   } else text = String(value);
+  // 空文本块对 AI 毫无信息量，且部分协议实现对空 content 不友好。
+  // 给一句明确的"无输出"说明，让 AI 知道是工具没产出而不是自己被截断。
+  if (!text || !String(text).trim()) {
+    return { text: '（工具无输出：返回值为空。请检查是否漏了 return，或改传更具体的参数）', isError: false };
+  }
   return { text, isError: !!toolFailureReason(value) };
 }
 

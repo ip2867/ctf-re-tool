@@ -11,6 +11,10 @@ const PREFIXES = {
   REMOTE_AUTH: 'REMOTE_AUTH',
   REMOTE_REFUSED: 'REMOTE_REFUSED',
   REMOTE_UNCONFIGURED: 'REMOTE_UNCONFIGURED',
+  // 命令本身在远端跑失败（找不到文件、非零退出）——与"连不上"是两回事。
+  // 历史上这两类都归 REMOTE_REFUSED，AI 看到"命令失败"会去查 SSH/网络，
+  // 而真正的原因是命令写错了。实测：`ls /nonexistent` 报 REMOTE_REFUSED。
+  REMOTE_CMD_FAILED: 'REMOTE_CMD_FAILED',
   OK: 'OK',
 };
 
@@ -54,6 +58,21 @@ function classifyRemoteError(input) {
   }
 
   if (i.success === false) {
+    // 区分"连不上"与"命令跑失败"：
+    //   sshExec 在连接层失败时 stdout/stderr 都为空，只有 error 文案；
+    //   命令层失败时 exitCode 有值，错误原文在 stderr（ls 的报错就走 stderr）。
+    // 混为一谈会让 AI 看到"命令写错"却去排查 SSH/网络。
+    const hasStderr = !!(i.stderr && String(i.stderr).trim());
+    const hasOut = !!(i.stdout && String(i.stdout).trim());
+    const ranOnRemote = hasStderr || hasOut || Number.isFinite(Number(i.exitCode));
+    if (ranOnRemote && !/ECONNREFUSED|connection refused|handshake|authentication failed|permission denied/i.test(raw)) {
+      const detail = (hasStderr ? String(i.stderr) : (hasOut ? String(i.stdout) : raw)).trim().slice(0, 400);
+      return {
+        code: PREFIXES.REMOTE_CMD_FAILED,
+        message: `${PREFIXES.REMOTE_CMD_FAILED} ${target}（命令在远端执行失败，连接正常）：${detail}`,
+        isError: true,
+      };
+    }
     return {
       code: PREFIXES.REMOTE_REFUSED,
       message: `${PREFIXES.REMOTE_REFUSED} ${target}（${raw || '命令执行失败'}）`,
@@ -63,9 +82,12 @@ function classifyRemoteError(input) {
 
   const code = i.exitCode == null ? 0 : Number(i.exitCode);
   if (Number.isFinite(code) && code !== 0) {
+    // 非零退出码是"命令本身失败"（ls 找不到文件、grep 无匹配），不是连接问题。
+    // 保留 stderr/stdout 原文便于 AI 直接看到远端报错。
+    const detail = String(i.stderr && String(i.stderr).trim() ? i.stderr : (i.stdout || raw)).trim().slice(0, 400);
     return {
-      code: PREFIXES.REMOTE_REFUSED,
-      message: `${PREFIXES.REMOTE_REFUSED} ${target}（退出码 ${code}）：${String(i.stdout || raw).slice(0, 400)}`,
+      code: PREFIXES.REMOTE_CMD_FAILED,
+      message: `${PREFIXES.REMOTE_CMD_FAILED} ${target}（退出码 ${code}，连接正常）：${detail}`,
       isError: true,
     };
   }

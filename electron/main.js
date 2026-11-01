@@ -8340,7 +8340,11 @@ function getToolDefinitions() {
       name: "remote_exec",
       description:
         "执行命令。host='kali' 走 SSH（config.kali），host='local' 走本地 shell。默认 20s 超时。" +
-        "失败返回固定前缀：REMOTE_TIMEOUT / REMOTE_AUTH / REMOTE_REFUSED / REMOTE_UNCONFIGURED（均为错误）。",
+        "失败返回固定前缀（均为错误，看前缀决定下一步）：\n" +
+        "· REMOTE_TIMEOUT / REMOTE_AUTH / REMOTE_REFUSED / REMOTE_UNCONFIGURED → **连接层**问题，" +
+        "去查 Kali 是否开机、密码、端口、配置；\n" +
+        "· REMOTE_CMD_FAILED → 连接正常但**命令本身失败**（找不到文件/非零退出），" +
+        "看后面的远端原始报错改进命令，**不要**去查网络。",
       input_schema: {
         type: "object",
         properties: {
@@ -10133,6 +10137,15 @@ async function executeToolCall(toolName, input) {
     // 工具内部已经判定失败（并希望保留类型化异常）时，原样上抛给主循环；
     // 只有真正的意外异常才改写成文本。
     if (err && err.__toolError) throw err;
+    // ⚠️ ReferenceError / TypeError 是**代码缺陷**，不是"工具这次失败了"。
+    // 历史上这里把一切的都改写成 `工具调用失败: xxx is not defined`，
+    // 结果 extract_payload 因为主进程漏了 buildPayloadExtractPython，
+    // 100% 不可用却看起来像"参数/环境问题"，测试全绿、AI 反复换参数重试。
+    // 这类错误必须带上可定位的标记，让 AI（和测试）能一眼区分"链路断了"。
+    if (err instanceof ReferenceError || err instanceof TypeError) {
+      return `工具实现缺陷（不是参数问题，不要重试同一调用）: ${err.name}: ${err.message}`
+        + `\n（请把这条原样反馈给用户：${toolName} 的分支引用了未定义的符号或类型不匹配。）`;
+    }
     return `工具调用失败: ${err.message}`;
   }
 }

@@ -1,25 +1,26 @@
-# CTF-RE-TOOL v1.10.0
+# CTF-RE-TOOL v1.11.0
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)]()
 [![Electron](https://img.shields.io/badge/Electron-35-47848F?logo=electron&logoColor=white)]()
 
-一个基于 Electron 的 **CTF 逆向 AI 解题工作台**（Windows 桌面应用）。把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成一条 AI 可自主驱动的流水线，并通过 MCP 实时接入 **IDA / JEB / Burp**，内置 **13 个逆向方法论技能**（Skills）与**可检索的结构化知识库**（Wiki）。
+一个基于 Electron 的 **CTF 逆向 AI 解题工作台**（Windows 桌面应用）。把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成一条 AI 可自主驱动的流水线，并通过 MCP 实时接入 **IDA / JEB / Burp**，内置 **13 个逆向方法论技能**（Skills）与 **64 篇可检索结构化知识库**（Wiki），提供 **57 个 AI 可调用工具**。
 
 设计原则：**AI 是解题主体，工具提供能力**。不是把功能堆在一起，而是让 AI 在解题过程中真正调用工具、识别算法、验证结论。
 
 - **AI 工具循环（Tool-Use）**：AI 自主调用 JEB/IDA/Frida/Python 等工具反复推进，而不是一次性问答；分阶段提示词（①收集 → ②定位算法 → ③写脚本本地验证 → ④结论）。
-- **动态调试闭环**：IDA 调试器可直接下断点、单步、读写内存，覆盖本地 PE 与 Kali 远程 ELF；先静态取数锁定函数，再定向取证。
-- **花指令自动修复**：11 类花指令特征识别 + 只 nop 跳转本身的等长修补（字节偏移与语义都不变），修复后自动让 IDA 重新分析并等到就绪；实测把非对齐跳转降 78%、边界冲突点降 98%，让原本反编译失败的关键函数变得可读。
-- **运行期探测**：`snapshot_diff` 前后快照就地差分，直接量出混淆代码对数据做了什么；`force_continue` 强制改寄存器让被提前打断的循环跑满；`global_reads` 统计全局引用识别单行校验；`angr_solve` 生成绕开 libc 启动并 hook 间接跳转的符号执行脚本。
+- **符号求解（`z3_solve`）**：AI 只写约束代码，工具自动补全脚本并返回结构化 JSON（sat/unsat/model/明文串）。内置 `lookup_expr` 查表辅助与 `rotl/zext/lshr` 等别名，**查表用无符号比较**——用有符号比较会让一半索引查错（实测 128/256）。
+- **动态调试闭环**：IDA 调试器可直接下断点、单步、读写内存，覆盖本地 PE 与 Kali 远程 ELF；**动调前先跑能力自检**（SSH 通 ≠ 能调：yama scope、gdb 缺失、ptrace 实测）。
+- **算法指纹扫描（`scan_crypto`）**：直接读文件字节，覆盖 SM4/AES/SM3/MD5/SHA1/SHA256/TEA/CRC32/RC4/ChaCha20/Blowfish/Base64，不依赖 IDA、不受引用关系限制。大二进制里的标准库常量会自动降级为 low（避免把 BoringSSL 的 sigma 常量当成题目算法）。
+- **花指令自动修复**：11 类花指令特征识别 + 只 nop 跳转本身的等长修补（字节偏移与语义都不变），修复后自动让 IDA 重新分析并等到就绪；实测把非对齐跳转降 78%、边界冲突点降 98%。
 - **本地验证闭环**：AI 给出的每个 flag 都附 `[VERIFY]` 契约，工具自动生成 Python 复现脚本本地跑一遍，标注 ✅已验证 / ⚠️未验证——**不靠"AI 说解出来了"就当解出来了**。
-- **结构化知识库**：58 篇可检索条目（51 篇 reverse + 6 篇 frida + 1 篇 firmware），每条带 `attack_chain` 解法链 / `failed_attempts` 避坑；按题目特征自动预取，命中即注入 AI 上下文。
+- **结构化知识库**：64 篇可检索条目（54 篇 reverse + 6 篇 frida + 1 篇 firmware + 3 篇索引），每条带 `attack_chain` 解法链 / `failed_attempts` 避坑；按题目特征自动预取，命中即注入 AI 上下文。
 - **经验自进化**：每次解题沉淀的多步攻击链写入经验库，下次同类题自动速查复用。
 
-**下载**：[v1.10.0 便携版 CTF-RE-TOOL.exe](https://github.com/ip2867/ctf-re-tool/releases/download/v1.10.0/CTF-RE-TOOL.exe)（74.22 MB，单文件双击即用，无需安装 / 无需 Node.js）
+**下载**：[v1.11.0 便携版 CTF-RE-TOOL.exe](https://github.com/ip2867/ctf-re-tool/releases/download/v1.11.0/CTF-RE-TOOL.exe)（77.86 MB，单文件双击即用，无需安装 / 无需 Node.js）
 
-> 校验：`SHA256 = 0ce81a10ce0c0a25c925cd0e5ba45206e0f4eefcd1685952d741c61719f23baf`（也可直接下载 [.sha256](https://github.com/ip2867/ctf-re-tool/releases/download/v1.10.0/CTF-RE-TOOL.exe.sha256)）
+> 校验：`SHA256 = 4af40f02e05b8754784e91dd141371c44e0ce53fcb92c5a23251d68291d3ae5d`（也可直接下载 [.sha256](https://github.com/ip2867/ctf-re-tool/releases/download/v1.11.0/CTF-RE-TOOL.exe.sha256)）
 >
 > 首次运行请在「设置」页填写 IDA / JEB / jadx 等外部工具路径（本工具是调度框架，不含这些工具）。
 
@@ -74,7 +75,7 @@ IDA Pro、JEB、jadx（静态分析）、DIE（查壳）、UPX、apktool（脱�
 ### 7. Agent Skills 方法论库
 `skills/` 目录 + SKILL.md 格式，兼容 Anthropic Agent Skills。
 
-内置 11 个中文方法论：题解写作、Android、二进制、自动化求解（Z3/angr/Unicorn）、语言特定（Python 字节码/Go/Rust/Lua）、IoT 固件、密码识别、反调试、Frida 动态、JS 逆向、总调度。
+内置 13 个中文方法论：总调度、二进制逆向、Android、语言特定（Python 字节码/Go/Rust/Lua）、自动化求解（Z3/angr/Unicorn）、IoT 固件、密码识别、反调试、Frida 动态、JS 逆向、题解写作、工具链。
 
 AI 通过 `read_skill` 按需加载，系统提示只注入索引。也可往 `%APPDATA%/ctf-reverse-tool/skills/` 放自己的技能，重启生效。
 
@@ -97,7 +98,7 @@ AI 通过 `read_skill` 按需加载，系统提示只注入索引。也可往 `%
 
 ### 11. 结构化知识库 + 检索体系（v1.3.5 重构）
 - **三层结构**：`AI-SEARCH-INDEX.md`（全局检索索引，按技术标签定位资源）→ `PAYLOAD-CHEATSHEET.md`（逆向套路/Payload/脚本速查）→ 各专题页
-- **历年逆向题条目库（`wiki/reverse/`，43 篇）**：从公开题库筛选的纯逆向题，每题一个页面，带结构化 meta：
+- **历年逆向题条目库（`wiki/reverse/`，53 条 = 43 题 + 10 篇方法）**：每题一个页面，带结构化 meta：
   - `attack_chain` —— 完整解法链（特征 → 关键步骤 → 坑 → 出 flag）
   - `reasoning_chain` —— 思维链（怎么想到这条路的）
   - `failed_attempts` —— 走不通的路与原因（**往往比成功更有价值**）
@@ -236,12 +237,13 @@ ctf-tool-v2/
 │   ├── ctf-reverse-tooling/   #   Z3/angr/Unicorn 自动化求解 + 迷宫题
 │   ├── ctf-frida-dynamic/ ctf-antidebug/ ctf-jsreverse/
 │   ├── ctf-iot-firmware/ ctf-crypto-identify/ ctf-writeup/
-├── wiki/                 # 可检索结构化知识库（50 条，AI 经 wiki_search/wiki_read 检索）
+├── wiki/                 # 可检索结构化知识库（64 篇，AI 经 wiki_search/wiki_read 检索）
 │   ├── AI-SEARCH-INDEX.md      # 全局检索索引（优先读）
 │   ├── PAYLOAD-CHEATSHEET.md   # 逆向套路/Payload/脚本速查
-│   ├── reverse/                # 43 篇历年逆向题（YAML meta：attack_chain/reasoning_chain/failed_attempts）+ _INDEX.md
+│   ├── reverse/                # 54 篇（含 _INDEX.md；YAML meta：attack_chain/reasoning_chain/failed_attempts）
 │   ├── frida/                  # 6 篇动态 Hook 手法页
 │   └── firmware/               # 固件解包与仿真
+├── tests/                # 128 个测试文件（含真跑 dispatch 的端到端链路测试）
 ├── assets/icons/         # 应用图标
 ├── LICENSE               # MIT
 ├── 启动.bat              # Windows 快速启动
@@ -368,6 +370,56 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 | [CHANGELOG-ARCHIVE.md](docs/CHANGELOG-ARCHIVE.md) | v1.4.0 及更早的更新日志 |
 
 ## 更新日志
+
+### v1.11.0 (2026-11-01) — 把「工具能用」变成「链路可证」
+
+这一版的主题是**证明工具真的能解题**，而不是"测试全绿"。上一版遗留的问题是：
+121 项测试**全部**是"在源码里找 `case 'xxx':`"——这正是 `extract_payload` 因
+主进程漏了一个函数、运行时抛 `ReferenceError`、却测试全绿的机制。
+
+**一、补上能真正执行代码的测试层（关键）**
+
+用 `Module._load` 拦截 `require('electron')`，再用 `Module._compile` 加载真实的
+`electron/main.js`，末尾注入钩子导出 `executeToolCall` / `getToolDefinitions` /
+`precheckToolCall`。于是 **57 个工具第一次能被真正调用**，并由此抓出 4 个静默失效：
+
+| 缺陷 | 后果 |
+|---|---|
+| `toToolResult(new Error('x'))` → `"{}"`，`isError=false` | 错误消息与栈全丢，AI 只收到一个 `{}`，以为工具成功了 |
+| 工具返回空时给出空文本块 | AI 无法分辨"无输出"与"被截断" |
+| `ReferenceError`/`TypeError` 被改写成 `工具调用失败: xxx` | 代码缺陷与参数错误无法区分，AI 反复换参数重试 |
+| `ls /nonexistent` → `REMOTE_REFUSED（端口拒绝连接）` | AI 去查 Kali 是否开机/网络，真实原因是命令写错 |
+
+**二、新增能力**
+
+| 能力 | 说明 |
+|---|---|
+| `z3_solve` | 符号求解：只写约束代码，工具补全脚本并返回结构化 JSON。内置 `lookup_expr` 查表辅助（**必须用无符号比较**，有符号版本实测 128/256 索引查错）、`rotl/zext/lshr/ashr/bswap32` 等别名 |
+| 动调能力自检 | `kali_probe.py` + `decideDynDebugReadiness()`：以 **ptrace 实测结果优先于 scope 值**，区分"SSH 通"与"真能调" |
+| 常量指纹补全 | 新增 ChaCha20/Salsa20 sigma、SHA1 IV（必须 16B 大端，否则与 MD5-IV 撞车）、SHA256 K[0]、Blowfish P；大二进制自动降级为 low |
+| `recipe` 使用指引 | CyberChef 式变换链，按"printable 跳升 + 熵下降"判断真明文在哪一层 |
+| LCG 参数恢复 | 差分消元求模数（**原始值消元的 gcd 恒为 1，无用**）；`pow(-1)` 成败取决于 `c` 的奇偶而非"模 2^k" |
+| `REMOTE_CMD_FAILED` | 区分"命令写错"与"连不上"，消息里注明"连接正常" |
+
+**三、审查抓到的旧缺陷（含两条指纹表写错字节）**
+
+- `TEA-DELTA-INV` 写成 `47 c8 86 61`（应为 `47 86 c8 61`）→ 这条指纹**永远匹配不到**
+- `SM4-FK` / `SM4-FK-BE` 的名字与端序描述**写反**，已按实际字节序改名为 `SM4-FK-LE`/`SM4-FK-BE`
+- `zext(x, 24)` 与 z3 原生 `ZeroExt(24, x)` 参数顺序相反 → 改为两种顺序都接受
+- `decideDynDebugReadiness` 定义了却**从未被调用**（无 IPC、无 preload）→ 已接线
+
+**四、Skill 知识并入**
+
+- `ctf-crypto-identify`：通用工作流、按现象反推改动形态、轻量编码层（ROT/栅栏/仿射/自定义 Base）、PRNG
+- `ctf-reverse-tooling`：z3 三条硬要求（**解出后必须回代验证**、多解显式排除、位宽选错是首因）；「调用式偷懒」——函数可独立调用时用 Unicorn 黑盒枚举，不复刻算法
+- `ctf-antidebug`：信号类反调试家族（SIGILL/SIGFPE/fork+pipe/INT3/rdtsc）、反沙箱、综合绕过优先级（**换执行环境优先**）
+
+**五、测试**
+
+- 全量回归 **128/128 通过**（新增 11 个测试文件、95 项断言，含 21 条负向断言）
+- 三道合成题**必须真解出 flag**：XOR 链、魔改 S 盒+跨字节累加、内嵌载荷多阶段；解出的与随机真答案逐字节一致，且回代原始校验函数通过
+- 负向对照：改错密钥解出不同明文；用标准 TEA delta 解魔改密文得到乱码
+- Kali 实机：`ptrace PTRACE_OK`、gdb/gdbserver/strace/objdump/capstone/unicorn/z3 均可用，仅 `qemu-riscv32` 缺失
 
 ### v1.10.0 (2026-10-31) — 让 AI 看得更全、判断更准、不再被工具自身误导
 

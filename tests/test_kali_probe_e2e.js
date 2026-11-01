@@ -43,9 +43,18 @@ function probe() {
 }
 
 const r = probe();
-if (!r) {
-  skip('Kali 实测映射', '探测无输出（SSH 不通或未配置）');
-  console.log(`\n结果: ${pass} 通过, ${fail} 失败（含跳过）`);
+// probe 有三种"不可用"形态，都必须跳过而不是硬跑断言：
+//   ① 完全没有输出（解析失败）
+//   ② 顶层 error 字段（SSH 端口不可达 / 未配置）——形如 {ok:false, error:"REFUSED"}
+//   ③ results 为空（探测没跑起来）
+// 早期实现只判了 ①，于是 Kali 关机时 ② 被当成"探测成功"，用空 results 造出入参，
+// 得出 ok=true，再断言"与 probe.ok 一致"必然失败——这是测试自身的缺陷。
+const probeUnusable = !r || r.error || !Array.isArray(r.results) || r.results.length === 0;
+if (probeUnusable) {
+  const why = !r ? '探测无输出（SSH 不通或未配置）'
+    : (r.error ? `探测失败：${r.error} ${r.detail || ''}`.trim() : '探测未返回 results');
+  skip('Kali 实测映射', why);
+  console.log(`\n结果: ${pass} 通过, ${fail} 失败（已跳过）`);
   if (fail > 0) process.exit(1);
   process.exit(0);
 }

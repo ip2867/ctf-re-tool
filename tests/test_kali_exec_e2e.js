@@ -78,7 +78,9 @@ const { execFileSync } = require('child_process');
     if (t) { try { probeJson = JSON.parse(t); } catch (_) { /* ignore */ } }
   }
   if (!probeJson || probeJson.ok !== true) {
-    console.log('  SKIP —— Kali 不可达（probe.ok !== true），远程链路本次不验证');
+    const why = !probeJson ? '探测无输出'
+      : (probeJson.error ? `${probeJson.error} ${probeJson.detail || ''}`.trim() : 'probe.ok !== true');
+    console.log(`  SKIP —— Kali 不可达（${why}），远程链路本次不验证`);
     console.log(`\n结果: ${pass} 通过, ${fail} 失败（已跳过）`);
     process.exit(fail > 0 ? 1 : 0);
   }

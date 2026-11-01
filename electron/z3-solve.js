@@ -69,6 +69,20 @@ def _bswap8(v):
                   Extract(23, 16, v), Extract(31, 24, v))
 _g['bswap32'] = _bswap8
 
+# 1c) 查表辅助：把 256 字节常量表变成 z3 表达式（平衡 If 树）。
+#     ⚠️ 比较必须用 ULT（无符号）。写 If(v < K, A, B) 时 z3 按有符号比较，
+#     索引 >= 0x80 会被当成负数 → 前一半条目全部查错，
+#     表现是"明明有解却报 unsat"（实测 128/256 项错）。这是本项目踩过的坑。
+def _lookup_expr(var, table, width=8):
+    """table: list[(index, value)]，按 index 升序。返回 z3 表达式。"""
+    if len(table) == 1:
+        return BitVecVal(table[0][1], width)
+    mid = len(table) // 2
+    return If(ULT(var, BitVecVal(table[mid][0], width)),
+              _lookup_expr(var, table[:mid], width),
+              _lookup_expr(var, table[mid:], width))
+_g['lookup_expr'] = _lookup_expr
+
 _code = base64.b64decode("${b64}").decode("utf-8")
 
 # 2) 执行约束代码

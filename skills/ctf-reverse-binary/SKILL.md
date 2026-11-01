@@ -265,6 +265,50 @@ if solver.check() == sat:
 
 ## 6. 动态取密钥（本工具环境）
 
+### 6.0-1 环境自检：动调前先确认"真能调"（实测沉淀）
+
+**SSH 通 ≠ 能动态调试。** 实测在 Kali 上同时踩到三种"看着通却调不了"：
+
+| 症状 | 真因 | 判定与处理 |
+|---|---|---|
+| 断点设了不命中 / attach EPERM | `yama ptrace_scope=1` | `cat /proc/sys/kernel/yama/ptrace_scope`；=1 只能 attach 子进程，`echo 0 \| sudo tee ...` |
+| 完全没有断点能力 | 远端没装 gdb / gdbserver | `command -v gdb`、`command -v gdbserver` |
+| 自检报 `No such process` | **自检程序自己写错**：TRACEME 后直接 CONT，抢在 exec/stop 之前 | 必须先 `raise(SIGSTOP)` 等父进程，再 CONT（见下） |
+
+**一次性自检**（推荐每次动调前跑，10 秒）：
+```bash
+python tests/kali_probe.py          # 人类可读
+python tests/kali_probe.py --json   # 机器可读，ok/blockers/warns 结构化
+```
+它会读 `config.json` 的 `kali` 段（也可用 `KALI_HOST/KALI_USER/KALI_PASS` 覆盖），
+输出：arch / kernel / ptrace_scope / gdb / gdbserver / python3 / z3 / capstone /
+unicorn / strace / objdump / gcc / qemu-riscv32 + **ptrace 实测**。
+退出码 0=可用，2=未配置或 SSH 不通。
+
+**关键判据是"实测"不是"看配置"**：`ptrace_scope=0` 也可能因容器 seccomp 而失败，
+所以判定顺序必须是「ptrace 实跑结果优先，scope 值只作参考」。
+工具侧对应 `decideDynDebugReadiness()`（`electron/kali-preflight.js`）。
+
+**正确的 ptrace 自检写法**（踩过的坑，直接抄）：
+```c
+pid_t p = fork();
+if (p == 0) {
+    ptrace(PTRACE_TRACEME, 0, 0, 0);
+    raise(SIGSTOP);                    /* ← 缺这句会拿到 "No such process" */
+    execl("/bin/true", "true", NULL);
+    _exit(3);
+}
+waitpid(p, &st, 0);                    /* 等 SIGSTOP */
+ptrace(PTRACE_CONT, p, 0, 0);
+waitpid(p, &st, 0);                    /* 等 exec/trap */
+struct user_regs_struct r;
+ptrace(PTRACE_GETREGS, p, 0, &r);      /* 能读到 rip 才算通 */
+```
+
+**虚拟机没开机**：`vmrun` 常不在 PATH（实测在 `E:\xnj\vmrun.exe`），
+用绝对路径 `vmrun -T ws start "<vmx>" nogui`，再用 `vmrun -T ws list` 确认。
+开机后 SSH 立即可用（实测 0s），不用等。
+
 ### 6.0 入场条件：静态跑完再调试（**最重要的一条纪律**）
 
 **动态调试不是探索手段，是取证手段。** 它只回答"这个值运行时是多少"，

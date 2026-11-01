@@ -824,8 +824,18 @@ const CRYPTO_FP = [
   ['AES-INV-SBOX', '52 09 6a d5 30 36 a5 38', 'AES 逆 S 盒首 8 字节（解密码表）'],
   ['SM3-IV', '73 80 16 6f 49 14 b2 b9 17 24 42 d7', 'SM3 IV（铁证，出现即 SM3）'],
   ['MD5-IV', '01 23 45 67 89 ab cd ef', 'MD5 IV（小端存放）'],
+  // SHA1 的 IV 与 MD5 前两个 dword 数值相同，区别在**字节序**：SHA1 全程大端，MD5 小端。
+  // 因此 SHA1 的指纹必须是 16 字节大端形态；只写 8 字节会与 MD5-IV 撞车。
+  ['SHA1-IV', '67 45 23 01 ef cd ab 89 98 ba dc fe 10 32 54 76', 'SHA1 IV（大端存放，16B 才能与 MD5 区分）'],
   ['SHA256-IV', '67 e6 09 6a 85 ae 67 bb', 'SHA256 IV（小端存放）'],
+  ['SHA256-K0', '98 2f 8a 42', 'SHA256 轮常量表首项 0x428A2F98（小端）'],
   ['TEA-DELTA', 'b9 79 37 9e', 'TEA/XTEA delta 0x9E3779B9（小端）'],
+  // ChaCha20/Salsa20 的 sigma 常量以**字符串**形式硬编码（"expand 32-byte k"）。
+  // 这是 FindCrypt 系工具最有辨识度的一条：命中即流密码，且能立刻区分 ChaCha/Salsa
+  // 与 AES-CTR（后者没有该常量）。
+  ['CHACHA-SIGMA', '65 78 70 61 6e 64 20 33 32 2d 62 79 74 65 20 6b', 'ChaCha20/Salsa20 sigma 常量 "expand 32-byte k"'],
+  // Blowfish 的 P 数组前两项（π 的小数位），后接 4 个 256 项 32 位 S 盒。
+  ['BLOWFISH-P', '88 6a 3f 24 d3 08 a3 85', 'Blowfish P 数组首 2 项 0x243F6A88 0x85A308D3（小端）'],
   ['TEA-DELTA-INV', '47 c8 86 61', 'TEA delta 取反 0x61C88647（小端）'],
   ['CRC32-POLY', '20 83 b8 ed', 'CRC32 多项式 0xEDB88320（小端）'],
   // ⚠️ 旧条目 '00 01 02 03 04 05 06 07 08 09' 已删除：这 10 个字节几乎出现在每个程序里
@@ -2956,7 +2966,18 @@ function scanCryptoFingerprints(filePath) {
     }
   }
   if (!out.some(o => o.fp === 'MD5-K') && has('MD5-IV')) summary.push({ algo: 'MD5', confidence: 'medium', evidence: 'MD5 IV', note: '哈希：爆破/碰撞/截断比较。' });
+  // 大二进制降级闸门（与 CUSTOM-BLOCK 分支同一判据，见下方 bigBinary 注释）：
+  // >16MB 基本是通用程序（浏览器/运行时），里面合法地嵌着各密码库的标准常量
+  // （实测 electron.exe 内嵌 BoringSSL，含 "expand 32-byte k"）→ 只能当线索，不能当结论。
+  const hugeBinary = size > 16 * 1024 * 1024;
+  const hugeNote = hugeBinary ? '（⚠️ 文件 >16MB，属通用程序量级，此常量可能来自其自带密码库，非本题算法）' : '';
+  const hugeConf = (c) => (hugeBinary ? 'low' : c);
   if (has('SHA256-IV')) summary.push({ algo: 'SHA256', confidence: 'medium', evidence: 'SHA256 IV', note: '哈希：同上。' });
+  if (has('SHA1-IV')) summary.push({ algo: 'SHA1', confidence: hugeConf('medium'), evidence: 'SHA1 IV（大端 16B，与 MD5 的字节序相反）' + hugeNote, note: '哈希：爆破/碰撞/长度扩展（SHA1(key||msg) 可做 length-extension）。' });
+  // CHACHA-SIGMA 只在流密码里出现，且是字符串常量 → 强证据（但大二进制要降级）。
+  if (has('CHACHA-SIGMA')) summary.push({ algo: 'ChaCha20/Salsa20', confidence: hugeConf('high'), evidence: 'sigma 常量 "expand 32-byte k"' + hugeNote, note: '按流密码解：ChaCha20 需 32B key + 12B nonce（或 16B=Salsa 形态）；注意 counter 初值。' });
+  if (has('BLOWFISH-P')) summary.push({ algo: 'Blowfish', confidence: hugeConf('medium'), evidence: 'P 数组首 2 项 0x243F6A88/0x85A308D3' + hugeNote, note: '16 轮 Feistel + 4×256 个 32 位 S 盒；变体常改 P/S。' });
+  if (has('SHA256-K0')) summary.push({ algo: 'SHA256', confidence: 'low', evidence: 'SHA256 轮常量表首项 0x428A2F98' + hugeNote, note: '单条常量证据弱（该值也可能出现在别处）；配合 IV 或 64 项常量表确认。' });
   if (has('CRC32-POLY')) summary.push({ algo: 'CRC32', confidence: 'medium', evidence: 'CRC32 多项式', note: '短输入可碰撞爆破（注意自定义初值/异或）。' });
   if (has('RC4-ID')) summary.push({ algo: 'RC4', confidence: 'medium', evidence: '完整 0..255 初值表（KSA 初始化特征）', note: '按 RC4 解；仍需在代码中确认 KSA 循环（`j=(j+S[i]+key[i%len])&0xff`）。' });
   if (has('B64-STD')) summary.push({ algo: 'Base64', confidence: 'low', evidence: '标准 Base64 表', note: '编码非加密；可能是自定义表 Base64 的对照。' });

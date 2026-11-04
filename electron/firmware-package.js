@@ -52,35 +52,83 @@ function findMagics(buf) {
   return hits.sort((a, b) => a.offset - b.offset);
 }
 
-// ── 通用"描述符表"探测：连续的 (offset, length, [digest]) 三元组 ──
-// 判据：从某个起点开始，若干个 u32 对 (off,len) 满足
-//   · 0 < off < fileSize 且 len > 0 且 off+len <= fileSize
-//   · 至少 2 组，且各段区间不重叠（或允许重叠但需明确标志）
+// ── 通用"描述符表"探测 ──
+// 判据：从某个起点开始，若干个连续的 u32 字段组满足
+//   · 前两个 u32 是 (off, len)：0 < off < fileSize 且 len > 0 且 off+len <= fileSize
+//   · 至少 2 组
+//
+// ⚠️ **步长不能只试 8**（实测踩过）：qwb2026 的 OTA 是 `(off, len, crc)` 三元组，
+// 步长 **12 字节**。只试 8 会完全检不出描述符表，进而漏掉整个多段结构。
+// 常见步长：8（off,len）/ 12（off,len,crc32）/ 16（off,len,crc,flags）/ 20 / 24（含 16B 摘要）。
+const DESC_STRIDES = [8, 12, 16, 20, 24, 32];
+
+/**
+ * 评估一个候选：越多的段"首尾相接"（off[i] == off[i-1]+len[i-1]）越可信，
+ * 因为多段 OTA 通常把镜像连续切分后分散存放。
+ * 若候选里带 crc 字段且能与段内容的 CRC32 对上，额外加分。
+ */
+function scoreDescriptor(cand, buf, stride) {
+  let contiguous = 0;
+  for (let i = 1; i < cand.entries.length; i++) {
+    const prev = cand.entries[i - 1];
+    if (cand.entries[i].off === prev.off + prev.len) contiguous++;
+  }
+  let crcHits = 0;
+  if (stride >= 12) {
+    for (const e of cand.entries) {
+      if (e.crc == null) continue;
+      const seg = buf.slice(e.off, e.off + e.len);
+      if ((crc32(seg) >>> 0) === (e.crc >>> 0)) crcHits++;
+    }
+  }
+  cand.contiguous = contiguous;
+  cand.crcHits = crcHits;
+  cand.score = contiguous * 10 + crcHits * 20 + cand.entries.length;
+  return cand;
+}
+
+/** 标准 CRC32（IEEE 802.3，与 zlib 一致） */
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    c ^= buf[i];
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
 function findDescriptorTable(buf, opts) {
   const o = opts || {};
   const maxDesc = o.maxDesc || 16;
+  const strides = o.strides || DESC_STRIDES;
   const results = [];
-  for (let start = 0; start + 8 * 2 <= buf.length; start += 4) {
-    for (let n = 2; n <= maxDesc; n++) {
-      let ok = true;
-      const descs = [];
-      for (let i = 0; i < n; i++) {
-        const o2 = start + i * 8;
-        if (o2 + 8 > buf.length) { ok = false; break; }
-        const off = buf.readUInt32LE(o2);
-        const len = buf.readUInt32LE(o2 + 4);
-        if (!(off > 0 && off < buf.length && len > 0 && off + len <= buf.length)) { ok = false; break; }
-        descs.push({ off, len });
+  for (const stride of strides) {
+    const pairsPerEntry = Math.floor(stride / 4);
+    if (pairsPerEntry < 2) continue;
+    for (let start = 0; start + stride * 2 <= buf.length; start += 4) {
+      for (let n = 2; n <= maxDesc; n++) {
+        let ok = true;
+        const descs = [];
+        for (let i = 0; i < n; i++) {
+          const base = start + i * stride;
+          if (base + stride > buf.length) { ok = false; break; }
+          const off = buf.readUInt32LE(base);
+          const len = buf.readUInt32LE(base + 4);
+          if (!(off > 0 && off < buf.length && len > 0 && off + len <= buf.length)) { ok = false; break; }
+          const e = { off, len };
+          if (pairsPerEntry >= 3) e.crc = buf.readUInt32LE(base + 8);
+          descs.push(e);
+        }
+        if (!ok) continue;
+        const total = descs.reduce((s, d) => s + d.len, 0);
+        if (total >= buf.length) continue;          // 拒绝"整段就是文件本身"
+        results.push({ tableOffset: start, count: n, stride, entries: descs, totalLen: total });
       }
-      if (!ok) continue;
-      // 拒绝"整段就是文件本身"的平凡解
-      const total = descs.reduce((s, d) => s + d.len, 0);
-      if (total >= buf.length) continue;
-      results.push({ tableOffset: start, count: n, entries: descs, totalLen: total });
     }
   }
-  // 只保留"最长且起点最早"的那一组（后续更长的会覆盖）
-  results.sort((a, b) => (b.count - a.count) || (a.tableOffset - b.tableOffset));
+  // 按可信度排序：段首尾相接 + CRC 命中 > 段数 > 起止位置
+  for (const r of results) scoreDescriptor(r, buf, r.stride);
+  results.sort((a, b) => (b.score - a.score) || (b.count - a.count) || (a.tableOffset - b.tableOffset));
   return results.slice(0, 3);
 }
 
@@ -127,12 +175,34 @@ function analyzePackage(buf) {
   if (tables.length) {
     const best = tables[0];
     out.descriptors = best.entries;
+    out.descriptorStride = best.stride;
     lines.push('');
-    lines.push(`## 描述符表 @0x${best.tableOffset.toString(16)}（${best.count} 段）`);
+    lines.push(`## 描述符表 @0x${best.tableOffset.toString(16)}（${best.count} 段，步长 ${best.stride} 字节）`);
     for (let i = 0; i < best.entries.length; i++) {
       const e = best.entries[i];
+      // CRC 字段若存在，说明它是校验和；标出「校验的是明文还是密文」
+      let crcNote = '';
+      if (e.crc != null) {
+        const seg = buf.slice(e.off, e.off + e.len);
+        const ok = (crc32(seg) >>> 0) === (e.crc >>> 0);
+        crcNote = ok
+          ? `，CRC32=0x${e.crc.toString(16).padStart(8, '0')} ✓ 与**当前段内容**匹配`
+          : `，CRC32=0x${e.crc.toString(16).padStart(8, '0')} ✗ 与当前段内容不匹配`
+            + `（可能校验的是**解密后的明文**，或算法不是标准 CRC32）`;
+      }
       lines.push(`- #${i} 源偏移 0x${e.off.toString(16)} 长度 ${e.len}（0x${e.len.toString(16)}）`
-        + ` → 结束 0x${(e.off + e.len).toString(16)}`);
+        + ` → 结束 0x${(e.off + e.len).toString(16)}${crcNote}`);
+    }
+    // 段间是否首尾相接
+    if (best.contiguous != null) {
+      lines.push(`- 相邻段连续性：${best.contiguous}/${best.count - 1} 处首尾相接`
+        + (best.contiguous === best.count - 1 ? '（镜像被连续切分后分散存放）' : ''));
+    }
+    if (best.crcHits > 0) {
+      lines.push(`- **${best.crcHits} 个段的 CRC 与字段一致** → 描述符解读正确`);
+    } else if (best.stride >= 12 && best.entries.some((e) => e.crc != null)) {
+      lines.push('- ⚠️ 所有 CRC 都对不上当前段内容 → 该段很可能**是密文**，'
+        + 'CRC 校验的是解密后的明文（实测 qwb2026 即此形态，说明解密在验证方内部完成）');
     }
     // 拼回
     const asm = assembleByDescriptors(buf, best.entries);
@@ -234,4 +304,4 @@ except Exception as e:
   return out;
 }
 
-module.exports = { analyzePackage, findMagics, findDescriptorTable, assembleByDescriptors, entropy, findDigestMatches, MAGICS };
+module.exports = { analyzePackage, findMagics, findDescriptorTable, assembleByDescriptors, entropy, findDigestMatches, crc32, MAGICS };

@@ -391,6 +391,54 @@ t('findDescriptorTable + assembleByDescriptors：分段拼回正确', () => {
   assert.strictEqual(asm.toString('latin1'), 'AAAAAAAAAABBBBBBBBCCCCCCCCC', '拼回内容不对');
 });
 
+t('描述符步长支持 12 字节 (off,len,crc) —— 只试 8 会完全漏掉（实测 qwb2026 形态）', () => {
+  // 复刻 qwb2026 的真实布局：0x3c 起 3 个 (off,len,crc) 三元组，段首尾相接
+  const segs = [Buffer.from('1111111111111', 'latin1'), Buffer.from('222222222222', 'latin1'), Buffer.from('3333333333333', 'latin1')];
+  const head = Buffer.alloc(0x3c);
+  head.write('QWBP', 0, 'latin1');
+  const tbl = Buffer.alloc(36);
+  const dataStart = 0x60;
+  let o = dataStart;
+  for (let i = 0; i < 3; i++) {
+    tbl.writeUInt32LE(o, i * 12);
+    tbl.writeUInt32LE(segs[i].length, i * 12 + 4);
+    tbl.writeUInt32LE(0xdeadbeef, i * 12 + 8);   // CRC 故意错（模拟"校验明文"）
+    o += segs[i].length;
+  }
+  const payload = Buffer.concat(segs);
+  const buf = Buffer.concat([head, tbl, payload, Buffer.alloc(0x10)]);
+
+  const tables = F.findDescriptorTable(buf);
+  assert.ok(tables.length > 0, '没找到任何描述符表');
+  const best = tables[0];
+  assert.strictEqual(best.stride, 12, `步长应为 12，实际 ${best.stride}`);
+  assert.strictEqual(best.count, 3, `应为 3 段，实际 ${best.count}`);
+  assert.strictEqual(best.tableOffset, 0x3c, `表起点应为 0x3c，实际 0x${best.tableOffset.toString(16)}`);
+  // 段首尾相接应被识别（这是排序的主要依据）
+  assert.strictEqual(best.contiguous, 2, `应有 2 处首尾相接，实际 ${best.contiguous}`);
+  const asm = F.assembleByDescriptors(buf, best.entries);
+  assert.strictEqual(asm.toString('latin1'), '1111111111111222222222222' + '3333333333333'.slice(0, 13),
+    '拼回内容不对：' + asm.toString('latin1'));
+});
+
+t('负向断言：没有描述符结构时不得凭空编出一个表', () => {
+  let s = 0x77777777;
+  const buf = Buffer.alloc(512);
+  for (let i = 0; i < buf.length; i++) { s = (s * 1664525 + 1013904223) >>> 0; buf[i] = s & 0xff; }
+  const tables = F.findDescriptorTable(buf);
+  // 随机数据偶尔会凑出"看起来合法"的 (off,len)，但不可能凑出多段首尾相接
+  const good = tables.filter((t) => t.count >= 3 && t.contiguous >= t.count - 1);
+  assert.strictEqual(good.length, 0, '随机数据凑出了首尾相接的描述符表：' + JSON.stringify(good.map((t) => [t.tableOffset, t.count, t.contiguous])));
+});
+
+t('crc32 与 zlib 标准一致（描述符 CRC 判读依赖它）', () => {
+  const zlib = require('zlib');
+  for (const s of ['', 'abc', 'hello world', 'AAAAAAAAAA']) {
+    const b = Buffer.from(s, 'latin1');
+    assert.strictEqual(F.crc32(b), zlib.crc32(b) >>> 0, `crc32("${s}") 与 zlib 不一致`);
+  }
+});
+
 t('analyzePackage：QWBP 容器（模拟题 2 形态）能定位到尾部 flag 段', () => {
   // 构造成题 2 的真实布局：QWBP 头 + 摘要 + 描述符 + 数据 + QWBPFLAG + u32 len + 密文
   const head = Buffer.concat([Buffer.from('QWBP', 'latin1'), Buffer.alloc(4),

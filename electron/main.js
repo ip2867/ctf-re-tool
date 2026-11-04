@@ -3533,6 +3533,9 @@ function toolLabel(name, input) {
     case 'blob_decrypt': return 'Blob 解密推断 ' + short(i.path ? path.basename(String(i.path)) : '', 28)
       + (i.offset != null ? ` @0x${Number(i.offset).toString(16)}` : '');
     case 'arx_solve': return '代数求解/' + String(i.mode || '?');
+    case 'firmware_package': return '固件包结构 ' + short(i.path ? path.basename(String(i.path)) : '', 28);
+    case 'riscv_probe': return 'RISC-V 动态取值 ' + String(i.action || 'auto')
+      + (i.binary ? ' ' + short(path.basename(String(i.binary)), 20) : '');
     case 'glob': return '查找文件 ' + short(i.pattern, 40);
     case 'grep': return '搜索 ' + short(i.pattern, 40) + (i.path ? ' @' + short(path.basename(i.path), 24) : '');
     case 'scan_crypto': return '扫描算法指纹 ' + short(i.path ? path.basename(i.path) : '', 40);
@@ -6682,7 +6685,7 @@ function parseTextToolCalls(rawText) {
     'switch_to_next_stage',
     'scan_crypto', 'extract_payload', 'gen_block_cipher_solver', 'gen_sm4_solver',
     'analyze_structure', 'junk_scan', 'junk_patch', 'junk_repair',
-    'z3_solve', 'elf_anomaly', 'blob_decrypt', 'arx_solve'
+    'z3_solve', 'elf_anomaly', 'blob_decrypt', 'arx_solve', 'firmware_package', 'riscv_probe'
   ]);
   // 工具名 → 参数名映射（模型给裸参数时也能用；无参工具不在此表）
   //
@@ -6694,7 +6697,8 @@ function parseTextToolCalls(rawText) {
   const MAP = {
     bash: 'command', run_command: 'command', run_python: 'script', glob: 'pattern', grep: 'pattern',
     z3_solve: 'constraints',
-    elf_anomaly: 'path', blob_decrypt: 'path', arx_solve: 'mode',
+    elf_anomaly: 'path', blob_decrypt: 'path', arx_solve: 'mode', firmware_package: 'path',
+    riscv_probe: 'binary',
     read_file: 'path', write_file: 'path', read_skill: 'name', wiki_read: 'path', wiki_search: 'query',
     browser_open: 'url', browser_search: 'query', browser_js: 'url',
     ida_decompile: 'function_name', ida_get_xrefs: 'address',
@@ -6951,6 +6955,20 @@ function precheckToolCall(name, input) {
   }
   if (name === 'elf_anomaly') {
     if (!i.path || !String(i.path).trim()) return '缺少必填参数 path（ELF 文件绝对路径）。';
+  }
+  if (name === 'firmware_package') {
+    if (!i.path || !String(i.path).trim()) return '缺少必填参数 path（固件/OTA 包绝对路径）。';
+  }
+  if (name === 'riscv_probe') {
+    if (!i.binary || !String(i.binary).trim()) {
+      return '缺少必填参数 binary（本地固件路径，会自动上传到 Kali）。';
+    }
+    if (String(i.action || '') === 'find_call' && !i.target) {
+      return 'action=find_call 需要 target（要查调用的函数地址，如 "0x10818"）。';
+    }
+    if (String(i.action || '') === 'probe' && !i.breakAddr) {
+      return 'action=probe 需要 breakAddr（断点地址，通常用 find_call 得到的返回地址）。';
+    }
   }
   if (name === 'blob_decrypt') {
     if (!i.path || !String(i.path).trim()) return '缺少必填参数 path（载体文件绝对路径）。';
@@ -8711,6 +8729,71 @@ function getToolDefinitions() {
         required: ["mode"]
       }
     },
+    {
+      name: "firmware_package",
+      description:
+        "**固件/OTA 包结构解包** —— 直接读字节，把「这个包是什么格式、数据在哪一段」摆出来。\n" +
+        "什么时候用：拿到 .bin / OTA 包 / 路由器 dump / 无扩展名大文件，需要先定位结构再谈分析。\n" +
+        "**不要靠肉眼数偏移**——这类包有固定骨架，工具一次给出：\n" +
+        "① **魔数**：内置 15 种固件/OTA 魔数（QWBP / ANDROID! / squashfs / UBI / CPIO / uImage / DTB / TRX / gzip / xz / zip…），报出所有出现位置\n" +
+        "② **描述符表**：自动探测连续的 `(off, len[, crc])` 三元组（多段 OTA 把镜像拆散存放时用），\n" +
+        "   并**按描述符把片段拼回连续镜像**——直接对原始字节做哈希必然错，必须先拼\n" +
+        "③ **尾部标记块**：形如 `<8~16 字节大写标记><u32 LE 长度><数据>` 的段（flag/密钥/签名常在这里）\n" +
+        "④ **摘要自动匹配**：找「文件里某 32 字节 == 某段数据的 SHA256 或 SM3」，这是判定『哪些数据是被保护的部分』最硬的证据\n" +
+        "\n判读要点（实测 qwb2026 firmware）：\n" +
+        "- 描述符步长**未必是 8**：实测是 `(off,len,crc)` = **12 字节**，前两字段才是 off/len\n" +
+        "- 长度字段是**小端 u32**：按大端读会得到远超文件大小的值，可用这点快速判字节序\n" +
+        "- **描述符的 CRC 可能校验的是明文而不是密文** —— 实测 OTA 存 38 字节密文，\n" +
+        "  但三个描述符 CRC 分别等于**明文**三段的 CRC32。看到这种就说明「密文+明文校验和」结构，解密在验证方内部完成\n" +
+        "- 尾部块熵 >6.5 说明是加密/压缩数据，不要直接当明文读\n" +
+        "\n拼不上摘要时：说明还缺一层解码/解密，去找主机端验证器（它本身就是最好的 oracle）。",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "固件/OTA 包绝对路径" },
+          out: { type: "string", description: "可选：把按描述符拼回的镜像写到这个路径" }
+        },
+        required: ["path"]
+      }
+    },
+    {
+      name: "riscv_probe",
+      description:
+        "**RISC-V / 跨架构固件的动态取值** —— 用 qemu + gdb 断点，读出**只在内存里存在**的派生材料。\n" +
+        "什么时候用：固件启动时把常量**原地变换**成密钥/材料（典型：读 .text 算哈希再原地变换），\n" +
+        "静态只能读到变换**前**的值（如 .selfhash），必须跟到函数返回点取变换**后**的缓冲区。\n" +
+        "实测（qwb2026 firmware）：fw_b.bin 启动时把 .selfhash 原地变换成 keymat ——\n" +
+        "静态读 .selfhash = `3049e679...`（变换前），动态读返回点 = `dd97cb2d...`（变换后，才是要用的）。\n" +
+        "\n三种用法：\n" +
+        "· `action=\"find_call\"`：反汇编 .text，找出「谁调用了 target」，并自动标出返回地址\n" +
+        "  （找到 `jal 0x10818` 在 0x103fa → 返回地址就是 0x103fc）\n" +
+        "· `action=\"probe\"`：起 qemu-riscv32 -g + gdb-multiarch，在 breakAddr 断下读 bufReg 指向的缓冲区\n" +
+        "  （可给 cmpAddr 对照，如 .selfhash，直接看出变换前后差异）\n" +
+        "· `action=\"auto\"`（默认）：自动 find_call → 取返回地址 → probe，一条龙\n" +
+        "\n环境要求（Kali 实测通过）：`qemu-riscv32` + `gdb-multiarch`。\n" +
+        "⚠️ **不要用 capstone 反汇编 RISC-V** —— Kali 上是 4.0.0，`CS_ARCH_RISCV` 从 5.0 才有；\n" +
+        "宿主 objdump 也不带 RISC-V 后端。唯一可靠的是 `gdb-multiarch`。",
+      input_schema: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string", enum: ["find_call", "probe", "auto"],
+            description: "find_call=找调用点；probe=断点读内存；auto=一条龙（默认）"
+          },
+          binary: { type: "string", description: "本地固件路径（会自动上传到 Kali）" },
+          target: { type: "string", description: "find_call：要查调用的函数地址，如 0x10818" },
+          textStart: { type: "string", description: "find_call：反汇编起点（默认 0x100b4）" },
+          textEnd: { type: "string", description: "find_call：反汇编终点（默认 0x1090e）" },
+          breakAddr: { type: "string", description: "probe：断点地址（通常是返回地址）" },
+          bufReg: { type: "string", description: "probe：缓冲区指针寄存器（默认 s2）" },
+          readBytes: { type: "number", description: "probe：读多少字节（默认 32）" },
+          cmpAddr: { type: "string", description: "probe：可选对照地址（如 .selfhash 的 0x10940）" },
+          arch: { type: "string", description: "qemu 目标（默认 riscv32）" },
+          port: { type: "number", description: "gdb 端口（默认 1234）" }
+        },
+        required: ["binary"]
+      }
+    },
     // ========== ADB/Frida 工具 ==========
     {
       name: "adb_command",
@@ -10028,6 +10111,168 @@ async function executeToolCall(toolName, input) {
         return await callBurpMcp(input.tool, input.args || {});
 
       // ========== 确定性分析能力（供 AI 主动调用）==========
+      case 'firmware_package': {
+        const f = String(input.path || '').trim();
+        if (!f) return '参数错误：path 为空';
+        if (!fs.existsSync(f)) return `文件不存在：${f}`;
+        const pkg = require('./firmware-package');
+        const buf = fs.readFileSync(f);
+        const r = pkg.analyzePackage(buf);
+        if (!r || !r.ok) return `解析失败：${(r && r.error) || '未知原因'}`;
+        const lines = [`文件：${f}  (${buf.length} 字节)`];
+        if (r.text) lines.push('', r.text);
+        // 把拼回的镜像落盘（AI 需要能接着分析它）
+        if (r.assembled && r.assembled.length) {
+          const outPath = String(input.out || '').trim()
+            || path.join(app.getPath('temp'), `fw_assembled_${Date.now().toString(36)}.bin`);
+          try {
+            fs.writeFileSync(outPath, r.assembled);
+            lines.push('');
+            lines.push(`## 按描述符拼回的镜像已写出`);
+            lines.push(`- 路径：${outPath}（${r.assembled.length} 字节）`);
+            lines.push(`- 下一步：对**这个新文件**调 scan_crypto / elf_anomaly`);
+            lines.push('- ⚠️ 若它的摘要与包头对不上，说明还缺一层解码/解密（去找主机端验证器）');
+          } catch (e) {
+            lines.push(`- （写出失败：${e.message}）`);
+          }
+        }
+        if (!r.magics.length && !r.descriptors.length && !r.trailers.length) {
+          lines.push('');
+          lines.push('## 结论：未识别出已知固件/OTA 结构');
+          lines.push('这不等于"没有结构"——可能是加密容器或厂商私有格式。');
+          lines.push('建议：① 先跑 scan_crypto 看有没有内嵌载荷 ② 找配套的验证器/升级工具，用它的 usage 反推格式');
+        }
+        return lines.join('\n');
+      }
+
+      case 'riscv_probe': {
+        const bin = String(input.binary || '').trim();
+        if (!bin) return '参数错误：binary 为空';
+        if (!fs.existsSync(bin)) return `文件不存在：${bin}`;
+        if (!config.kali || !config.kali.sshHost) {
+          return '未配置 Kali（config.kali.sshHost 为空）。本工具需要在 Kali 上跑 qemu-riscv32 + gdb-multiarch。';
+        }
+        const RP = require('./riscv-probe');
+        const action = String(input.action || 'auto');
+        const remoteDir = '/tmp/ctf_rvprobe';
+        const binName = path.basename(bin);
+        const port = Number(input.port) || 1234;
+        const bufReg = String(input.bufReg || 's2');
+        const readBytes = Number(input.readBytes) || 32;
+        const arch = String(input.arch || 'riscv32');
+
+        const lines = [];
+        // 1) 建目录 + 上传（base64 经 ssh 传，避免额外依赖）
+        const buf = fs.readFileSync(bin);
+        if (buf.length > 4 * 1024 * 1024) {
+          return `文件过大（${buf.length} 字节）：riscv_probe 通过 base64 经 SSH 传输，上限 4MB。`
+            + `请先裁出相关段，或在 Kali 上手动放置到 ${remoteDir}/${binName}。`;
+        }
+        const b64 = buf.toString('base64');
+        lines.push(`## 步骤 1：上传到 Kali`);
+        const up = await sshExec(
+          `mkdir -p ${remoteDir} && echo '${b64}' | base64 -d > ${remoteDir}/${binName} && chmod +x ${remoteDir}/${binName} && ls -l ${remoteDir}/${binName}`,
+          120000);
+        if (!up.success) {
+          return `上传失败（REMOTE 错误）：${up.error || up.stderr || '未知'}\n`
+            + `检查：Kali 是否开机、config.kali 是否正确、磁盘是否可写。`;
+        }
+        lines.push(`- 已上传：${remoteDir}/${binName}（${buf.length} 字节）`);
+        lines.push('');
+        // 2) 环境检查
+        const envChk = await sshExec(
+          `cd ${remoteDir} && for t in qemu-${arch} gdb-multiarch base64; do command -v $t >/dev/null && echo "OK $t" || echo "MISSING $t"; done`, 30000);
+        const envTxt = String(envChk.stdout || '');
+        lines.push('## 步骤 2：环境检查');
+        lines.push('```\n' + envTxt.trim() + '\n```');
+        if (/MISSING qemu-|MISSING gdb-multiarch/.test(envTxt)) {
+          lines.push('');
+          lines.push('⛔ 缺关键工具。安装：`sudo apt install qemu-user gdb-multiarch`');
+          return lines.join('\n');
+        }
+
+        // 3) find_call
+        let breakAddr = String(input.breakAddr || '').trim();
+        if (action === 'find_call' || action === 'auto') {
+          const target = String(input.target || '').trim();
+          if (!target && action === 'find_call') {
+            return 'action=find_call 需要 target（要查调用的函数地址，如 0x10818）';
+          }
+          if (target) {
+            const script = RP.buildFindCallSiteScript({
+              remoteDir, binName, target,
+              textStart: String(input.textStart || '0x100b4'),
+              textEnd: String(input.textEnd || '0x1090e'),
+            });
+            const b64s = Buffer.from(script, 'utf8').toString('base64');
+            const r = await sshExec(
+              `cd ${remoteDir} && echo '${b64s}' | base64 -d > fc.sh && bash fc.sh 2>&1`, 120000);
+            lines.push('');
+            lines.push('## 步骤 3：找调用点');
+            lines.push('```\n' + String(r.stdout || r.stderr || r.error || '').trim() + '\n```');
+            // 从输出里自动抽返回地址（"调用点: 0x103fa ..." 的下一行地址）
+            if (!breakAddr) {
+              const m = String(r.stdout || '').match(/0x0*([0-9a-f]+):\s*\S+\s+jal\s+0x0*([0-9a-f]+)/i);
+              const mNext = String(r.stdout || '').match(/之后的指令[^\n]*\n\s*(0x[0-9a-f]+):/i);
+              if (mNext) {
+                breakAddr = mNext[1];
+                lines.push(`- 自动推断返回地址：**${breakAddr}**（断点设在这里）`);
+              } else if (m) {
+                // 退路：jal 指令长度 4（或 2 若是压缩指令），返回 = 调用点 + 4
+                const callAt = parseInt(m[1], 16);
+                breakAddr = '0x' + (callAt + 4).toString(16);
+                lines.push(`- 自动推断返回地址：**${breakAddr}**（调用点 + 4）`);
+              }
+            }
+          }
+        }
+
+        // 4) probe
+        if (action === 'probe' || (action === 'auto' && breakAddr)) {
+          if (!breakAddr) return lines.concat(['', '⛔ 没有 breakAddr，无法 probe。']).join('\n');
+          const script = RP.buildRiscvProbeScript({
+            remoteDir, binName, port, breakAddr, bufReg, readBytes,
+            cmpAddr: String(input.cmpAddr || '').trim(),
+            arch,
+          });
+          const b64p = Buffer.from(script, 'utf8').toString('base64');
+          const r = await sshExec(
+            `cd ${remoteDir} && echo '${b64p}' | base64 -d > pb.sh && bash pb.sh 2>&1`, 180000);
+          const txt = String(r.stdout || r.stderr || r.error || '');
+          lines.push('');
+          lines.push(`## 步骤 4：断点读取（break=${breakAddr}, reg=${bufReg}, ${readBytes} 字节）`);
+          lines.push('```\n' + txt.trim() + '\n```');
+          // 解析出缓冲区的字节，直接给 hex —— AI 不用自己数
+          // 注意可能有多个块（缓冲区 + cmpAddr 对照段），必须分开呈现，
+          // 揉成一串会把两段拼在一起（实测踩过：32B + 32B → 64B 的错误结果）
+          const parsed = RP.parseGdbXOutput(txt);
+          if (parsed && parsed.blocks.length) {
+            lines.push('');
+            lines.push('## 读到的内存块（已按地址分段解析）');
+            for (let bi = 0; bi < parsed.blocks.length; bi++) {
+              const b = parsed.blocks[bi];
+              const label = bi === 0 ? `缓冲区（$${bufReg}）` : (input.cmpAddr ? '对照段' : `块 ${bi + 1}`);
+              lines.push(`- **${label}** @${b.addr}  ${b.bytes.length} 字节`);
+              lines.push(`  hex：\`${b.hex}\``);
+            }
+            lines.push('');
+            if (parsed.blocks.length >= 2) {
+              lines.push('> 两个块通常分别是「变换后的值」和「变换前的原值」——');
+              lines.push('> **用第一个**（缓冲区里的）继续派生链，第二个只作对照。');
+            } else {
+              lines.push('> 这个缓冲区里的值才是后续派生链要用的（静态读到的通常是变换前的旧值）。');
+            }
+          } else if (/Breakpoint 1,/.test(txt)) {
+            lines.push('');
+            lines.push('- ⚠️ 断点命中了但没解析到内存内容，检查 bufReg 名字是否正确（riscv: s0-s11 / a0-a7 / t0-t6）');
+          } else {
+            lines.push('');
+            lines.push('- ⚠️ 断点未命中。可能：地址不对（先跑 find_call）、或该函数在启动早期就跑完了（试试在入口 0x<entry> 下断后单步）');
+          }
+        }
+        return lines.join('\n');
+      }
+
       case 'scan_crypto':
         return scanCryptoCase({ fs, scanCrypto: scanCryptoFingerprints, inferCipherStructure,
           elfAnomaly: analyzeElfAnomalies }, input);

@@ -6866,6 +6866,76 @@ async function generateScript() {
 const LOG_DOM_LIMIT = 1500;
 const LOG_DOM_TRIM_BATCH = 300;
 
+// ── 同类告警重复升级器（渲染层内联实现）──
+// 与 electron/warning-repeat-guard.js 逻辑一致（那边是主进程/测试用的同一套规则）。
+// 为什么放渲染层：addLog 在这里，而渲染层不能 require electron 模块。
+// 为什么需要：elfstudy 事故里两条告警各出现 6 次，AI 把它们当"环境噪声"反复重试，
+// 而真正该做的是**换前提**。FailureLoopGuard 只覆盖工具调用失败，覆盖不到日志级告警。
+function _normalizeWarningKey(text) {
+  let s = String(text == null ? '' : text);
+  s = s.replace(/\[\s*([^\]]*?)\s*\]/g, (m, inner) =>
+    '[' + inner.replace(/0x[0-9a-f]+/gi, '0x?').replace(/\d+/g, '?') + ']');
+  s = s.replace(/0x[0-9a-f]+/gi, '0x?');
+  s = s.replace(/\d+(\.\d+)?/g, '?');
+  s = s.replace(/[A-Za-z]:\\[^\s，。；]*/g, '<path>');
+  // 去掉尾部括号补充：同一告警可能带/不带「（ImageBase=..., SizeOfImage=...）」
+  s = s.replace(/\s*[（(][^（()）]*[)）]\s*$/g, '');
+  return s.replace(/\s+/g, ' ').trim().slice(0, 120);
+}
+
+function ensureWarningRepeatGuard() {
+  if (state.__warningGuard) return state.__warningGuard;
+  const g = {
+    counts: new Map(),
+    tripped: new Set(),
+    adviseAt: 2,
+    tripAt: 3,
+    maxKeys: 200,
+    record(level, text) {
+      const lv = String(level || '').toLowerCase();
+      if (lv !== 'warning' && lv !== 'error') return { repeat: 0, key: '' };
+      const key = _normalizeWarningKey(text);
+      if (!key) return { repeat: 0, key: '' };
+      let ent = this.counts.get(key);
+      if (!ent) {
+        if (this.counts.size >= this.maxKeys) {
+          this.counts.delete(this.counts.keys().next().value);
+        }
+        ent = { n: 0, sample: String(text).slice(0, 300) };
+        this.counts.set(key, ent);
+      }
+      ent.n++;
+      const repeat = ent.n;
+      if (repeat >= this.tripAt && !this.tripped.has(key)) {
+        this.tripped.add(key);
+        return {
+          repeat, key, tripped: true,
+          advisory: `### ⛔ 同一告警已出现 ${repeat} 次，停止重试\n`
+            + `这条告警在本次会话中已重复 ${repeat} 次：\n${ent.sample}\n\n`
+            + `**重复出现 = 上次的处理没有生效**。不要再"重开分析/再试一次"——按以下顺序换前提：\n`
+            + `1. **判断这是不是"结果"而不是"原因"**：告警描述的现象（跳转非对齐、函数越界、`
+            + `反编译错位）往往由更上游的问题引起（IDA 基址错、函数表坏、逻辑不在函数里）。\n`
+            + `2. **换一类工具取证**：不要继续在同一个表象上修补。用 elf_anomaly / scan_crypto / `
+            + `strings+xrefs / blob_decrypt 从另一个角度拿确定性事实。\n`
+            + `3. **明确写出"当前假设已排除"**，说明排除了什么证据。\n`
+            + `4. 若确实是环境问题（IDA 实例串台），用 ida_open_file + new_database=true 重建 IDB。`,
+        };
+      }
+      if (repeat === this.adviseAt) {
+        return {
+          repeat, key,
+          advisory: `⚠ 同类告警第 ${repeat} 次出现（${key.slice(0, 60)}…）。`
+            + `再出现一次将要求换前提——先确认上一次的处理是否真的生效了。`,
+        };
+      }
+      return { repeat, key };
+    },
+    reset() { this.counts.clear(); this.tripped.clear(); },
+  };
+  state.__warningGuard = g;
+  return g;
+}
+
 function addLog(type, message) {
   const logOutput = document.getElementById('category-log');
   if (!logOutput) return;
@@ -6884,6 +6954,26 @@ function addLog(type, message) {
     }
   }
   followScroll(logOutput);
+
+  // 同类告警反复出现 → 升级成"该换前提"的明确指令（而不是被 AI 当成环境噪声）
+  // 真实事故（elfstudy）：两条告警各出现 6 次，AI 每次都以为"环境还没准备好"，
+  // 反复重开分析，烧掉 2 小时。根因是 FailureLoopGuard 只管工具失败，管不到日志级告警。
+  // 实现放在渲染层（纯数据结构，无需 require electron 模块），见 ensureWarningRepeatGuard()。
+  try {
+    const guard = ensureWarningRepeatGuard();
+    const r = guard.record(type, message);
+    if (r && r.advisory) {
+      const adv = document.createElement('div');
+      adv.className = 'log-line log-error';
+      adv.innerHTML = `<span class="log-time">[${time}]</span><span class="log-text"></span>`;
+      adv.querySelector('.log-text').textContent = r.advisory;
+      logOutput.appendChild(adv);
+      followScroll(logOutput);
+      // 升级后的指令要在下一次 AI 请求里带上，否则 AI 看不到
+      state.pendingWarningAdvisories = state.pendingWarningAdvisories || [];
+      state.pendingWarningAdvisories.push(r.advisory);
+    }
+  } catch (e) { /* 告警升级失败不能影响日志本身 */ }
 
   // 时间线持久化（尽力而为，失败静默）
   if (state.caseDir && window.electronAPI.appendFile) {
@@ -9005,14 +9095,38 @@ async function autoSolveBinaryFlag(fileType) {
         if (im && im.success && im.map) {
           const { kept, dropped } = filterFunctionsInImage(funcs, im.map);
           if (dropped.length) {
-            addLog('warning', `[IDA] 越界地址 ${dropped.length}/${funcs.length} 个不在映像内`
-              + `（ImageBase=0x${im.map.imageBase.toString(16)}, SizeOfImage=0x${im.map.sizeOfImage.toString(16)}）`);
+            // ⚠️ 关键：越界比例必须作为**数据可信度**判断，不能只当一条 warning。
+            // 真实事故（elfstudy，2026-10-31）：44/159 = 27.7% 越界，工具只打了一行
+            // warning 就继续把剩下 115 个函数交给 AI，AI 以为拿到的是完整函数表，
+            // 在这上面推理了近 2 小时。而实际上 ImageBase=0x0（PIE 文件本该是基址），
+            // 整张表都是错的。
+            //
+            // 判据（实测校准）：
+            //   · < 5%   正常：IDA 合成条目/导入桩，剔除即可，不标记不可信
+            //   · 5%~20% 存疑：可能是串台初期或解析偏移，标注但继续
+            //   · > 20%  不可信：函数表整体不可用，必须显式告诉 AI 别把它当事实基础
+            const dropRatio = dropped.length / Math.max(1, funcs.length);
+            const trust = dropRatio > 0.20 ? 'unusable'
+              : (dropRatio > 0.05 ? 'suspect' : 'ok');
+            addLog(trust === 'ok' ? 'warning' : 'error',
+              `[IDA] 越界地址 ${dropped.length}/${funcs.length}（${(dropRatio * 100).toFixed(1)}%）不在映像内`
+              + `（ImageBase=0x${im.map.imageBase.toString(16)}, SizeOfImage=0x${im.map.sizeOfImage.toString(16)}）`
+              + (trust === 'unusable' ? '  ⛔ 函数表整体不可信' : (trust === 'suspect' ? '  ⚠ 存疑' : '')));
             const sample = dropped.slice(0, 3).map(f => {
               const a = (f && (f.address != null ? f.address : f.addr)) || '?';
               return String(a);
             }).join(', ');
             addLog('warning', `[IDA] 越界样例: ${sample}`);
             funcs = kept;
+            if (trust !== 'ok') {
+              analysisData.funcTableTrust = trust;
+              analysisData.funcTableDropRatio = +(dropRatio * 100).toFixed(1);
+            }
+            // ImageBase=0 对 PIE 是明确的解析错误信号：地址全对不上
+            if (im.map.imageBase === 0 && trust !== 'ok') {
+              analysisData.funcTableProblem = 'ImageBase=0（PIE 文件应为非零基址）→ 函数地址整体偏移';
+              addLog('error', '[IDA] ImageBase=0：这是 PIE 文件典型的解析错误信号，函数地址不可直接使用');
+            }
           }
           // ⚠️ 全部被剔除 ≠ 串台。实测（ByteCTF2019 easy_rust）：
           //   .bss 到 0x36208 结束，但 IDA 把未定义的外部符号合成到 0x362a8 起，
@@ -9500,6 +9614,24 @@ async function autoSolveBinaryFlag(fileType) {
     } catch (e) {
       functionsText = '函数列表解析失败';
     }
+    // ⚠️ 函数表可信度必须和列表一起进提示词，否则 AI 会把它当完整事实基础。
+    // 真实事故（elfstudy）：27.7% 地址越界 + ImageBase=0，AI 拿到残缺表推理 2 小时。
+    if (analysisData.funcTableTrust && analysisData.funcTableTrust !== 'ok') {
+      const ratio = analysisData.funcTableDropRatio || 0;
+      if (analysisData.funcTableTrust === 'unusable') {
+        functionsText = `⛔ **函数表整体不可信（${ratio}% 的地址不在映像内）**\n`
+          + `原因：${analysisData.funcTableProblem || '解析偏移或会话串台'}\n`
+          + `**不要**把下面的列表当作完整函数清单——它只能提示"附近有什么"，\n`
+          + `任何"没有某函数"的结论都不成立。优先改用：\n`
+          + `  · elf_anomaly 看结构（逻辑可能在段外/加密，不在函数里）\n`
+          + `  · 字符串/常量交叉引用（strings → xrefs）\n`
+          + `  · 若必须用 IDA：先 ida_open_file 重开（new_database=true）重建 IDB\n`
+          + `已剔除越界项后的残留列表（仅作参考）：\n${functionsText}`;
+      } else {
+        functionsText = `⚠ 函数表存疑（${ratio}% 的地址不在映像内）：列表可能不完整，\n`
+          + `不要据此断言"某函数不存在"。\n${functionsText}`;
+      }
+    }
 
     // 安全地转换字符串列表（find_regex -> {n,matches:[{addr,string}]}，渲染成 addr string 列表）
     let stringsText = '暂无';
@@ -9636,8 +9768,19 @@ junk_repair 只把**跳转指令那 2/5 个字节**换成等长 NOP——跳转�
       [functionsText, stringsText, mainCodeText, otherFuncsText, globalsText].join('\n'),
       fileType, prefetchExtra);
 
-    const analysisPrompt = `我正在分析一个CTF ${fileType}题目。
+    // 同类告警反复出现 → 把升级指令放在提示词最前面（优先级高于其他一切）
+    // 这些告警在日志里已经重复过，AI 看不到日志，只能靠这里拿到"该换前提"的信号。
+    let repeatWarnSection = '';
+    try {
+      if (Array.isArray(state.pendingWarningAdvisories) && state.pendingWarningAdvisories.length) {
+        repeatWarnSection = '\n## ⛔ 重复告警升级（必须优先处理）\n\n'
+          + state.pendingWarningAdvisories.join('\n\n') + '\n\n';
+        state.pendingWarningAdvisories = [];
+      }
+    } catch (e) { /* 注入失败不阻塞 */ }
 
+    const analysisPrompt = `我正在分析一个CTF ${fileType}题目。
+${repeatWarnSection}
 文件路径：${state.currentFile}
 ${algHintText}${junkSection}
 以下是通过IDA MCP获取的分析数据：

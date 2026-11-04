@@ -3570,6 +3570,10 @@ function toolLabel(name, input) {
     case 'firmware_package': return '固件包结构 ' + short(i.path ? path.basename(String(i.path)) : '', 28);
     case 'riscv_probe': return 'RISC-V 动态取值 ' + String(i.action || 'auto')
       + (i.binary ? ' ' + short(path.basename(String(i.binary)), 20) : '');
+    case 'func_probe': return '算法函数探针/' + String(i.action || 'auto')
+      + (i.binary ? ' ' + short(path.basename(String(i.binary)), 18) : '');
+    case 'smc_dump': return 'SMC 还原 ' + String(i.region || '')
+      + (i.binary ? ' ' + short(path.basename(String(i.binary)), 20) : '');
     case 'glob': return '查找文件 ' + short(i.pattern, 40);
     case 'grep': return '搜索 ' + short(i.pattern, 40) + (i.path ? ' @' + short(path.basename(i.path), 24) : '');
     case 'scan_crypto': return '扫描算法指纹 ' + short(i.path ? path.basename(i.path) : '', 40);
@@ -6719,7 +6723,8 @@ function parseTextToolCalls(rawText) {
     'switch_to_next_stage',
     'scan_crypto', 'extract_payload', 'gen_block_cipher_solver', 'gen_sm4_solver',
     'analyze_structure', 'junk_scan', 'junk_patch', 'junk_repair',
-    'z3_solve', 'elf_anomaly', 'blob_decrypt', 'arx_solve', 'firmware_package', 'riscv_probe'
+    'z3_solve', 'elf_anomaly', 'blob_decrypt', 'arx_solve', 'firmware_package', 'riscv_probe',
+    'func_probe', 'smc_dump'
   ]);
   // 工具名 → 参数名映射（模型给裸参数时也能用；无参工具不在此表）
   //
@@ -6733,6 +6738,8 @@ function parseTextToolCalls(rawText) {
     z3_solve: 'constraints',
     elf_anomaly: 'path', blob_decrypt: 'path', arx_solve: 'mode', firmware_package: 'path',
     riscv_probe: 'binary',
+    func_probe: 'binary',
+    smc_dump: 'binary',
     read_file: 'path', write_file: 'path', read_skill: 'name', wiki_read: 'path', wiki_search: 'query',
     browser_open: 'url', browser_search: 'query', browser_js: 'url',
     ida_decompile: 'function_name', ida_get_xrefs: 'address',
@@ -7002,6 +7009,23 @@ function precheckToolCall(name, input) {
     }
     if (String(i.action || '') === 'probe' && !i.breakAddr) {
       return 'action=probe 需要 breakAddr（断点地址，通常用 find_call 得到的返回地址）。';
+    }
+  }
+  if (name === 'func_probe') {
+    if (!i.binary || !String(i.binary).trim()) return '缺少必填参数 binary（目标二进制路径）。';
+    if (String(i.action || '') === 'probe' && !i.breakAddr) {
+      return 'action=probe 需要 breakAddr（函数入口地址，如 "0x403140"）。'
+        + '先用 action=locate 找算法常量，再从反汇编里找引用它的 endbr64。';
+    }
+  }
+  if (name === 'smc_dump') {
+    if (!i.binary || !String(i.binary).trim()) return '缺少必填参数 binary（目标可执行文件路径）。';
+    if (i.region) {
+      const m = /^0x([0-9a-fA-F]+):0x([0-9a-fA-F]+)$/.exec(String(i.region).trim());
+      if (!m) return 'region 格式错误，应为 "0x基址:0x长度"，例 "0x404000:0x20000"。';
+    }
+    if (i.patches != null && !Array.isArray(i.patches)) {
+      return 'patches 必须是数组：[{va:"0x5024fc", bytes:"31c0c3"}]。';
     }
   }
   if (name === 'blob_decrypt') {
@@ -8828,6 +8852,81 @@ function getToolDefinitions() {
         required: ["binary"]
       }
     },
+    {
+      name: "func_probe",
+      description:
+        "**算法函数探针** —— 在 stripped 二进制里定位密码函数，并在调用点批量 dump 参数。\n" +
+        "什么时候用：需要一个 stripped 程序「这个函数在算什么」时。反汇编 8000 行看不出，\n" +
+        "但把断点设在函数入口，**一次就能拿到每次调用的完整输入输出**。\n" +
+        "\n实测（qwb2026 firmware）：1MB stripped 静态链接的 fw_a，7 次 SM3 调用完全靠这个拿到：\n" +
+        "  #2 SM3(keymat,16) → 与 0x4b3200 比\n" +
+        "  #4 SM3(\"QWB2026::TWIN::DEVICE-A\", 23) → P\n" +
+        "  #5 SM3(keymat‖P‖vm_out8, 40) → A    ← 关键材料就在第 32..39 字节\n" +
+        "\n三种用法：\n" +
+        "· `action=\"locate\"`：按特征常量（SM3/SM4/AES/MD5/SHA256/ChaCha 的 IV、S 盒、sigma，\n" +
+        "  **两种字节序都试**）定位常量偏移并换算 VA。多 word 常量在 x86 上常以小端 word 存放，\n" +
+        "  只搜大端会误判成「没有这个算法」\n" +
+        "· `action=\"probe\"`：生成 gdb 脚本，在 breakAddr 下断，每次命中打印参数寄存器与内存\n" +
+        "· `action=\"auto\"`：locate → 提示下一步\n" +
+        "\n**函数入口怎么找**（stripped 二进制通用手法）：常量 VA → 反汇编里 grep 引用它的指令\n" +
+        "（如 `movdqa xmm0,[rip+...]`）→ 往前找最近的 `endbr64` → 那就是函数起点。\n" +
+        "函数签名从序言反推：`mov rbp,rdi; mov r13,rsi; mov r12,rdx` ⇒ `f(rdi, rsi, rdx)`。\n" +
+        "\n⚠️ 静态链接程序**不能用 LD_PRELOAD** 拦截（不走动态链接器），只能靠断点。\n" +
+        "⚠️ gdb 里引用寄存器要写 `$rdi`，但脚本在 bash 双引号里执行时必须转义成 `\\$rdi`。",
+      input_schema: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["locate", "probe", "auto"], description: "默认 auto" },
+          binary: { type: "string", description: "目标二进制路径（本地）" },
+          breakAddr: { type: "string", description: "probe：函数入口地址，如 0x403140" },
+          argRegs: { description: "probe：参数寄存器数组，默认 [\"rdi\",\"rsi\",\"rdx\"]" },
+          maxHits: { type: "number", description: "probe：最多打印几次（默认 20）" },
+          dumpBytes: { type: "number", description: "probe：dump 多少字节（默认 64）" },
+          onlyNth: { type: "number", description: "probe：只打印第 N 次调用（0=全部）" },
+          programArgs: { description: "probe：运行目标时传的参数数组" },
+          algo: { type: "string", description: "locate/auto：限定算法名（SM3/SM4/AES/MD5/SHA256/CHACHA）" },
+          out: { type: "string", description: "probe：gdb 脚本输出路径" }
+        },
+        required: ["binary"]
+      }
+    },
+    {
+      name: "smc_dump",
+      description:
+        "**自修改代码（SMC）的通用还原** —— 高频采样 `/proc/<pid>/mem`，取并集把「按需解密、用完即焚」的代码还原成明文。\n" +
+        "什么时候用：静态反汇编里某段代码看起来是垃圾/花指令，但程序跑起来明显在执行它；\n" +
+        "或者看到 `mprotect(addr, len, PROT_RWX)` 后跳进该区域、配 SIGTRAP/SIGSEGV 处理器的写法。\n" +
+        "\n**为什么单次快照没用**：SMC 的典型形态是「解密 16 字节 → 执行 → 重新加密」。\n" +
+        "任意时刻只有一小块是明文，所以必须高频采样再**取并集**。\n" +
+        "实测（license 题）：98 个快照里每个只差 15~16 字节，并集还原出 95 个块、1420 字节，\n" +
+        "露出了 `/proc/self/status`、`TracerPiE9` 这些反调试串和整段平坦 VM 解释器。\n" +
+        "\n参数：\n" +
+        "· `binary`：目标可执行文件（本地路径，会复制到 Kali 上跑）\n" +
+        "· `region`：采样区间 `\"0x基址:0x长度\"`，如 `\"0x404000:0x20000\"`。省略则用 base/len\n" +
+        "· `patches`：先打补丁再跑，形如 `[{\"va\":\"0x5024fc\",\"bytes\":\"31c0c3\"}]`。\n" +
+        "  **用来跳过反调试**：静态定位到 `sec_env_probe` 这类函数后直接 `xor eax,eax; ret`\n" +
+        "· `stdinData`：喂给进程的输入（很多程序要读到输入才会进入真正的校验路径）\n" +
+        "· `maxSnap` / `maxMs` / `sleepMs`：采样上限。默认不 sleep、最多 4000 张 / 8000ms\n" +
+        "\n输出：还原字节数、被改写的块列表（地址区间）、`smc_plain.bin` 与 `smc_plain.dis`、\n" +
+        "以及明文里的 ASCII 串（常直接暴露反调试路径与提示串）。\n" +
+        "\n⚠️ 覆盖不全时（还原比例低）把 `maxMs` 调大或 `sleepMs=0`；\n" +
+        "⚠️ 若 `SNAPSHOTS 0`，说明区间猜错了——用 `analyze_structure` 看 `mprotect` 的目标地址。",
+      input_schema: {
+        type: "object",
+        properties: {
+          binary: { type: "string", description: "目标可执行文件路径（本地）" },
+          region: { type: "string", description: "采样区间 \"0x基址:0x长度\"，如 \"0x404000:0x20000\"" },
+          base: { type: "string", description: "采样基址（region 省略时用，默认 0x404000）" },
+          len: { type: "number", description: "采样长度（region 省略时用，默认 0x20000）" },
+          patches: { description: "先打的补丁数组：[{va:\"0x5024fc\", bytes:\"31c0c3\"}]" },
+          stdinData: { type: "string", description: "喂给进程的 stdin 内容" },
+          maxSnap: { type: "number", description: "最多采样张数（默认 4000）" },
+          maxMs: { type: "number", description: "最长采样毫秒（默认 8000）" },
+          sleepMs: { type: "number", description: "每次采样间隔毫秒（默认 0=不停）" }
+        },
+        required: ["binary"]
+      }
+    },
     // ========== ADB/Frida 工具 ==========
     {
       name: "adb_command",
@@ -10304,6 +10403,242 @@ async function executeToolCall(toolName, input) {
             lines.push('- ⚠️ 断点未命中。可能：地址不对（先跑 find_call）、或该函数在启动早期就跑完了（试试在入口 0x<entry> 下断后单步）');
           }
         }
+        return lines.join('\n');
+      }
+
+      case 'func_probe': {
+        const bin = String(input.binary || '').trim();
+        if (!bin) return '参数错误：binary 为空';
+        if (!fs.existsSync(bin)) return `文件不存在：${bin}`;
+        const FP = require('./func-probe');
+        const action = String(input.action || 'auto');
+        const fbuf = fs.readFileSync(bin);
+        const lines = [`文件：${bin}（${fbuf.length} 字节）`];
+
+        if (action === 'locate' || action === 'auto') {
+          let hits = FP.locateSignatures(fbuf);
+          const want = String(input.algo || '').trim().toUpperCase();
+          if (want) hits = hits.filter((h) => h.algo === want);
+          lines.push('');
+          if (!hits.length) {
+            lines.push('## 未命中任何算法特征常量' + (want ? `（限定 ${want}）` : ''));
+            lines.push('这不等于"程序里没有密码算法"：常量可能被加密/拆分，或用了不认识的算法。');
+          } else {
+            lines.push('## 算法特征常量命中（LE/BE 两种字节序都试过）');
+            let map = null;
+            try { map = parseImageMap(fbuf); } catch (e) { map = null; }
+            for (const h of hits.slice(0, 20)) {
+              let va = '';
+              const secs = (map && Array.isArray(map.sections)) ? map.sections : [];
+              for (const s of secs) {
+                const rp = Number(s.rawPtr), rs = Number(s.rawSize);
+                if (rs > 0 && h.offset >= rp && h.offset < rp + rs) {
+                  const base = Number(s.va) + (map.vaIsAbsolute ? 0 : (Number(map.imageBase) || 0));
+                  va = '  VA=0x' + (base + (h.offset - rp)).toString(16);
+                  break;
+                }
+              }
+              lines.push(`- **${h.algo}** ${h.note}  off=0x${h.offset.toString(16)}${va}`);
+            }
+            lines.push('');
+            lines.push('## 下一步：找函数入口');
+            lines.push('① 反汇编后 grep 引用上面的 VA（`objdump -d -M intel <bin> | grep -i "0x<VA>"`）');
+            lines.push('② 找到引用它的指令后，**往前找最近的 `endbr64`** → 那就是函数入口');
+            lines.push('③ 调 `func_probe(action="probe", breakAddr="<入口>")` 生成断点脚本');
+            lines.push('④ 在目标机器跑 gdb 脚本，一次拿到每次调用的输入输出');
+          }
+        }
+
+        if (action === 'probe' || (action === 'auto' && input.breakAddr)) {
+          const addr = String(input.breakAddr || '').trim();
+          if (!addr) {
+            lines.push('');
+            lines.push('⚠️ probe 需要 breakAddr（函数入口）。先 locate + 反汇编找 endbr64。');
+          } else {
+            const script = FP.buildProbeScript({
+              binary: bin, breakAddr: addr,
+              argRegs: Array.isArray(input.argRegs) ? input.argRegs : undefined,
+              maxHits: Number(input.maxHits) || 20,
+              dumpBytes: Number(input.dumpBytes) || 64,
+              onlyNth: Number(input.onlyNth) || 0,
+              programArgs: Array.isArray(input.programArgs) ? input.programArgs : [],
+            });
+            const outPath = String(input.out || '').trim()
+              || path.join(app.getPath('temp'), `funcprobe_${Date.now().toString(36)}.gdb`);
+            fs.writeFileSync(outPath, script);
+            lines.push('');
+            lines.push(`## gdb 脚本已生成：${outPath}`);
+            lines.push('在目标机器执行：');
+            lines.push('```bash');
+            lines.push(`gdb -q -batch -x "${outPath}" "${path.basename(bin)}" < /dev/null 2>&1 | grep -A20 "hit #"`);
+            lines.push('```');
+            lines.push('会打印每次命中的参数寄存器值 + 前若干字节内存。');
+            lines.push('**stripped 二进制最快的取值手段** —— 比读反汇编快两个数量级。');
+          }
+        }
+        return lines.join('\n');
+      }
+
+      case 'smc_dump': {
+        const bin = String(input.binary || '').trim();
+        if (!bin) return '参数错误：binary 为空';
+        if (!fs.existsSync(bin)) return `文件不存在：${bin}`;
+        if (!config.kali || !config.kali.sshHost) {
+          return '未配置 Kali（config.kali.sshHost 为空）。本工具需要在 Kali 上采样 /proc/<pid>/mem。';
+        }
+        const SD = require('./smc-dump');
+        const remoteDir = '/tmp/ctf_smcdump';
+        const binName = path.basename(bin);
+        const lines = [`文件：${bin}（${fs.statSync(bin).size} 字节）`];
+
+        // 1) 上传目标二进制（base64 内联；4MB 上限是 sshExec 单条命令的现实约束）
+        const buf = fs.readFileSync(bin);
+        if (buf.length > 4 * 1024 * 1024) {
+          return `文件过大（${buf.length} 字节）。sshExec 把 base64 内联进一条命令，超过 4MB 会失败。`
+            + '先用 `extract_payload` 把真正要采样的段裁出来再传。';
+        }
+        const up = await sshExec(
+          `mkdir -p ${remoteDir} && echo '${buf.toString('base64')}' | base64 -d > ${remoteDir}/${binName}`
+          + ` && chmod +x ${remoteDir}/${binName} && ls -l ${remoteDir}/${binName}`,
+          120000);
+        if (!up.success) {
+          return `上传失败（REMOTE 错误）：${up.error || up.stderr || '未知'}\n`
+            + '检查 Kali 是否在线、磁盘是否可写。';
+        }
+
+        // 2) 推断采样区间：给了 region 就用，否则用 ELF 里最大的可执行 PT_LOAD
+        let region = String(input.region || '').trim();
+        if (!region) {
+          const segs = SD.inferRegions(buf);
+          if (!segs.length) {
+            lines.push('');
+            lines.push('⚠️ 无法从 ELF program headers 推断可执行段（可能不是 ELF64）。');
+            lines.push('请显式传 region，例如 `region="0x404000:0x20000"`。');
+            lines.push('区间怎么找：看 `mprotect(addr, len, PROT_RWX)` 的参数，或 SIGTRAP/SIGSEGV 处理器里跳转的目标。');
+            return lines.join('\n');
+          }
+          const s = segs[0];
+          region = `0x${s.vaddr.toString(16)}:0x${s.filesz.toString(16)}`;
+          lines.push(`采样区间（自动推断，最大可执行 PT_LOAD）：${region}`);
+          if (s.memsz > s.filesz) {
+            lines.push(`注意该段 memsz(0x${s.memsz.toString(16)}) > filesz(0x${s.filesz.toString(16)})，`
+              + '超出 filesz 的部分没有文件基线，只能采到改写后的值。');
+          }
+        } else {
+          lines.push(`采样区间（显式）：${region}`);
+        }
+
+        // 3) 生成脚本并上传执行
+        const patches = Array.isArray(input.patches) ? input.patches : [];
+        if (patches.length) {
+          lines.push(`预打补丁 ${patches.length} 处：` + patches.map((p) => `${p.va}=${p.bytes}`).join(', '));
+        }
+        const script = SD.buildSmcScript({
+          binPath: `${remoteDir}/${binName}`,
+          outDir: remoteDir,
+          region,
+          base: input.base,
+          len: input.len,
+          patches,
+          stdinData: input.stdinData == null ? '' : String(input.stdinData),
+          maxSnap: Number(input.maxSnap) || 4000,
+          maxMs: Number(input.maxMs) || 8000,
+          sleepMs: input.sleepMs == null ? 0 : Number(input.sleepMs),
+        });
+        const b64s = Buffer.from(script, 'utf8').toString('base64');
+        const r = await sshExec(
+          `cd ${remoteDir} && echo '${b64s}' | base64 -d > smcdump.py &&`
+          + ` timeout ${Math.max(30, Math.floor((Number(input.maxMs) || 8000) / 1000) + 30)}`
+          + ` python3 -I smcdump.py 2>&1`,
+          300000);
+        const txt = String(r.stdout || r.stderr || r.error || '');
+
+        // 4) 解析结果
+        lines.push('');
+        if (/NO_DIFF/.test(txt)) {
+          lines.push('## 未检测到改写');
+          lines.push('该区间在进程整个生命周期内没有变化。可能原因：');
+          lines.push('- 区间不对（SMC 不在这一段）——看 `mprotect` 的参数，或先跑 `analyze_structure`');
+          lines.push('- 程序没走到 SMC 路径（很多保护要先读到正确输入才解密）—— 用 `stdinData` 喂输入');
+          lines.push('- SMC 只发生一次且极快，采样没抓到 —— 把 `sleepMs` 设 0、`maxMs` 调大');
+          lines.push('');
+          lines.push('原始输出：');
+          lines.push(txt.slice(0, 2000));
+          return lines.join('\n');
+        }
+
+        const mRestored = /RESTORED_BYTES (\d+) \/ (\d+)/.exec(txt);
+        const mSnaps = /SNAPSHOTS (\d+)/.exec(txt);
+        const mBlocks = /BLOCKS (\d+)/.exec(txt);
+        const mChild = /CHILD_RC (-?\d+)/.exec(txt);
+        const mOut = /STDOUT (.*)/.exec(txt);
+
+        if (mSnaps) lines.push(`采样快照：${mSnaps[1]} 张`);
+        if (mChild) lines.push(`目标进程退出码：${mChild[1]}`);
+        if (mOut) lines.push(`目标 stdout：${mOut[1]}`);
+        if (mRestored) {
+          const [, cov, tot] = mRestored;
+          const pct = Number(tot) ? (100 * Number(cov) / Number(tot)) : 0;
+          lines.push(`还原字节：${cov} / ${tot}（${pct.toFixed(2)}%）`);
+          if (pct < 1) {
+            lines.push('⚠️ 覆盖率低：SMC 每次只解密一小块就重新加密，采样密度不够。');
+            lines.push('  把 `maxMs` 调大（如 30000）、`maxSnap` 调大（如 20000）、`sleepMs` 保持 0。');
+          }
+        }
+        if (mBlocks) lines.push(`被改写的块：${mBlocks[1]} 个`);
+
+        // 块列表
+        const blocks = [];
+        const reBlock = /BLOCK 0x([0-9a-f]+) 0x([0-9a-f]+) len=(\d+)/g;
+        let mb;
+        while ((mb = reBlock.exec(txt)) !== null) {
+          blocks.push({ start: '0x' + mb[1], end: '0x' + mb[2], len: Number(mb[3]) });
+        }
+        if (blocks.length) {
+          lines.push('');
+          lines.push('## 被改写的地址区间（这些就是 SMC 块）');
+          for (const b of blocks.slice(0, 30)) {
+            lines.push(`- \`${b.start}\` .. \`${b.end}\`  (${b.len} 字节)`);
+          }
+          if (blocks.length > 30) lines.push(`- ... 还有 ${blocks.length - 30} 个`);
+          lines.push('');
+          lines.push('**下一步**：这些区间原本在文件里是密文。现在已还原到 `' + remoteDir + '/smc_plain.bin`。');
+          lines.push('拿回来接着分析：');
+          lines.push('```bash');
+          lines.push(`# 在 Kali 上：把还原结果和原文件对齐看差异`);
+          lines.push(`objdump -D -b binary -m i386:x86-64 -M intel --adjust-vma=<基址> ${remoteDir}/smc_plain.bin | less`);
+          lines.push('```');
+        }
+
+        // ASCII 串
+        const strs = [];
+        const reStr = /^  0x([0-9a-f]+) (.+)$/gm;
+        let ms;
+        const strSection = txt.split('STRINGS ')[1] || '';
+        while ((ms = reStr.exec(strSection)) !== null) {
+          strs.push({ va: '0x' + ms[1], s: ms[2].trim() });
+        }
+        if (strs.length) {
+          lines.push('');
+          lines.push('## 明文里的 ASCII 串（常直接暴露反调试路径与提示串）');
+          for (const s of strs.slice(0, 25)) {
+            lines.push(`- \`${s.va}\`  \`${s.s}${s.s.length >= 70 ? '…' : ''}\``);
+          }
+          if (strs.length > 25) lines.push(`- ... 还有 ${strs.length - 25} 条`);
+          const ad = strs.filter((s) => /proc\/self|TracerPid|ptrace|debug/i.test(s.s));
+          if (ad.length) {
+            lines.push('');
+            lines.push('⚠️ 发现反调试相关串，说明这段 SMC 代码含反调试逻辑。'
+              + '定位到调用点后，可用 `patches` 参数直接打掉再采一次。');
+          }
+        }
+
+        if (!mRestored && !mSnaps) {
+          lines.push('');
+          lines.push('## 原始输出（未解析到结构化结果）');
+          lines.push(txt.slice(0, 3000));
+        }
+
         return lines.join('\n');
       }
 

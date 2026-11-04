@@ -824,10 +824,18 @@ const CRYPTO_FP = [
   ['SM4-FK-BE', 'a3 b1 ba c6 56 aa 33 50 67 7d 91 97 b2 70 22 dc', 'SM4 系统参数 FK（大端书写序：0xa3b1bac6 起）'],
   ['SM4-FK-LE', 'c6 ba b1 a3 50 33 aa 56 97 91 7d 67 dc 22 70 b2', 'SM4 FK（小端存放：uint32_t 数组在 x86 上的原始字节）'],
   ['SM4-SBOX', 'd6 90 e9 fe cc e1 3d b7', 'SM4 标准 S 盒首 4 字节'],
-  ['SM4-CK', '00 07 0e 15', 'SM4 轮常量 CK 起始（配合 256 双射表判定）'],
+  ['SM4-CK', '00 07 0e 15', 'SM4 轮常量 CK 起始（大端；配合 256 双射表判定）'],
+  ['SM4-CK-LE', '15 0e 07 00', 'SM4 轮常量 CK 起始（小端 word，x86 上的 uint32_t[] 形态）'],
   ['AES-SBOX', '63 7c 77 7b f2 6b 6f c5', 'AES S 盒首 8 字节'],
   ['AES-INV-SBOX', '52 09 6a d5 30 36 a5 38', 'AES 逆 S 盒首 8 字节（解密码表）'],
-  ['SM3-IV', '73 80 16 6f 49 14 b2 b9 17 24 42 d7', 'SM3 IV（铁证，出现即 SM3）'],
+  ['SM3-IV', '73 80 16 6f 49 14 b2 b9 17 24 42 d7', 'SM3 IV（大端/书写序，铁证）'],
+  // ⚠️ 同一组 IV 在不同二进制里有两种字节序（实测踩过）：
+  //   fw_a（statically linked, SIMD SM3）用的是**小端 word** 存放 → 按大端搜返回 -1，
+  //   会误判成"这个程序里没有 SM3"。
+  // 凡是"多 word 常量表"，两种序都要搜。这条规则适用于 IV / CK / Rcon / 初始链值。
+  ['SM3-IV-LE', '6f 16 80 73 b9 b2 14 49 d7 42 24 17', 'SM3 IV（小端 word 存放，x86 上的 uint32_t[] 形态）'],
+  ['SM3-TJ0', '79 cc 45 19', 'SM3 轮常量 Tj（大端）'],
+  ['SM3-TJ0-LE', '19 45 cc 79', 'SM3 轮常量 Tj（小端 word）'],
   ['MD5-IV', '01 23 45 67 89 ab cd ef', 'MD5 IV（小端存放）'],
   // SHA1 的 IV 与 MD5 前两个 dword 数值相同，区别在**字节序**：SHA1 全程大端，MD5 小端。
   // 因此 SHA1 的指纹必须是 16 字节大端形态；只写 8 字节会与 MD5-IV 撞车。
@@ -918,6 +926,15 @@ function validateELF(decode, maxItems) {
   const rd32 = (o) => (o + 4 > maxItems ? NaN : (be
     ? ((decode(o) << 24) | (decode(o + 1) << 16) | (decode(o + 2) << 8) | decode(o + 3)) >>> 0
     : (decode(o) | (decode(o + 1) << 8) | (decode(o + 2) << 16) | (decode(o + 3) << 24)) >>> 0));
+  // ⚠️ **必须校验 e_type 与 e_machine**，不能只看 e_ident。
+  // 实测（fw_a / license 各 4 处误报）：.eh_frame 等数据里会偶然出现
+  // `7f 45 4c 46 02 01 01 00`（0x7f 是 DWARF 的 DW_CFA 操作码），
+  // 但紧跟的 e_type 是 0 或 0xffff、e_machine 是 3905/28905 这种随机值。
+  // 只查 e_ident 会把它们全判成"内嵌 ELF"，让 AI 以为有下一层。
+  const eType = rd16(16);
+  if (eType !== 1 && eType !== 2 && eType !== 3 && eType !== 4) return null;   // REL/EXEC/DYN/CORE
+  const eMachine = rd16(18);
+  if (eMachine === 0 || eMachine > 260) return null;   // 0=未指定；>260 超出已知架构范围
   let shoff, shentsize, shnum;
   if (cls === 1) { shoff = rd32(0x20); shentsize = rd16(0x2e); shnum = rd16(0x30); }
   else { shoff = rd32(0x28) + rd32(0x2c) * 4294967296; shentsize = rd16(0x3a); shnum = rd16(0x3c); }
@@ -926,6 +943,9 @@ function validateELF(decode, maxItems) {
     const end = shoff + shentsize * shnum;
     if (end >= 0x40 && end <= maxItems) length = end;
   }
+  // 段表完全不可解析 → 不足以证明这是"一个完整的 ELF 载荷"，只接受 e_ident 之外
+  // 还有硬证据的情形（e_type/e_machine 已在上方校验过），这里仍允许 length=0，
+  // 因为有些题目会把 ELF 截断存放（只给头部 + 数据段），由调用方按 offset 自行切。
   return { length };
 }
 
@@ -1154,8 +1174,13 @@ function detectOtherFormats(buf, size, limit) {
       const avail = Math.floor((size - i) / s);
       if (avail < 0x40) continue;
       // 少数候选才进入完整校验（magic 4 字节先内联比，再走头部解析）
-      // ⚠️ key=0 表示"明文"：只有当偏移 i===0（文件自身就是该格式）时才允许，且这种情形
-      //    **不算"内嵌载荷"**（否则每个正常 ELF/PE 都会自报一次，实测回归题集全员误报）。
+      // ⚠️ key=0（明文）要分两种情形：
+      //   ① i===0：文件自身就是该格式 → **不算内嵌载荷**（否则每个正常 ELF/PE 自报一次）
+      //   ② i!==0：文件内部嵌了**一整个明文 ELF/DEX** → **必须报**（多阶段题的常见形态，
+      //      实测回归题里有"明文 ELF 段"的题目，漏报会让 AI 以为没有下一层）
+      // 而"文件内部恰好含几个魔数字节"（fw_a/license 那 4 处误报）由 emit() 里的
+      // **完整头部校验**排除：ELF 要求 e_ident 合法 + e_type/e_machine 合理 + 段表可解析，
+      // 光有 4 字节魔数过不了。
       if (eXor) { const k = a ^ E.m[0]; if (!(i === 0 && k === 0)) emit(E, 'xor', k, i, s, avail); }
       if (eAdd) { const k = (a - E.m[0]) & 0xff; if (!(i === 0 && k === 0)) emit(E, 'add', k, i, s, avail); }
       if (dXor) { const k = a ^ D.m[0]; if (!(i === 0 && k === 0)) emit(D, 'xor', k, i, s, avail); }
@@ -2953,7 +2978,16 @@ function scanCryptoFingerprints(filePath) {
       note: '按 AES 解（注意 key 长度 16/24/32；轮数由 key 长度决定 10/12/14）。',
     });
   }
-  if (has('SM3-IV')) summary.push({ algo: 'SM3', confidence: 'high', evidence: 'SM3 IV（铁证）', note: '哈希不可逆：按"SM3(候选)==目标"爆破/长度扩展。' });
+  if (has('SM3-IV') || has('SM3-IV-LE') || has('SM3-TJ0') || has('SM3-TJ0-LE')) {
+    const which = has('SM3-IV') || has('SM3-TJ0') ? '大端' : '小端 word';
+    const strong = has('SM3-IV') || has('SM3-IV-LE');
+    summary.push({
+      algo: 'SM3', confidence: strong ? 'high' : 'medium',
+      evidence: `SM3 ${strong ? 'IV' : '轮常量 Tj'}（${which}${strong ? '，铁证' : '，需配合其它证据'}）`,
+      note: '哈希不可逆：按"SM3(候选)==目标"爆破/长度扩展。'
+        + (strong ? '' : '⚠️ 只命中 Tj 常量时置信度有限，去看 IV 或 64 轮结构确认。'),
+    });
+  }
   if (has('TEA-DELTA') || has('TEA-DELTA-INV')) summary.push({ algo: 'TEA/XTEA/XXTEA', confidence: 'high', evidence: 'TEA delta 常量', note: `按 TEA 族解；delta 大小端/正负见偏移。` });
   // MD5：K 轮常量命中比连续 IV 更强（IV 可能被省略/内联改写，K 表是算法本体）。
   // 证据形态写成 "K 常量命中 N/64，IV M/4"，便于 AI 自己判断可信度。

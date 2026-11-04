@@ -41,6 +41,11 @@ function makeELF() {
   b[4] = 1;   // 32-bit
   b[5] = 1;   // little-endian
   b[6] = 1;   // version
+  // ⚠️ 真实 ELF 一定有 e_type / e_machine。检测器现在会校验这两个字段
+  // （否则 .eh_frame 里偶然出现的 7f 45 4c 46 + 合法 ident 会被误判成内嵌 ELF，
+  //  实测 fw_a / license 各报 4 处）。构造样例必须补齐，否则它不是一个合法 ELF。
+  b.writeUInt16LE(2, 16);   // e_type = ET_EXEC
+  b.writeUInt16LE(3, 18);   // e_machine = EM_386（x86）
   const shoff = 0x200, shentsize = 0x28, shnum = 1;
   b.writeUInt32LE(shoff, 0x20);
   b.writeUInt16LE(shentsize, 0x2e);

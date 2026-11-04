@@ -1,7 +1,7 @@
 # 逆向题结构化条目库（_INDEX）
 
 > 来源：Des-CTF 知识库的**逆向题** meta（含 attack_chain 解法链 / reasoning_chain 思维链 / failed_attempts 避坑）。
-> 每题一个 .md（YAML meta）；AI 用 `wiki_search` 检索，命中即 `wiki_read`。共 **53** 条（43 题 + 10 篇方法）。
+> 每题一个 .md（YAML meta）；AI 用 `wiki_search` 检索，命中即 `wiki_read`。共 **54** 条（43 题 + 11 篇方法）。
 
 | # | 题名 | 大赛 | 年 | 难度 | 一句话 |
 |---|---|---|---|---|---|
@@ -58,6 +58,7 @@
 | 51 | [method_junk_code](method_junk_code.md) | 看雪方法论 | 2026 | medium | **花指令去混淆**：互补跳转对+确定标志位+push/pop边界三件套识别，整段nop后重新反汇编；含IDC批量去花模板、栈指针修正、动态Run Trace兜底 |
 | 52 | [method_fault_driven_vm](method_fault_driven_vm.md) | 强网杯 2026 license | 2026 | hard | **故障驱动（块链）VM**：TF单步+mprotect RWX+si_code分流；确定性取证（关ASLR/假TracerPid）+进程内shellcode dump（无竞态）+重放器（解出块须与内存逐字节相同）+累计魔数诱饵判死 |
 | 53 | [method_firmware_ota](method_firmware_ota.md) | 强网杯 2026 firmware | 2026 | medium | **OTA包+跨架构校验器**：先在176B小包定界(magic/版本/key/条目表/FLAG段)，跑校验器拿usage，标准哈希全不匹配即判MAC；RISC-V用Unicorn仿真注意mem_map从0x0起、ecall用UC_HOOK_CODE拦0x73 |
+| 54 | [method_structure_before_algorithm](method_structure_before_algorithm.md) | ELFStudy/firmware/license | 2026 | hard | **结构先于算法**：三种"看不见"（段尾缝隙/加密blob/单步异常流）；elf_anomaly查8类结构矛盾→blob_decrypt按capstone覆盖率认自解密→arx_solve换元t=U^V^W把2^64降到2^32（C版18秒） |
 
 ## 关键词（tags 汇总）
 

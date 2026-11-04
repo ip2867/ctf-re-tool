@@ -72,6 +72,36 @@ t('技能里有 z3_solve 的完整用法', () => {
   assert.ok(/回代验证|回代原始校验/.test(tooling), 'tooling 技能没提回代验证');
 });
 
+console.log('\nA2) 本轮新增的结构级工具');
+t('elf_anomaly：schema + 技能都点名', () => {
+  const d = schemaDesc('elf_anomaly');
+  assert.ok(d.length > 0, 'schema 缺 elf_anomaly');
+  assert.ok(/段尾缝隙|slack/.test(d), 'schema 未说明段尾缝隙这一类');
+  assert.ok(allSkills.includes('elf_anomaly'), '技能里没提 elf_anomaly');
+});
+t('blob_decrypt：schema + 技能都点名', () => {
+  const d = schemaDesc('blob_decrypt');
+  assert.ok(d.length > 0, 'schema 缺 blob_decrypt');
+  assert.ok(/xor-chain|链式/.test(d), 'schema 未说明支持链式 XOR');
+  assert.ok(/capstone|覆盖率/.test(d), 'schema 未说明用 capstone 覆盖率打分');
+  assert.ok(allSkills.includes('blob_decrypt'), '技能里没提 blob_decrypt');
+});
+t('arx_solve：schema + 技能都点名，且写明 C 才是正解', () => {
+  const d = schemaDesc('arx_solve');
+  assert.ok(d.length > 0, 'schema 缺 arx_solve');
+  assert.ok(/2\^64.*2\^32|化简/.test(d), 'schema 未说明 2^64→2^32 的化简');
+  assert.ok(/gcc|-O3|C 源码/.test(d), 'schema 未说明要用 C 跑');
+  const tooling = read('skills/ctf-reverse-tooling/SKILL.md');
+  assert.ok(/arx_solve/.test(tooling), 'tooling 技能没提 arx_solve');
+  assert.ok(/t = U \^ V \^ W|U\^V\^W/.test(tooling), 'tooling 技能没写换元公式');
+});
+t('固件技能写明 OTA 描述符步长陷阱与尾部标记块', () => {
+  const fw = read('skills/ctf-iot-firmware/SKILL.md');
+  assert.ok(/12 字节|三元组/.test(fw), '未说明描述符步长可能是 12 字节');
+  assert.ok(/小端 u32|小端/.test(fw), '未说明长度字段是 LE u32');
+  assert.ok(/oracle|验证器/.test(fw), '未说明"验证器当 oracle"');
+});
+
 console.log('\nB) 动调能力预检');
 t('技能写明"SSH 通 ≠ 能调"与自检脚本', () => {
   const bin = read('skills/ctf-reverse-binary/SKILL.md');
@@ -149,7 +179,8 @@ t('负向断言：schema 里的工具数必须等于技能里被点名的子集�
   const mentioned = uniq.filter((n) => allSkills.includes(n) || appSrc.includes(n));
   console.log(`     ${mentioned.length}/${uniq.length} 个工具在技能/提示词中被点名`);
   // 不要求全部点名（部分工具靠 schema 描述自解释），但核心求解类必须有
-  for (const core of ['z3_solve', 'scan_crypto', 'extract_payload', 'run_python']) {
+  for (const core of ['z3_solve', 'scan_crypto', 'extract_payload', 'run_python',
+    'elf_anomaly', 'blob_decrypt', 'arx_solve']) {
     assert.ok(mentioned.includes(core), `核心工具 ${core} 只在 schema 里，缺使用指引`);
   }
 });

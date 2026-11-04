@@ -77,9 +77,13 @@ const { execFileSync } = require('child_process');
     const t = String(e.stdout || '').trim();
     if (t) { try { probeJson = JSON.parse(t); } catch (_) { /* ignore */ } }
   }
-  if (!probeJson || probeJson.ok !== true) {
+  // 只用「SSH 是否可达」作为跳过条件：
+  // probe.ok 还包含 arch/kernel/ptrace_scope 等**信息项**，SSH 通道抖动时它们会失败，
+  // 但远程执行本身仍可用（实测：channel 超时导致 probe.ok=false，remote_exec 却工作正常）。
+  const sshReachable = probeJson && !probeJson.error && Array.isArray(probeJson.results) && probeJson.results.length > 0;
+  if (!sshReachable) {
     const why = !probeJson ? '探测无输出'
-      : (probeJson.error ? `${probeJson.error} ${probeJson.detail || ''}`.trim() : 'probe.ok !== true');
+      : (probeJson.error ? `${probeJson.error} ${probeJson.detail || ''}`.trim() : 'probe 无 results');
     console.log(`  SKIP —— Kali 不可达（${why}），远程链路本次不验证`);
     console.log(`\n结果: ${pass} 通过, ${fail} 失败（已跳过）`);
     process.exit(fail > 0 ? 1 : 0);

@@ -317,7 +317,7 @@ print('BYTES '+data.hex())
 // 早期实现引用了不存在的 buf/size，导致每个带常量分析的样本都在此处抛
 // "buf is not defined"，整条扫描结果被 catch 改写成一行错误文本。
 function scanCryptoCase(deps, input) {
-  const { fs: fsDep, scanCrypto, inferCipherStructure } = deps || {};
+  const { fs: fsDep, scanCrypto, inferCipherStructure, elfAnomaly } = deps || {};
   const i = input || {};
   const f = String(i.path == null ? '' : i.path).trim();
   if (!f) return '参数错误：path 为空';
@@ -381,6 +381,33 @@ function scanCryptoCase(deps, input) {
     lines.push('');
     lines.push('## 高熵常量块（疑似 key/密文）');
     lines.push((r.highEntropy || []).map(h => `${h.offset}(${h.len}B) ${h.hex}`).join('\n'));
+  }
+  // ELF 结构级异常：与"算法指纹"是两条正交的线索。
+  // 实测教训（elfstudy）：算法扫描报"未发现指纹"是完全正确的——因为真正的校验逻辑
+  // 是**加密后藏在 LOAD 段页尾缝隙**、靠 Rela/COPY/IFUNC 在加载期自解密的。
+  // 只有结构异常检测能把"有东西藏在映射区但不属于任何段/节"这件事说出来。
+  if (elfAnomaly && typeof elfAnomaly === 'function') {
+    try {
+      const an = elfAnomaly(raw);
+      if (an && an.text) {
+        lines.push('');
+        lines.push('## ELF 结构级异常（确定性推导，与算法指纹正交）');
+        lines.push(`- 架构 ${an.arch} / ${an.elfType} / entry ${an.entry}` +
+          `；TEXTREL=${an.flags.TEXTREL}；RELASZ=${an.relacount.relasz} 条` +
+          `（.rela.dyn ${an.relacount.relaDyn} + .rela.plt ${an.relacount.relaPlt}）`);
+        const hi = (an.findings || []).filter((x) => x.severity === 'high').map((x) => x.kind);
+        if (hi.length) lines.push(`- 高危信号：${hi.join('、')}`);
+        lines.push('');
+        lines.push(an.text);
+        lines.push('');
+        lines.push('> 这些是**结构事实**而非猜测：按上面的偏移去取数即可。'
+          + '若同时"算法扫描未发现指纹"，说明校验逻辑可能被加密/藏在映射区，'
+          + '先去提取这些区块，再对提取出的数据重新分析。');
+      }
+    } catch (e) {
+      lines.push('');
+      lines.push(`## ELF 结构级异常（分析失败：${e && e.message}）`);
+    }
   }
   return lines.join('\n');
 }

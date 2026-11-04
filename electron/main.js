@@ -43,6 +43,8 @@ const { assessHashTarget, buildMd5Note, extractDigestCallSites } = require('./ha
 const { assessTableRefs, isRefutedByRefs } = require('./xref-gate');
 // 表地址/节表解析（缺口计算与 xref 闸门共用）
 const { parseImageMap } = require('./binary-map');
+// ELF 结构级异常（段尾缝隙藏数据 / 重定位自相矛盾 / TEXTREL / 空壳函数）
+const { analyzeElfAnomalies } = require('./elf-anomaly');
 // 文件能力分诊（容器/文件系统/流量/文本/可执行）
 const { detectCapabilities, decideRoute } = require('./file-capability');
 // 远程执行错误分类（Kali SSH）
@@ -3517,6 +3519,10 @@ function toolLabel(name, input) {
     case 'bash': return '执行命令 ' + short(i.command, 50);
     case 'run_python': return '运行 Python 脚本' + (i.script ? `（${String(i.script).split('\n').length} 行）` : '');
     case 'z3_solve': return '符号求解' + (i.constraints ? `（${String(i.constraints).split('\n').length} 行约束）` : '');
+    case 'elf_anomaly': return 'ELF 结构异常 ' + short(i.path ? path.basename(String(i.path)) : '', 32);
+    case 'blob_decrypt': return 'Blob 解密推断 ' + short(i.path ? path.basename(String(i.path)) : '', 28)
+      + (i.offset != null ? ` @0x${Number(i.offset).toString(16)}` : '');
+    case 'arx_solve': return '代数求解/' + String(i.mode || '?');
     case 'glob': return '查找文件 ' + short(i.pattern, 40);
     case 'grep': return '搜索 ' + short(i.pattern, 40) + (i.path ? ' @' + short(path.basename(i.path), 24) : '');
     case 'scan_crypto': return '扫描算法指纹 ' + short(i.path ? path.basename(i.path) : '', 40);
@@ -6647,7 +6653,7 @@ function parseTextToolCalls(rawText) {
     'switch_to_next_stage',
     'scan_crypto', 'extract_payload', 'gen_block_cipher_solver', 'gen_sm4_solver',
     'analyze_structure', 'junk_scan', 'junk_patch', 'junk_repair',
-    'z3_solve'
+    'z3_solve', 'elf_anomaly', 'blob_decrypt', 'arx_solve'
   ]);
   // 工具名 → 参数名映射（模型给裸参数时也能用；无参工具不在此表）
   //
@@ -6659,6 +6665,7 @@ function parseTextToolCalls(rawText) {
   const MAP = {
     bash: 'command', run_command: 'command', run_python: 'script', glob: 'pattern', grep: 'pattern',
     z3_solve: 'constraints',
+    elf_anomaly: 'path', blob_decrypt: 'path', arx_solve: 'mode',
     read_file: 'path', write_file: 'path', read_skill: 'name', wiki_read: 'path', wiki_search: 'query',
     browser_open: 'url', browser_search: 'query', browser_js: 'url',
     ida_decompile: 'function_name', ida_get_xrefs: 'address',
@@ -6912,6 +6919,30 @@ function precheckToolCall(name, input) {
   }
   if (name === 'z3_solve' && (!i.constraints || !String(i.constraints).trim())) {
     return '缺少必填参数 constraints。请传入约束代码，例如 `x = BitVec("x",32)\\ns.add(x ^ 0x1234 == 0xabcd)`。';
+  }
+  if (name === 'elf_anomaly') {
+    if (!i.path || !String(i.path).trim()) return '缺少必填参数 path（ELF 文件绝对路径）。';
+  }
+  if (name === 'blob_decrypt') {
+    if (!i.path || !String(i.path).trim()) return '缺少必填参数 path（载体文件绝对路径）。';
+    if (i.offset == null || i.length == null) {
+      return '缺少必填参数 offset / length。例：`{path:"/x/bin", offset:"0x7396", length:816}`（offset 可写 0x...）。';
+    }
+  }
+  if (name === 'arx_solve') {
+    const m = String(i.mode || '').trim();
+    if (!m) return '缺少必填参数 mode（linear / invert / feistel3）。';
+    if (m === 'linear' && (!i.nIn || !i.nOut || !Array.isArray(i.pairs) || !i.pairs.length)) {
+      return 'mode=linear 需要 nIn / nOut / pairs（样本数组）。';
+    }
+    if (m === 'invert' && (!Array.isArray(i.matrix) || !i.matrix.length)) {
+      return 'mode=invert 需要 matrix（二维 0/1 数组）。';
+    }
+    if (m === 'feistel3' && (!Array.isArray(i.rounds) || i.rounds.length !== 3
+      || !Array.isArray(i.sbox) || i.sbox.length !== 256
+      || !Array.isArray(i.yL) || !Array.isArray(i.yR))) {
+      return 'mode=feistel3 需要 rounds(3 轮 P/Q/k) + sbox(256) + yL(4) + yR(4)。';
+    }
   }
   if (name === 'write_file') {
     if (!i.path || !String(i.path).trim()) return '缺少必填参数 path。';
@@ -8557,6 +8588,100 @@ function getToolDefinitions() {
         required: ["constraints"]
       }
     },
+    {
+      name: "elf_anomaly",
+      description:
+        "**ELF 结构级异常检测** —— 直接读文件字节，回答「这个 ELF 的元数据有没有自相矛盾」。\n" +
+        "与 scan_crypto 正交：scan_crypto 找**算法常量**，本工具找**结构事实**。\n" +
+        "典型用例（实测 elfstudy 题）：校验逻辑被加密后藏在 LOAD 段**页尾缝隙**、靠\n" +
+        "Rela/COPY/IFUNC 在 ld.so 重定位阶段自解密 —— 这种题 scan_crypto 会报「未发现算法指纹」\n" +
+        "（正确但无用），只有结构检测能指出「有东西在映射区但不属于任何段/节」。\n" +
+        "检出项：① 段尾缝隙(segment slack)里的隐藏数据块（滑窗找，不受零填充稀释）\n" +
+        "② 不被任何 section 覆盖的数据区 ③ DF_TEXTREL ④ RELASZ 与 .rela.dyn/.rela.plt 条数矛盾\n" +
+        "⑤ 可疑重定位（COPY/RELATIVE 打到 .dynsym、写可执行段）⑥ STT_GNU_IFUNC+SHN_ABS 符号\n" +
+        "⑦ 重定位 addend 指向未覆盖数据 ⑧ endbr64+nop×N+ret 的空壳函数\n" +
+        "输出给精确文件偏移 + 判定理由，**是线索不是结论**。",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "ELF 文件绝对路径" }
+        },
+        required: ["path"]
+      }
+    },
+    {
+      name: "blob_decrypt",
+      description:
+        "**加密 blob 的自解密器推断** —— 给一段密文，自动试多种解密家族并按「可判读性」排序。\n" +
+        "典型用例：校验函数被加密存成一块 blob，运行期用 stub 解密后再执行（elfstudy 的 0x7396、\n" +
+        "license 的指令流）。这类题**不需要跑程序**：解密是纯数据变换，离线可复现。\n" +
+        "支持的家族：xor-chain-word（链式 XOR，key 累加上一个明文 word）/ rolling-xor / rolling-add /\n" +
+        "single-xor / single-add。判分指标：capstone 指令覆盖率（kind=code）、可打印比（kind=text）、\n" +
+        "熵下降。**kind=code 时覆盖率高就说明解对了**（实测 elfstudy 自动排名第一即正确答案）。\n" +
+        "也能从 stub 反汇编文本里抽参数（parseStubParams）：宽度/计数/方向/key 初值/是否累加。",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "载体文件绝对路径" },
+          offset: { type: "number", description: "密文起始文件偏移（可写 0x...）" },
+          length: { type: "number", description: "密文长度" },
+          kind: {
+            type: "string", enum: ["code", "text", "data"],
+            description: "期望的明文类型：code=机器码（用 capstone 评分，默认）、text=字符串、data=结构化数据"
+          },
+          algo: {
+            type: "string",
+            description: "可选：强制指定算法（xor-chain-word/rolling-xor/rolling-add/single-xor/single-add）"
+          },
+          params: {
+            type: "object",
+            description: "可选：配合 algo 指定参数，如 {\"width\":4,\"direction\":\"down\",\"key0\":0}"
+          },
+          out: { type: "string", description: "可选：解密结果写出路径" },
+          limit: { type: "number", description: "返回前 N 个候选（默认 6）" }
+        },
+        required: ["path", "offset", "length"]
+      }
+    },
+    {
+      name: "arx_solve",
+      description:
+        "**代数结构求解** —— GF(2) 线性方程组 / 矩阵求逆 / 三轮 Feistel 逆推。\n" +
+        "什么时候用：校验是「线性混合 + 可逆轮函数」的组合（实测 license 题：3 轮 Feistel + 24×24\n" +
+        "GF(2) 矩阵）。这类题手推极容易错，本工具做确定性代数运算。\n" +
+        "mode=linear：从 (输入,输出) 样本对反解 GF(2) 线性映射 M（y = M·x）。样本数 ≥ 位宽即可。\n" +
+        "mode=invert：求 GF(2) 方阵的逆，用来把 M·Y=target 解成 Y=M⁻¹·target。\n" +
+        "mode=feistel3：三轮 Feistel 逆推。**关键化简**：t=U^V^W 使 g1(U)=t^yL, g2(V)=t, g3(W)=t^yR，\n" +
+        "把 2^64 搜索降到 2^32。给定 yL/yR 与三轮的 S-box/P/Q/k，生成 C 源码（内联参数），\n" +
+        "在 Kali 上 `gcc -O3` 后单核约 18 秒跑完 2^32。\n" +
+        "注意：Feistel 逆推通常有**多个候选**（实测 8 个），必须用原始程序回代验证才知哪个对。",
+      input_schema: {
+        type: "object",
+        properties: {
+          mode: {
+            type: "string", enum: ["linear", "invert", "feistel3"],
+            description: "linear=反解线性映射，invert=矩阵求逆，feistel3=三轮 Feistel 逆推"
+          },
+          nIn: { type: "number", description: "mode=linear：输入位宽" },
+          nOut: { type: "number", description: "mode=linear：输出位宽" },
+          pairs: {
+            description: "mode=linear：样本数组 [{in:[0/1...], out:[0/1...]}, ...]"
+          },
+          matrix: {
+            description: "mode=invert：GF(2) 方阵 [[0/1...], ...]"
+          },
+          n: { type: "number", description: "mode=invert：方阵维度" },
+          sbox: { description: "mode=feistel3：256 字节 S-box" },
+          rounds: {
+            description: "mode=feistel3：三轮参数 [{P:[[4]], Q:[[4]], k:[4]}, ...]（P/Q 是 4×4 GF(2) 矩阵）"
+          },
+          yL: { description: "mode=feistel3：目标 Y 的左半 4 字节" },
+          yR: { description: "mode=feistel3：目标 Y 的右半 4 字节" },
+          out: { type: "string", description: "mode=feistel3：可选的 C 源码输出路径" }
+        },
+        required: ["mode"]
+      }
+    },
     // ========== ADB/Frida 工具 ==========
     {
       name: "adb_command",
@@ -9654,6 +9779,188 @@ async function executeToolCall(toolName, input) {
       case 'z3_solve':
         return await runZ3Solve(input.constraints, input.timeout);
 
+      // ========== 结构级分析（确定性，与算法指纹正交）==========
+      case 'elf_anomaly': {
+        const p = String(input.path || '').trim();
+        if (!p) return '参数错误：path 为空';
+        if (!fs.existsSync(p)) return `文件不存在: ${p}`;
+        const buf = fs.readFileSync(p);
+        const r = analyzeElfAnomalies(buf);
+        if (!r) return `不是 ELF 文件（魔数不符）: ${p}`;
+        const head = [`文件: ${p}  (${buf.length} 字节)`,
+          `架构 ${r.arch} / ${r.elfType} / entry ${r.entry}`,
+          `TEXTREL=${r.flags.TEXTREL}  BIND_NOW=${r.flags.BIND_NOW}`,
+          `RELASZ=${r.relacount.relasz} 条（.rela.dyn ${r.relacount.relaDyn} + .rela.plt ${r.relacount.relaPlt}）`,
+          ''];
+        if (!r.findings.length) {
+          head.push('## 结论：未发现结构级异常（元数据自洽）');
+          head.push('这不是"没问题"的证明——只说明没有上面那几类矛盾。');
+        } else {
+          const hi = r.findings.filter((x) => x.severity === 'high');
+          head.push(`## 结论：${r.findings.length} 类异常（高危 ${hi.length} 类）`);
+          head.push(r.text);
+          head.push('');
+          head.push('> 以上都是**可验证的结构事实**，不是猜测。按给出的偏移去取数即可。');
+        }
+        return head.join('\n');
+      }
+
+      case 'blob_decrypt': {
+        const p = String(input.path || '').trim();
+        if (!p) return '参数错误：path 为空';
+        if (!fs.existsSync(p)) return `文件不存在: ${p}`;
+        const toNum = (v) => {
+          if (typeof v === 'number') return v;
+          const s = String(v == null ? '' : v).trim();
+          if (/^0x/i.test(s)) return parseInt(s, 16);
+          const n = Number(s);
+          return Number.isFinite(n) ? n : NaN;
+        };
+        const off = toNum(input.offset);
+        const len = toNum(input.length);
+        if (!Number.isFinite(off) || !Number.isFinite(len) || len <= 0) {
+          return '参数错误：offset / length 必须是数字（offset 可写 0x...）';
+        }
+        const buf = fs.readFileSync(p);
+        if (off < 0 || off + len > buf.length) {
+          return `参数错误：区间 0x${off.toString(16)}..0x${(off + len).toString(16)} 超出文件大小 0x${buf.length.toString(16)}`;
+        }
+        const cipher = buf.slice(off, off + len);
+        const blob = require('./blob-decrypt');
+        const kind = String(input.kind || 'code');
+
+        // 强制算法分支
+        let chosen = null;
+        if (input.algo) {
+          const algo = String(input.algo);
+          const params = input.params || {};
+          const fns = {
+            'xor-chain-word': () => blob.xorChainWords(cipher, { width: 4, direction: 'down', key0: 0, ...params }),
+            'rolling-xor': () => blob.rollingXor(cipher, params),
+            'rolling-add': () => blob.rollingAdd(cipher, params),
+            'single-xor': () => blob.singleByte(cipher, { mode: 'xor', ...params }),
+            'single-add': () => blob.singleByte(cipher, { mode: 'add', ...params }),
+          };
+          if (!fns[algo]) return `不支持的 algo: ${algo}（可选 ${Object.keys(fns).join('/')}）`;
+          const outBuf = fns[algo]();
+          const sc = blob.scoreResult(outBuf, kind);
+          chosen = { algo, params, out: outBuf, metrics: sc, score: sc.score };
+        } else {
+          const auto = blob.autoDecrypt(cipher, { kind, limit: Number(input.limit) || 6 });
+          // autoDecrypt 的候选里明文放在 `_out`（避免 JSON 序列化时膨胀），这里取出来
+          chosen = { ...auto.best, out: auto.best._out };
+        }
+
+        const lines = [];
+        lines.push(`文件: ${p}  密文 0x${off.toString(16)} 起 ${len} 字节`);
+        lines.push(`期望明文类型: ${kind}`);
+        lines.push('');
+        if (!input.algo) {
+          lines.push('## 候选排名（按可判读性打分，越高越可能解对）');
+          const auto = blob.autoDecrypt(cipher, { kind, limit: Number(input.limit) || 6 });
+          for (let i = 0; i < auto.top.length; i++) {
+            const t = auto.top[i];
+            lines.push(`${i === 0 ? '★' : ' '} #${i + 1} 分数 ${String(t.score.toFixed(2)).padStart(8)}  ${t.algo} ${JSON.stringify(t.params)}`);
+            lines.push(`     熵 ${t.metrics.entropy}  可打印 ${(t.metrics.printableRatio * 100).toFixed(0)}%  预览 ${t.preview}`);
+          }
+          lines.push('');
+        }
+        // 最优结果的指令质量
+        if (kind === 'code') {
+          const dq = blob.disasmQualityViaPython(chosen.out, 'x86');
+          if (dq && dq.available) {
+            lines.push(`## 最优解的 capstone 评估：${dq.insn_count} 条指令，覆盖 ${(dq.coverage * 100).toFixed(1)}%`);
+            if (dq.coverage > 0.8) lines.push('> 覆盖率 >80% 基本可确定解对了（错误的密钥解出来会大量断在指令中间）。');
+          } else {
+            lines.push('## capstone 不可用（跳过指令质量评估）');
+          }
+        }
+        lines.push('');
+        lines.push(`## 最优结果（${chosen.algo}）`);
+        lines.push('首 64 字节 hex: ' + chosen.out.slice(0, 64).toString('hex'));
+        lines.push('首 64 字节预览: ' + chosen.out.slice(0, 64).toString('latin1').replace(/[^\x20-\x7e]/g, '.'));
+
+        // 写出
+        const outPath = String(input.out || '').trim();
+        if (outPath) {
+          fs.writeFileSync(outPath, chosen.out);
+          lines.push('');
+          lines.push(`已写出: ${outPath}（${chosen.out.length} 字节）`);
+        } else {
+          const tmpOut = path.join(app.getPath('temp'), `blob_${Date.now().toString(36)}.bin`);
+          fs.writeFileSync(tmpOut, chosen.out);
+          lines.push('');
+          lines.push(`已写出（临时）: ${tmpOut}`);
+        }
+        return lines.join('\n');
+      }
+
+      case 'arx_solve': {
+        const A = require('./arx-solve');
+        const mode = String(input.mode || '').trim();
+        if (!mode) return '参数错误：mode 必须是 linear / invert / feistel3';
+        if (mode === 'linear') {
+          const nIn = Number(input.nIn), nOut = Number(input.nOut);
+          const pairs = Array.isArray(input.pairs) ? input.pairs : [];
+          if (!(nIn > 0) || !(nOut > 0)) return '参数错误：linear 需要 nIn / nOut';
+          if (pairs.length < nIn) return `样本不足：需要 ≥ ${nIn} 组（当前 ${pairs.length}）。至少要有 nIn 个线性无关的输入。`;
+          const r = A.linearMap(pairs, nIn, nOut);
+          if (!r.ok) return `反解失败：${r.reason}\n提示：样本必须线性无关；增加随机样本比只用单位向量更稳。`;
+          return ['## GF(2) 线性映射反解成功', `M（${nOut}×${nIn}，第 i 行 = 输出位 i 各输入位的系数）：`,
+            ...r.M.map((row, i) => `  out[${i}] = ` + row.map((v, j) => v ? `in[${j}]` : null).filter(Boolean).join(' ^ ') || '0')]
+            .join('\n');
+        }
+        if (mode === 'invert') {
+          const M = Array.isArray(input.matrix) ? input.matrix : null;
+          const n = Number(input.n) || (M ? M.length : 0);
+          if (!M || !n) return '参数错误：invert 需要 matrix（二维 0/1 数组）与 n';
+          const r = A.invertMatrix(M, n);
+          if (!r.ok) return `求逆失败：${r.reason}`;
+          return ['## GF(2) 矩阵求逆成功', 'M⁻¹:', ...r.inv.map((row) => '  [' + row.join(' ') + ']')].join('\n');
+        }
+        if (mode === 'feistel3') {
+          const rounds = Array.isArray(input.rounds) ? input.rounds : null;
+          const sbox = Array.isArray(input.sbox) ? input.sbox : null;
+          if (!rounds || rounds.length !== 3) return '参数错误：feistel3 需要恰好 3 轮参数 rounds';
+          if (!sbox || sbox.length !== 256) return '参数错误：feistel3 需要 256 字节 sbox';
+          const yL = Array.isArray(input.yL) ? input.yL : null;
+          const yR = Array.isArray(input.yR) ? input.yR : null;
+          if (!yL || yL.length !== 4 || !yR || yR.length !== 4) return '参数错误：yL / yR 各需 4 字节';
+          // 补 Pinv/Qinv
+          const rr = rounds.map((x, idx) => {
+            const P = Array.isArray(x.P) ? x.P : null;
+            const Q = Array.isArray(x.Q) ? x.Q : null;
+            if (!P || !Q) throw new Error(`第 ${idx} 轮缺 P 或 Q`);
+            const pi = A.invertMatrix(P, 4), qi = A.invertMatrix(Q, 4);
+            if (!pi.ok) throw new Error(`第 ${idx} 轮 P 不可逆：${pi.reason}`);
+            if (!qi.ok) throw new Error(`第 ${idx} 轮 Q 不可逆：${qi.reason}`);
+            return { P, Q, k: x.k, Pinv: pi.inv, Qinv: qi.inv };
+          });
+          const cSrc = A.buildFeistelC({ sbox, rounds: rr, yL, yR });
+          const outPath = String(input.out || '').trim()
+            || path.join(app.getPath('temp'), `feistel3_${Date.now().toString(36)}.c`);
+          fs.writeFileSync(outPath, cSrc);
+          return [
+            '## 三轮 Feistel 逆推：C 源码已生成',
+            `- 路径: ${outPath}（${cSrc.length} 字符）`,
+            '- 参数已**内联**，自包含，无需额外文件',
+            '',
+            '## 怎么跑（关键：JS/Python 太慢，必须用 C）',
+            '在 Kali 上执行（单核约 18 秒跑完 2^32）：',
+            '```bash',
+            `gcc -O3 -march=native -o /tmp/f3 "${outPath}" && /tmp/f3`,
+            '```',
+            '若文件不在远端，先用 `remote_exec` 的 `cat > /tmp/f3.c <<\'EOF\'` 传源码，或 base64 传输。',
+            '',
+            '## 预期',
+            '- 输出 `HIT L=xxxxxxxx R=xxxxxxxx t=...`，可能有**多个候选**（实测 8 个）',
+            '- **必须**把每个候选拼成完整输入，喂回原始程序验证，才知道哪个对',
+            '- 化简说明：t=U^V^W ⇒ g1(U)=t^yL, g2(V)=t, g3(W)=t^yR ⇒ 只需枚举 32 位 t',
+          ].join('\n');
+        }
+        return `不支持的 mode: ${mode}`;
+      }
+
       // ========== ADB/Frida 工具 ==========
       case 'adb_command':
         return await execAdbCommand(input.command);
@@ -9693,7 +10000,8 @@ async function executeToolCall(toolName, input) {
 
       // ========== 确定性分析能力（供 AI 主动调用）==========
       case 'scan_crypto':
-        return scanCryptoCase({ fs, scanCrypto: scanCryptoFingerprints, inferCipherStructure }, input);
+        return scanCryptoCase({ fs, scanCrypto: scanCryptoFingerprints, inferCipherStructure,
+          elfAnomaly: analyzeElfAnomalies }, input);
 
       case 'extract_payload': {
         const f = String(input.path || '').trim();
@@ -11456,7 +11764,7 @@ ipcMain.handle('kali-stop-vm', async (event) => {
 });
 
 // 通过 ssh2 在 Kali 中执行命令（Windows 无 sshpass，原 exec+sshpass 方案在 Windows 上不可用）
-function sshExec(command, timeoutMs = 60000) {
+function sshExec(command, timeoutMs = 60000, _retried) {
   return new Promise((resolve) => {
     const { sshHost, sshPort, sshUser, sshPass } = config.kali;
     const conn = new SshClient();
@@ -11500,6 +11808,20 @@ function sshExec(command, timeoutMs = 60000) {
 
     conn.on('error', (err) => {
       clearTimeout(timer);
+      // 握手层失败（超时/ECONNRESET）自动重试一次：
+      // 实测 Kali 在启动后头几十秒 / 高负载时握手易超时，但紧接着再连就成功。
+      // 不重试的话，AI 会因一次抖动就判定"Kali 不可用"，整轮转本地兜底。
+      const msg = String((err && err.message) || '');
+      const handshake = /handshake|ETIMEDOUT|Timeout|ECONNRESET|ECONNREFUSED|socket hang up/i.test(msg);
+      if (handshake && !_retried) {
+        settled = true;                       // 防止旧连接再回调
+        try { conn.end(); } catch (e) {}
+        return setTimeout(() => {
+          sshExec(command, timeoutMs, true).then(resolve, () => resolve({
+            success: false, stdout: '', stderr: '', error: msg,
+          }));
+        }, 1200);
+      }
       done({ success: false, stdout: '', stderr: '', error: err.message });
     });
 
@@ -11508,7 +11830,11 @@ function sshExec(command, timeoutMs = 60000) {
       port: Number(sshPort) || 22,
       username: sshUser,
       password: sshPass,
-      readyTimeout: 15000,
+      // 握手超时不能设太短：实测 Kali 刚开机 / 负载高时握手常超 15 秒，
+      // 结果是所有远程命令都报 REMOTE_TIMEOUT，AI 据此判定"Kali 不可用"转本地兜底，
+      // 而实际端口是通的、稍后重试就能连上。给 30 秒并保留一次重试（见下方 on('error')）。
+      readyTimeout: 30000,
+      keepaliveInterval: 10000,
       // CTF 内网环境，跳过主机指纹校验
       hostVerifier: () => true
     });

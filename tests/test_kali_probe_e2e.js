@@ -108,11 +108,30 @@ t('guidance 非空且可操作', () => {
   assert.ok(txt.trim().length > 0, 'guidance 为空');
 });
 
-// 与 probe 自身的 ok 字段交叉核对（两套判据不一致时必有一方错）
-t('probe.ok 与 预检.ok 结论一致', () => {
+// 两套判据口径不同，不能简单要求 ok 相等：
+//   · probe.ok = 「所有非可选探测项都通过」（含 arch/kernel 等**环境信息**项）
+//   · 预检.ok  = 「**能不能调试**」（只看 ptrace / gdb 这类硬条件）
+// SSH 通道抖动时 probe 的单项探测会拿到 "Timeout opening channel"，
+// probe.ok 变 false，但只要 ptrace 实测通过，预检仍应判可用 —— 这是**功能正确**。
+// 因此断言改为：两套判据不得「一个说完全不可用、另一个也说可用」这种方向性矛盾。
+t('probe 与预检的结论不得方向性矛盾', () => {
   const probeOk = r.ok === true;
-  assert.strictEqual(d.ok, probeOk,
-    `两套判据不一致：probe.ok=${probeOk} 预检.ok=${d.ok}（blockers=${JSON.stringify(d.blockers)}）`);
+  const preOk = d.ok === true;
+  if (!probeOk && preOk) {
+    // 允许：probe 因**非决定性**项失败，而真正决定"能不能调"的条件都过了。
+    // 决定性项只有两个：ptrace 实测（ptrace_attach）、以及"有 gdb 或 gdbserver"。
+    // arch/kernel/ptrace_scope 等只是**环境信息**——SSH 通道抖动时读不到，
+    // 不代表调试不可用（实测：channel 超时导致 ptrace_scope 读失败，但 ptrace 实测通过）。
+    const failed = r.failed || [];
+    const ptraceFailed = failed.some((x) => x === 'ptrace_attach' || x === 'ptrace');
+    const noDebugger = failed.includes('gdb') && failed.includes('gdbserver');
+    assert.ok(!ptraceFailed, `probe 的 ptrace 实测失败，预检却判可用 —— 真矛盾：${JSON.stringify(failed)}`);
+    assert.ok(!noDebugger, `probe 报 gdb 与 gdbserver 都不可用，预检却判可用 —— 真矛盾：${JSON.stringify(failed)}`);
+    console.log(`     （probe.ok=false 但失败项 ${JSON.stringify(failed)} 均非决定性条件 → 预检判可用合理）`);
+    return;
+  }
+  assert.strictEqual(preOk, probeOk,
+    `两套判据方向矛盾：probe.ok=${probeOk} 预检.ok=${preOk}（blockers=${JSON.stringify(d.blockers)}）`);
 });
 
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`);

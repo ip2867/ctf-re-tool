@@ -1,6 +1,6 @@
 ---
 name: ctf-reverse-binary
-description: PE/ELF 二进制逆向方法论：查壳脱壳、IDA 定位关键函数、VM 字节码题专项、算法识别入口、静态分析套路、**动态调试入场纪律与定向取证**（断点选址/窗口期/SMC/反调试/GUI）。拿到 EXE/DLL/ELF/SO 题目、或需要下断点取运行时值时使用。
+description: PE/ELF 二进制逆向方法论：查壳脱壳、IDA 定位关键函数、VM 字节码题专项、算法识别入口、静态分析套路、**ELF 结构级异常检测**（段尾缝隙藏数据/重定位自相矛盾/TEXTREL/IFUNC/空壳函数）、**加密 blob 的自解密器推断**（链式 XOR/滚动 XOR，按 capstone 覆盖率自动排名）、**动态调试入场纪律与定向取证**（断点选址/窗口期/SMC/反调试/GUI）。拿到 EXE/DLL/ELF/SO 题目、看到"空函数"或"扫码无算法指纹"、或需要下断点取运行时值时使用。
 license: MIT
 metadata:
   user-invocable: "true"
@@ -262,6 +262,74 @@ if solver.check() == sat:
 
 - PE：`IsDebuggerPresent`、`CheckRemoteDebuggerPresent`、`NtQueryInformationProcess(7)`、PEB BeingDebugged、`OutputDebugString`、rdtsc 时间差
 - ELF：`ptrace(PTRACE_TRACEME)` 返回值检查、`/proc/self/status` 的 TracerPid、`sigaction` 信号陷阱
+
+## 5.5 ELF 结构级异常：先看元数据自相矛盾（新，实测沉淀）
+
+**关键认知**：`scan_crypto` 报「未发现算法指纹」可能是**完全正确**的——因为真正的校验逻辑
+根本不在段/节里。典型（ELFStudy 题）：校验函数被加密后藏在 **LOAD 段页尾缝隙**，
+靠精心构造的 Rela/COPY/IFUNC 在 `ld.so` 重定位阶段自解密，跑完把自己抹掉。
+静态工具看不到它，但它**必然留下结构矛盾**。
+
+**工具：`elf_anomaly(path)`**（也自动并入 `scan_crypto` 输出）。它查 8 类矛盾：
+
+| 检出项 | 判据 | 意味着什么 |
+|---|---|---|
+| `segment-slack-data` | LOAD 的 `p_filesz` 未页对齐，页尾有非零数据 | 内核对**整页**都做了映射，这些字节运行期可读（可执行段还可执行） |
+| `df-textrel` | 动态表含 `DF_TEXTREL` | 运行期会写代码段 → 有人要改 .text（自解密/SMC） |
+| `rela-count-mismatch` | `RELASZ` ≠ `.rela.dyn` + `.rela.plt` 条数 | ld.so 的重定位遍历**终点被挪动过**，是改写任意表的入口 |
+| `suspicious-relocations` | COPY/RELATIVE 的 `r_offset` 落在 `.dynsym` 内 | 用加载器**改写符号表项本身**（伪造 `st_value`/`st_shndx`） |
+| `ifunc-symbols` | `STT_GNU_IFUNC` 且 `st_shndx=SHN_ABS` | ld.so 会在**加载期直接调用** `st_value` 处的 resolver |
+| `reloc-addend-to-uncovered` | reloc 的 addend 指向不被任何 section 覆盖的数据 | 引用了一块"藏"在缝隙里的数据 |
+| `hollow-functions` | `endbr64 + nop×N + ret` | 被掏空的函数，可能运行期被改成跳板 |
+| `uncovered-file-region` | 文件里有不被任何 section 覆盖的数据块 | 隐藏数据 |
+
+**实现要点（踩过的坑，改动时别再踩）**：
+
+1. **页尾不能按整段平均判**：实测 slack 常是「大片零填充 + 中间夹真数据」，
+   整段非零比只有 13%，会漏判。必须**滑窗**（窗口 128 / 步长 32）找连续数据块再合并。
+2. **NOBITS 节（.bss）不算文件覆盖**：它在文件里不占字节，`s.offset` 只是映射目标；
+   算进去会让覆盖率超过 100%，把真数据误判成"已被节覆盖"。
+3. **节表本体要算已覆盖**：`e_shoff..e_shoff+e_shnum*entsize` 是合法结构数据但不属于任何 section。
+4. **只有 RELATIVE(8) / COPY(5) 的 addend 才有"文件偏移"语义**：
+   PC32/PLT32/GOTPCREL 的 addend 是指令内位移常量（常见 0x10/0x18），
+   按文件偏移解释会大面积误报。
+
+**拿到异常之后怎么做**：按工具给的**精确偏移**去 `blob_decrypt` 解那块数据，
+而不是去猜算法。
+
+## 5.6 加密 blob 的自解密器推断（新，实测沉淀）
+
+**场景**：校验函数/指令流被加密存成一块，运行期用 stub 解密后执行。
+**关键认知**：这类解密是**纯数据变换**，与程序其余部分无关 → **不需要跑程序**，
+不需要 ptrace、不需要 Unicorn，离线就能复现。
+
+**工具：`blob_decrypt(path, offset, length, kind)`**：
+
+1. 穷举候选家族（`xor-chain-word` / `rolling-xor` / `rolling-add` / `single-xor` / `single-add`）
+2. 逐个试解，用**可判读性**打分排序：
+   - `kind=code` → capstone 指令覆盖率（**最强信号**：解对了几乎全覆盖）
+   - `kind=text` → 可打印比例
+   - 通用 → 熵下降 + 零字节比例
+3. 输出排名 + 最优结果 + 可选写出文件
+
+**实测效果**（ELFStudy 的 0x7396 处 816 字节）：正确答案 `xor-chain-word{width:4,direction:down}`
+得分 **103.97**，第二名只有 12.73 —— 差距悬殊，不需要人判断。解出的明文以
+`90909090 f30f1efa 53554154 4889e548` 开头，正是标准函数序言（nop×4 + endbr64 + push）。
+
+**链式 XOR 的确切定义**（别记反）：
+```python
+key = 0
+for i = N-1 downto 1:          # 从高地址往低地址
+    P[i] = C[i] ^ key
+    key = (key + P[i]) & mask  # 累加的是**明文**
+P[0] = C[0]                    # 索引 0 不变
+```
+⚠️ **它不是自逆的**：拿解密函数当加密函数用会得到错误结果（写测试时踩过）。
+
+**从 stub 抽参数**：`parseStubParams(asmText)` 能从反汇编文本认出
+宽度（`xor dword ptr [...]`）、计数（`mov ecx, N`）、方向（`loop`）、
+key 初值（`xor eax,eax`）、是否累加（`add eax, [...]`），并给出证据列表。
+
 
 ## 6. 动态取密钥（本工具环境）
 

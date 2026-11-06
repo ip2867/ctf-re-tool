@@ -231,5 +231,26 @@ console.log('\n[7] patch_bytes 真跑：va 字符串必须被转成 int');
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
 }
 
+console.log('\n[8] 覆盖率不足必须主动警告（实测天花板固化）');
+{
+  // license 题实测：外部轮询无法采全。工具必须自己说出来，
+  // 而不是让 AI 把「没采到」当成「那段就是密文」。
+  const s = SD.buildSmcScript({
+    binPath: '/t', outDir: '/o', region: '0x404000:0x1000',
+  });
+  ok(/COVERAGE_INCOMPLETE/.test(s), '脚本输出 COVERAGE_INCOMPLETE 标记');
+  ok(/没执行到/.test(s), '警告里点明「可能没执行到」（不只说密文）');
+  ok(/SUSPECT_EARLY_FAILURE/.test(s), '脚本输出 SUSPECT_EARLY_FAILURE 标记');
+  ok(/Rejected/.test(s), '失败串检测包含 Rejected');
+  ok(/stdinData/.test(s), '警告里指引用 stdinData 喂正确输入');
+
+  // main.js dispatch 必须把这两个标记解释成人话
+  const mainSrc = require('fs').readFileSync(
+    require('path').join(__dirname, '..', 'electron', 'main.js'), 'utf8');
+  ok(/SUSPECT_EARLY_FAILURE/.test(mainSrc), 'main.js 解析 SUSPECT_EARLY_FAILURE');
+  ok(/未覆盖的字节 ≠ 一定是密文/.test(mainSrc), 'main.js 提示「未覆盖 ≠ 密文」');
+  ok(/337 块/.test(mainSrc), 'main.js 带上实测对照数据（337 块 vs 87 块）');
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

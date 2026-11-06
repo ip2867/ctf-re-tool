@@ -15,6 +15,22 @@
 //
 // 关键参数：采样区间必须覆盖 SMC 区。工具会先用 ELF program headers 推断候选区间，
 // 也可由调用方用 region 显式指定（如 "0x404000:0x20000"）。
+//
+// ⚠️ 两个实测教训（license 题，2026-11）：
+//
+// 1) stdinData 直接决定能不能采到东西。同一份二进制：
+//    喂错误输入（48 个 0x00）→ 344 张快照 / 337 块 / 5026 字节，但程序走的是
+//      「快速失败」路径，解出的块有 1304 字节是错路径独有的；
+//    喂正确 license → 才走完整校验路径。
+//    也就是说：**输入不对时采到的明文是不完整的，且不会有任何报错**。
+//    判断方法：先看 STDOUT，如果程序很快打印了失败串，说明没进深路径。
+//
+// 2) 外部轮询是有损的，这是方法论天花板，不是实现 bug。
+//    实测单个 16 字节窗口的解密→执行→重加密全程只被观察到 1 次
+//    （把 0x404000..0x424000 整段轮询，20 秒内只有 6 次差异快照）。
+//    想要无损，必须在进程内挂钩（ptrace/PIN/Unicorn），而不是从外面读 /proc/pid/mem。
+//    所以覆盖率达到 100% 时才有资格说「还原完整」；低于 100% 时，
+//    未覆盖的地址**可能是密文也可能根本没执行到**，不能假定是前者。
 
 const DEFAULT_SAMPLE_MS = 0;   // 0 = 不 sleep，能采多快采多快
 
@@ -203,6 +219,18 @@ for s in snaps:
 
 ncov = sum(covered)
 print('RESTORED_BYTES %d / %d (%.2f%%)' % (ncov, LEN, 100.0 * ncov / LEN if LEN else 0))
+
+# 覆盖率不足时明确警告：未覆盖的字节可能是密文，也可能根本没执行到。
+# 这两者无法从外部采样区分 —— 不要假定是前者。
+if ncov < LEN:
+    print('COVERAGE_INCOMPLETE %d' % (LEN - ncov))
+    print('  ⚠️ 未覆盖的 %d 字节可能是「密文」也可能是「没执行到」，外部轮询无法区分。' % (LEN - ncov))
+    print('  ⚠️ 若程序 stdout 里出现过失败串，说明输入不对、没走进深路径 —— 用 stdinData 喂正确输入。')
+
+# 程序很快失败通常意味着输入不对，SMC 只解了浅层
+_fail_hints = (b'Rejected', b'failed', b'invalid', b'wrong', b'incorrect', b'denied')
+if any(h.lower() in (out or b'').lower() for h in _fail_hints):
+    print('SUSPECT_EARLY_FAILURE 目标输出里出现失败串；采到的明文很可能只覆盖失败路径。')
 
 # 输出块列表
 blocks = []

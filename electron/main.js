@@ -10584,6 +10584,17 @@ async function executeToolCall(toolName, input) {
             lines.push('⚠️ 覆盖率低：SMC 每次只解密一小块就重新加密，采样密度不够。');
             lines.push('  把 `maxMs` 调大（如 30000）、`maxSnap` 调大（如 20000）、`sleepMs` 保持 0。');
           }
+          lines.push('');
+          lines.push('**未覆盖的字节 ≠ 一定是密文**：外部轮询无法区分「这段是密文」和「这段没执行到」。');
+          lines.push('所以覆盖率 < 100% 时不要把未覆盖区当成"加密的代码"去解，先确认路径走全了。');
+        }
+        if (/SUSPECT_EARLY_FAILURE/.test(txt)) {
+          lines.push('');
+          lines.push('## ⚠️ 疑似走了失败路径');
+          lines.push('目标输出里出现失败串（Rejected/failed/invalid…），说明**输入不对**，');
+          lines.push('SMC 只解了「快速失败」那一层，采到的明文不代表完整校验逻辑。');
+          lines.push('正确做法：用 `stdinData` 喂**能通过的输入**再采一次。');
+          lines.push('实测对照（license 题）：错误输入 87 块 / 1323 字节，正确输入 337 块 / 5026 字节。');
         }
         if (mBlocks) lines.push(`被改写的块：${mBlocks[1]} 个`);
 

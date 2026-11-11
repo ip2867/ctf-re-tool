@@ -376,6 +376,7 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 
 | 文档 | 内容 |
 |---|---|
+| [qwb2026-三题复现.md](docs/qwb2026-三题复现.md) | **三道逆向题完整复现**（含 IDA 取证截图与工具链输出） |
 | [PROJECT-FRAMEWORK.md](docs/PROJECT-FRAMEWORK.md) | 项目框架总览（SSOT） |
 | [AUTOTEST-REPORT.md](docs/AUTOTEST-REPORT.md) | 批量实测报告：104 道题的失败归因与修复 |
 | [FINAL-REPORT.md](docs/FINAL-REPORT.md) | 第三轮实测：rank 1–6 机制落地效果 |

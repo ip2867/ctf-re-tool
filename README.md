@@ -1,14 +1,16 @@
-# CTF-RE-TOOL v1.11.0
+# CTF-RE-TOOL v1.12.0
 
 [![Release](https://img.shields.io/github/v/release/ip2867/ctf-re-tool?color=d97757)](https://github.com/ip2867/ctf-re-tool/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)]()
 [![Electron](https://img.shields.io/badge/Electron-35-47848F?logo=electron&logoColor=white)]()
 
-一个基于 Electron 的 **CTF 逆向 AI 解题工作台**（Windows 桌面应用）。把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成一条 AI 可自主驱动的流水线，并通过 MCP 实时接入 **IDA / JEB / Burp**，内置 **13 个逆向方法论技能**（Skills）与 **64 篇可检索结构化知识库**（Wiki），提供 **57 个 AI 可调用工具**。
+一个基于 Electron 的 **CTF 逆向 AI 解题工作台**（Windows 桌面应用）。把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成一条 AI 可自主驱动的流水线，并通过 MCP 实时接入 **IDA / JEB / Burp**，内置 **13 个逆向方法论技能**（Skills）与 **64 篇可检索结构化知识库**（Wiki），提供 **64 个 AI 可调用工具**。
 
 设计原则：**AI 是解题主体，工具提供能力**。不是把功能堆在一起，而是让 AI 在解题过程中真正调用工具、识别算法、验证结论。
 
+- **运行期取证**：`elf_anomaly` 定位被藏起来的代码（页尾 slack / TEXTREL / 重定位篡改），`blob_decrypt` 自动识别自解密算法并排名，`smc_dump` 高频采样还原「解密→执行→重加密」的自修改代码，`func_probe` 在 stripped 二进制里按特征常量定位密码函数并批量 dump 每次调用的参数。
+- **跨架构**：`riscv_probe` 用 qemu + gdb-multiarch 断点读取只在运行时存在的派生材料（固件逆向不必纯静态硬读）；`firmware_package` 解析 OTA / 固件包的分段描述符与尾部标记。
 - **AI 工具循环（Tool-Use）**：AI 自主调用 JEB/IDA/Frida/Python 等工具反复推进，而不是一次性问答；分阶段提示词（①收集 → ②定位算法 → ③写脚本本地验证 → ④结论）。
 - **符号求解（`z3_solve`）**：AI 只写约束代码，工具自动补全脚本并返回结构化 JSON（sat/unsat/model/明文串）。内置 `lookup_expr` 查表辅助与 `rotl/zext/lshr` 等别名，**查表用无符号比较**——用有符号比较会让一半索引查错（实测 128/256）。
 - **动态调试闭环**：IDA 调试器可直接下断点、单步、读写内存，覆盖本地 PE 与 Kali 远程 ELF；**动调前先跑能力自检**（SSH 通 ≠ 能调：yama scope、gdb 缺失、ptrace 实测）。
@@ -18,9 +20,9 @@
 - **结构化知识库**：64 篇可检索条目（54 篇 reverse + 6 篇 frida + 1 篇 firmware + 3 篇索引），每条带 `attack_chain` 解法链 / `failed_attempts` 避坑；按题目特征自动预取，命中即注入 AI 上下文。
 - **经验自进化**：每次解题沉淀的多步攻击链写入经验库，下次同类题自动速查复用。
 
-**下载**：[v1.11.0 便携版 CTF-RE-TOOL.exe](https://github.com/ip2867/ctf-re-tool/releases/download/v1.11.0/CTF-RE-TOOL.exe)（77.86 MB，单文件双击即用，无需安装 / 无需 Node.js）
+**下载**：[v1.12.0 便携版 CTF-RE-TOOL.exe](https://github.com/ip2867/ctf-re-tool/releases/download/v1.12.0/CTF-RE-TOOL.exe)（74.30 MB，单文件双击即用，无需安装 / 无需 Node.js）
 
-> 校验：`SHA256 = 4af40f02e05b8754784e91dd141371c44e0ce53fcb92c5a23251d68291d3ae5d`（也可直接下载 [.sha256](https://github.com/ip2867/ctf-re-tool/releases/download/v1.11.0/CTF-RE-TOOL.exe.sha256)）
+> 校验：`SHA256 = 275907b35c4d9ea91f12fff3ee9aab01cf081607a2ed777c977f6be171849734`（也可直接下载 [.sha256](https://github.com/ip2867/ctf-re-tool/releases/download/v1.12.0/CTF-RE-TOOL.exe.sha256)）
 >
 > 首次运行请在「设置」页填写 IDA / JEB / jadx 等外部工具路径（本工具是调度框架，不含这些工具）。
 
@@ -163,6 +165,23 @@ S 盒知识库内置 AES / SM4 完整表（含逆 S 盒、Rcon、FK/CK），扫�
 - **crypto**：AES / SM4 / DES / 3DES / RC4 / TEA 系 / 哈希 / HMAC，数据不出本机（标准向量 35/35）
 - **recipe**：CyberChef 式变换链，一次调用跑完 base64→xor→反转→解压，每层给 printable/entropy/hex
 
+### 16. 运行期取证（v1.12 新增）
+
+静态看不出来的东西，交给这五个工具从运行期挖出来。
+
+| 工具 | 解决的问题 | 输出 |
+|---|---|---|
+| `elf_anomaly` | 代码或数据被藏在"本该没有东西"的地方 | 页尾 slack、`DF_TEXTREL`、`RELASZ` 与段和不等、重定位落在 `.dynsym` 内部、`endbr64+nop+ret` 空壳函数、addend 指向未覆盖数据 —— 共 8 类结构异常 |
+| `blob_decrypt` | 拿到一段密文，不知道用什么算法解的 | 对 8 种候选（chain-XOR 按 1/2/4/8 字节宽、滚动 XOR/ADD、单字节、LCG 流）逐个解密并按可判读性打分，返回排名而非单一猜测 |
+| `smc_dump` | 代码"跑起来才存在"（解密→执行→重新加密） | 轮询 `/proc/<pid>/mem`、逐字节差分后取并集还原明文；支持 `patches` 先打掉反调试、`stdinData` 喂输入走深路径；输出块列表 + 反汇编 + ASCII 串 |
+| `func_probe` | stripped 二进制里"这个函数在算什么" | 按 SM3/SM4/AES/MD5/SHA256/ChaCha 的特征常量（**LE/BE 两种字节序都试**）定位，再在调用点批量 dump 参数寄存器与内存 |
+| `riscv_probe` | RISC-V / 跨架构固件，材料只在内存里存在 | `qemu-riscv32 -g` + `gdb-multiarch` 断点读寄存器指向的缓冲区；自动找调用点、支持对照地址 |
+
+配套的两条主动告警：
+
+- `COVERAGE_INCOMPLETE`：未覆盖的字节**可能是密文，也可能是没有执行到**，外部轮询无法区分。工具会明确提示两种可能，避免把未执行区误当成"加密的代码"去硬解。
+- `SUSPECT_EARLY_FAILURE`：目标输出出现失败串时，提示"输入不对，SMC 只解了快速失败那一层"。同一二进制下，错误输入只还原 87 块 / 1323 字节，正确输入可达 337 块 / 5026 字节。
+
 ## 环境要求
 
 - Windows 10/11
@@ -243,7 +262,7 @@ ctf-tool-v2/
 │   ├── reverse/                # 54 篇（含 _INDEX.md；YAML meta：attack_chain/reasoning_chain/failed_attempts）
 │   ├── frida/                  # 6 篇动态 Hook 手法页
 │   └── firmware/               # 固件解包与仿真
-├── tests/                # 128 个测试文件（含真跑 dispatch 的端到端链路测试）
+├── tests/                # 135 个测试文件（含真跑 dispatch 的端到端链路测试）
 ├── assets/icons/         # 应用图标
 ├── LICENSE               # MIT
 ├── 启动.bat              # Windows 快速启动
@@ -370,6 +389,43 @@ Android/APK 流程使用 JEB MCP（默认 `127.0.0.1:16161`），与 IDA MCP 是
 | [CHANGELOG-ARCHIVE.md](docs/CHANGELOG-ARCHIVE.md) | v1.4.0 及更早的更新日志 |
 
 ## 更新日志
+
+### v1.12.0 (2026-11-11) — 运行期取证：把"静态看不见的"挖出来
+
+这一版补齐了一类此前只能靠人工硬读的能力：**代码和数据藏在静态工具看不到的地方**。
+新增工具均在真实题目上完成端到端验证（qwb2026 s10 三道逆向题，全部复现）。
+
+**一、新增 5 个工具（工具总数 57 → 64）**
+
+| 工具 | 能力 |
+|---|---|
+| `elf_anomaly` | 8 类 ELF 结构异常：页尾 slack 藏数据、`DF_TEXTREL`、`RELASZ` 与 `.rela.dyn+.rela.plt` 条数不符、重定位 `r_offset` 落在 `.dynsym` 内部、`endbr64+nop×N+ret` 空壳函数、addend 指向未被 section 覆盖的数据 |
+| `blob_decrypt` | 密文算法自动识别：8 种候选逐参枚举 + 可判读性打分排序。**chain-XOR 不是自逆的**，必须按正向定义构造 |
+| `smc_dump` | 自修改代码还原：`/proc/<pid>/mem` 高频采样 + 逐字节差分 + **并集**（单次快照只能看到一小块） |
+| `func_probe` | stripped 二进制里按特征常量定位密码函数，在调用点批量 dump 参数 |
+| `riscv_probe` | `qemu-riscv32` + `gdb-multiarch` 跨架构断点取值 |
+
+**二、实测验证（qwb2026 s10 三题全部复现）**
+
+| 题 | 机制 | 工具链 |
+|---|---|---|
+| ELFStudy | 校验函数藏在 LOAD 段页尾 slack，由 `RELA` 在 `ld.so` 重定位阶段解密执行 | `elf_anomaly` → `blob_decrypt`（排名 43.65 vs 10.10）→ 30 轮 ARX 逆推 + **正向回代精确命中** |
+| firmware | x86 验证器 + RISC-V 固件 + OTA 包三方材料 | `firmware_package` 拆包 → `func_probe` 定位 SM3（7 次调用全追踪）→ `riscv_probe` 取 keymat → 派生链 + SM4-CTR |
+| license | 静态链接 + 白盒 AES + TF 单步驱动 SMC | `smc_dump` 打补丁绕反调试 → 428 快照 / 401 块 / 5986 字节明文 |
+
+**三、工具可靠性修复**
+
+以下四处均由实测发现，并已加入回归测试：
+
+- **常量指纹字节序**：SM3 IV 在 fw_a 里以 LE word 存放（`6f168073…`），只搜 BE 会误判"没有 SM3"。现已两种字节序都试。
+- **假 ELF 头**：`.eh_frame` 里含 `7f 45 4c 46`（`0x7f` 是 DWARF 操作码），旧逻辑误报 4 处"内嵌 ELF"。现校验 `e_type ∈ {1,2,3,4}` 且 `e_machine ∈ [1,260]`，同时保留"offset≠0 且 key=0"的真明文 ELF 检出。
+- **花指令阈值**：`bad>=20 || ratio>0.002` 在 5/5 个微软官方二进制上全部误报"高度可疑"（实际占比 0.033%–0.131%）。改为 `bad>=20 && ratio>0.004` 后误报为 0，三道真题仍全部命中。
+- **`smc_dump` 补丁路径**：`patch` 的 `va` 传入字符串未转 `int` 会抛 `TypeError`；补丁曾写入只读 `bytes` 而非 `bytearray`。两处均由端到端测试暴露，脚本生成层的单测无法覆盖。
+
+**四、测试**
+
+- 全量回归 **135/135 通过**
+- 新增 `test_smc_dump.js`（50 项，含两组**真跑负向断言**）、`test_func_probe.js`（16 项）、`test_riscv_probe.js`（17 项）、`test_fp_byteorder_and_selfmatch.js`（10 项）、`test_junk_threshold_baseline.js`（12 项）等
 
 ### v1.11.0 (2026-11-01) — 把「工具能用」变成「链路可证」
 

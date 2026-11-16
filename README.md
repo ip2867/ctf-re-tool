@@ -5,7 +5,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)]()
 [![Electron](https://img.shields.io/badge/Electron-35-47848F?logo=electron&logoColor=white)]()
 
-一个基于 Electron 的 **CTF 逆向 AI 解题工作台**（Windows 桌面应用）。把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成一条 AI 可自主驱动的流水线，并通过 MCP 实时接入 **IDA / JEB / Burp**，内置 **13 个逆向方法论技能**（Skills）与 **64 篇可检索结构化知识库**（Wiki），提供 **64 个 AI 可调用工具**。
+一个基于 Electron 的 **CTF 逆向 AI 解题工作台**（Windows 桌面应用）。把「静态分析 → 动态 Hook → 算法还原 → 本地验证」串成一条 AI 可自主驱动的流水线，并通过 MCP 实时接入 **IDA / JEB / Burp**，内置 **14 个逆向方法论技能**（Skills）与 **64 篇可检索结构化知识库**（Wiki），提供 **64 个 AI 可调用工具**。
 
 设计原则：**AI 是解题主体，工具提供能力**。不是把功能堆在一起，而是让 AI 在解题过程中真正调用工具、识别算法、验证结论。
 
@@ -250,7 +250,8 @@ ctf-tool-v2/
 │   ├── index.html        # 主页面（CSP + SRI 加固）
 │   ├── css/style.css     # 样式（暖白简约主题）
 │   └── js/app.js         # 渲染层逻辑（AI 编排、Tool-Use 循环、Hook 生成、验证闭环、WP 生成）
-├── skills/               # 13 个逆向方法论技能（SKILL.md，AI 经 read_skill 按需加载）
+├── skills/               # 14 个逆向方法论技能（SKILL.md，AI 经 read_skill 按需加载）
+│   ├── ctf-reverse-total/ #   全流程总纲：判型→结构→算法→求解→动调→验证（建议首读）
 │   ├── ctf-dispatch/     #   总调度：分类 → 选方法 → 卡题换路
 │   ├── ctf-reverse-binary/ ctf-reverse-android/ ctf-reverse-langs/
 │   ├── ctf-reverse-tooling/   #   Z3/angr/Unicorn 自动化求解 + 迷宫题
